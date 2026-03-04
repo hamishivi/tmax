@@ -13,8 +13,8 @@ set -euo pipefail
 #   MAX_STEPS          - Max agent steps per trial (default: 30)
 
 MODEL="${MODEL:-openai/default}"
-N_CONCURRENT="${N_CONCURRENT:-16}"
-MAX_STEPS="${MAX_STEPS:-30}"
+N_CONCURRENT="${N_CONCURRENT:-25}"
+MAX_STEPS="${MAX_STEPS:-50}"
 
 harbor run \
     --dataset terminal-bench@2.0 \
