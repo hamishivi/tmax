@@ -1,5 +1,6 @@
 import argparse
 
+from datasets import load_from_disk
 from transformers import AutoTokenizer
 from trl import SFTConfig, SFTTrainer
 
@@ -24,6 +25,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cache_dir", type=str, default=None)
     p.add_argument("--dataset_num_proc", type=int, default=8)
+    p.add_argument(
+        "--tokenized_dataset_path",
+        type=str,
+        default=None,
+        help="If set, load a pre-tokenized dataset from this path (datasets.load_from_disk) "
+        "instead of raw Nemotron-Terminal-Corpus.",
+    )
 
     # Training
     p.add_argument("--num_gpus", type=int, default=8, help="Total GPU count (for grad accum calc)")
@@ -47,12 +55,15 @@ def main():
 
     grad_accum = args.global_batch_size // (args.num_gpus * args.per_device_train_batch_size)
 
-    dataset = load_terminal_corpus(
-        subsets=args.subsets,
-        sample_frac=args.sample_frac,
-        seed=args.seed,
-        cache_dir=args.cache_dir,
-    )
+    if getattr(args, "tokenized_dataset_path", None):
+        dataset = load_from_disk(args.tokenized_dataset_path)
+    else:
+        dataset = load_terminal_corpus(
+            subsets=args.subsets,
+            sample_frac=args.sample_frac,
+            seed=args.seed,
+            cache_dir=args.cache_dir,
+        )
 
     training_args = SFTConfig(
         output_dir=args.output_dir,
@@ -73,7 +84,7 @@ def main():
         logging_steps=args.logging_steps,
         save_strategy="steps",
         save_steps=args.save_steps,
-        report_to="tensorboard",
+        report_to=["tensorboard", "wandb"],
         seed=args.seed,
         packing=args.packing,
         dataset_num_proc=args.dataset_num_proc,
