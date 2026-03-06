@@ -6,6 +6,7 @@ sandbox tasks using only bash execution. Inspired by mini-SWE-agent.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -19,6 +20,18 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 logger = logging.getLogger(__name__)
+
+# Exceptions that should immediately abort the run (no retry).
+ABORT_EXCEPTIONS = (
+    litellm.exceptions.AuthenticationError,
+    litellm.exceptions.NotFoundError,
+    litellm.exceptions.ContextWindowExceededError,
+    litellm.exceptions.UnsupportedParamsError,
+    litellm.exceptions.PermissionDeniedError,
+)
+
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 2.0
 
 MAX_OUTPUT_CHARS = 10_000
 
@@ -106,54 +119,66 @@ class TassieAgent(BaseAgent):
             {"role": "user", "content": instruction},
         ]
 
-        for step in range(self.max_steps):
-            logger.info(f"Step {step + 1}/{self.max_steps}")
+        try:
+            for step in range(self.max_steps):
+                logger.info(f"Step {step + 1}/{self.max_steps}")
 
-            if self.cost_limit > 0 and self.cost >= self.cost_limit:
-                logger.warning(f"Cost limit reached: ${self.cost:.2f} >= ${self.cost_limit:.2f}")
-                break
+                if self.cost_limit > 0 and self.cost >= self.cost_limit:
+                    logger.warning(f"Cost limit reached: ${self.cost:.2f} >= ${self.cost_limit:.2f}")
+                    break
 
+                response = await self._query_with_retry(model, messages)
+
+                try:
+                    step_cost = litellm.completion_cost(response, model=model)
+                except Exception:
+                    step_cost = 0.0
+                self.cost += step_cost
+                logger.info(f"Step cost: ${step_cost:.4f}, total: ${self.cost:.4f}")
+
+                msg = response.choices[0].message.model_dump()
+                messages.append(msg)
+
+                tool_calls = msg.get("tool_calls")
+                if not tool_calls:
+                    break
+
+                done = False
+                for tc in tool_calls:
+                    func = tc["function"]
+                    args = json.loads(func["arguments"]) if isinstance(func["arguments"], str) else func["arguments"]
+                    command = args.get("command", "")
+
+                    output = await self._execute_bash(command, environment)
+
+                    # Check for submit marker
+                    if output.startswith(SUBMIT_MARKER):
+                        done = True
+
+                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": _truncate(output)})
+
+                if done:
+                    break
+        finally:
+            # Always save trajectory, even on error
+            (self.logs_dir / "trajectory.json").write_text(json.dumps(messages, indent=2, default=str))
+
+    async def _query_with_retry(self, model: str, messages: list[dict[str, Any]]) -> Any:
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
-                response = await litellm.acompletion(
+                return await litellm.acompletion(
                     model=model, messages=messages, tools=[BASH_TOOL], temperature=0.7, top_p=0.95,
                 )
-            except Exception as e:
-                logger.error(f"LiteLLM error: {type(e).__name__}: {e}")
+            except ABORT_EXCEPTIONS as e:
+                logger.error(f"Aborting: {type(e).__name__}: {e}")
                 raise
-
-            try:
-                step_cost = litellm.completion_cost(response, model=model)
-            except Exception:
-                step_cost = 0.0
-            self.cost += step_cost
-            logger.info(f"Step cost: ${step_cost:.4f}, total: ${self.cost:.4f}")
-
-            msg = response.choices[0].message.model_dump()
-            messages.append(msg)
-
-            tool_calls = msg.get("tool_calls")
-            if not tool_calls:
-                break
-
-            done = False
-            for tc in tool_calls:
-                func = tc["function"]
-                args = json.loads(func["arguments"]) if isinstance(func["arguments"], str) else func["arguments"]
-                command = args.get("command", "")
-
-                output = await self._execute_bash(command, environment)
-
-                # Check for submit marker
-                if output.startswith(SUBMIT_MARKER):
-                    done = True
-
-                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": _truncate(output)})
-
-            if done:
-                break
-
-        # Save trajectory
-        (self.logs_dir / "trajectory.json").write_text(json.dumps(messages, indent=2, default=str))
+            except Exception as e:
+                if attempt == MAX_RETRIES:
+                    logger.error(f"Max retries reached: {type(e).__name__}: {e}")
+                    raise
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(f"Retry {attempt}/{MAX_RETRIES} after {type(e).__name__}: {e} (waiting {delay:.0f}s)")
+                await asyncio.sleep(delay)
 
     async def _execute_bash(self, command: str, env: BaseEnvironment) -> str:
         result = await env.exec(command=command)
