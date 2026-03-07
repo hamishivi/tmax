@@ -4,9 +4,14 @@ cd "$(dirname "$0")/.."
 
 # ── Config ───────────────────────────────────────────────────────────────────
 MODEL="Qwen/Qwen3.5-4B"
-BACKEND="fsdp" # "fsdp" or "deepspeed"
-ACCELERATE_CONFIG="configs/accelerate_fsdp_8xh200.yaml"
-DS_CONFIG="configs/ds_z3_sp8.json"
+BACKEND="deepspeed" # "fsdp" or "deepspeed"
+
+# Accelerate config files (pick one per backend)
+FSDP_CONFIG="configs/accelerate_fsdp_8xh200.yaml"
+DS_CONFIG="configs/accelerate_ds_z3_sp8_8xh200.yaml"
+# Alternatives:
+#   configs/accelerate_ds_z3_sp4_8xh200.yaml   (SP=4 + DP=2, 2D parallel)
+
 NUM_GPUS=8
 
 # Data
@@ -14,7 +19,7 @@ SUBSETS="dataset_adapters skill_based_easy skill_based_medium skill_based_mixed"
 SEED=42
 # SAMPLE_FRAC=0.1  # uncomment for a quick test run
 # Optional: path to a pre-tokenized dataset created by pre_tokenize.py
-TOKENIZED_DATASET="/gpfs/scrubbed/osey/tmax/sft/data/tokenized_nemotron-terminal_0.1_42"
+TOKENIZED_DATASET="/gpfs/scrubbed/osey/tmax/sft/data/tokenized_nemotron-terminal_0.05_42"
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 BASE_PATH="/gpfs/scrubbed/osey/tmax/sft/output"
@@ -42,14 +47,13 @@ OUTPUT_DIR="${BASE_PATH}/${MODEL_NAME}_${DATA_NAME}"
 
 # Training parameters. Match nemontron-terminal-8B
 GLOBAL_BATCH_SIZE=128
-# MAX_LENGTH=65536 # 32768 * 2
-MAX_LENGTH=32768
+MAX_LENGTH=65536 # 32768 * 2
 NUM_EPOCHS=2
 LR=2e-5
 
 # Logging / saving (fractional = ratio of total steps; 0.05 ≈ every 0.1 epoch)
-LOGGING_STEPS=0.01
-SAVE_STEPS=0.05
+LOGGING_STEPS=1
+SAVE_STEPS=0.1
 
 # ── Launch ───────────────────────────────────────────────────────────────────
 DATA_ARGS=(--subsets $SUBSETS)
@@ -69,43 +73,33 @@ echo "Starting training. Logging output to: $LOG_FILE"
 # Tell Triton to cache on the scrubbed partition (which has space/inodes) instead of the home partition
 export TRITON_CACHE_DIR="/gpfs/scrubbed/osey/.triton_cache"
 
+COMMON_ARGS=(
+    train.py
+    --model_name_or_path "$MODEL"
+    --output_dir "$OUTPUT_DIR"
+    "${DATA_ARGS[@]}"
+    --num_gpus "$NUM_GPUS"
+    --per_device_train_batch_size 1
+    --max_length "$MAX_LENGTH"
+    --num_train_epochs "$NUM_EPOCHS"
+    --learning_rate "$LR"
+    --global_batch_size "$GLOBAL_BATCH_SIZE"
+    --logging_steps "$LOGGING_STEPS"
+    --save_steps "$SAVE_STEPS"
+    --seed "$SEED"
+    --dataset_num_proc 1
+)
+
 if [ "$BACKEND" = "fsdp" ]; then
-    echo "Using FSDP backend with config: $ACCELERATE_CONFIG"
+    echo "Using FSDP backend with config: $FSDP_CONFIG"
     accelerate launch \
-        --config_file "$ACCELERATE_CONFIG" \
-        train.py \
-        --model_name_or_path "$MODEL" \
-        --output_dir "$OUTPUT_DIR" \
-        "${DATA_ARGS[@]}" \
-        --num_gpus "$NUM_GPUS" \
-        --per_device_train_batch_size 1 \
-        --max_length "$MAX_LENGTH" \
-        --num_train_epochs "$NUM_EPOCHS" \
-        --learning_rate "$LR" \
-        --global_batch_size "$GLOBAL_BATCH_SIZE" \
-        --logging_steps "$LOGGING_STEPS" \
-        --save_steps "$SAVE_STEPS" \
-        --seed "$SEED" \
-        --dataset_num_proc 1 2>&1 | tee "$LOG_FILE"
+        --config_file "$FSDP_CONFIG" \
+        "${COMMON_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
 elif [ "$BACKEND" = "deepspeed" ]; then
-    echo "Using DeepSpeed backend with config: $DS_CONFIG"
+    echo "Using DeepSpeed Ulysses SP with config: $DS_CONFIG"
     accelerate launch \
-        --use_deepspeed \
-        train.py \
-        --deepspeed "$DS_CONFIG" \
-        --model_name_or_path "$MODEL" \
-        --output_dir "$OUTPUT_DIR" \
-        "${DATA_ARGS[@]}" \
-        --num_gpus "$NUM_GPUS" \
-        --per_device_train_batch_size 1 \
-        --max_length "$MAX_LENGTH" \
-        --num_train_epochs "$NUM_EPOCHS" \
-        --learning_rate "$LR" \
-        --global_batch_size "$GLOBAL_BATCH_SIZE" \
-        --logging_steps "$LOGGING_STEPS" \
-        --save_steps "$SAVE_STEPS" \
-        --seed "$SEED" \
-        --dataset_num_proc 1 2>&1 | tee "$LOG_FILE"
+        --config_file "$DS_CONFIG" \
+        "${COMMON_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
 else
     echo "Error: Unknown BACKEND '$BACKEND'"
     exit 1
