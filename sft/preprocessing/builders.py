@@ -53,7 +53,10 @@ def build_tool_calls(
 
     parts: list[str] = []
     for cmd in commands:
-        ks = cmd.get("keystrokes", "")
+        if isinstance(cmd, str):
+            ks = cmd
+        else:
+            ks = cmd.get("keystrokes", "")
         if not ks.strip():
             continue
         if ks.strip() in ("C-c", "C-d"):

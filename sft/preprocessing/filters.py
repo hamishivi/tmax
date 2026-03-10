@@ -16,8 +16,21 @@ class FilterVerdict:
     warning_flags: list[str] = field(default_factory=list)
 
 
-def apply_mandatory_filters(row: dict) -> FilterVerdict:
-    """Filters that cause the trace to be **dropped**."""
+def apply_mandatory_filters(
+    row: dict,
+    *,
+    require_task_complete: bool = True,
+) -> FilterVerdict:
+    """Filters that cause the trace to be **dropped**.
+
+    Parameters
+    ----------
+    require_task_complete : bool
+        If *False*, traces without ``task_complete: true`` are kept and
+        flagged (via :func:`apply_warning_flags`) instead of dropped.
+        Useful for preserving partial trajectories from datasets that
+        truncate conversations at a turn limit.
+    """
     v = FilterVerdict()
 
     if not row.get("_conversion_ok", False):
@@ -37,7 +50,7 @@ def apply_mandatory_filters(row: dict) -> FilterVerdict:
         v.drop_reason = "too_few_turns"
         return v
 
-    if not meta.get("has_task_complete", False):
+    if require_task_complete and not meta.get("has_task_complete", False):
         v.keep = False
         v.drop_reason = "no_task_complete"
         return v
@@ -49,6 +62,10 @@ def apply_warning_flags(row: dict) -> list[str]:
     """Flags that **do not** drop the trace but are recorded for review."""
     flags: list[str] = []
     warnings = row.get("warnings", [])
+    meta = row.get("metadata", {})
+
+    if not meta.get("has_task_complete", False):
+        flags.append("no_task_complete")
 
     for w in warnings:
         if "TASK_DELIM not found" in w:

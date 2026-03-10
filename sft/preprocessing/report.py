@@ -10,7 +10,10 @@ Prints a nicely formatted summary after conversion completes:
 
 from __future__ import annotations
 
+import io
 import json
+import re
+import sys
 import textwrap
 from pathlib import Path
 
@@ -91,6 +94,7 @@ def print_report(
     report: dict,
     examples: list[dict] | None = None,
     dropped_examples: list[dict] | None = None,
+    save_path: str | Path | None = None,
 ) -> None:
     """Print a rich terminal summary of the conversion report.
 
@@ -106,7 +110,39 @@ def print_report(
         has ``source``, ``drop_reason``, ``trial_name``, ``messages``,
         ``warnings``, ``num_raw_messages``, ``raw_first_user``,
         ``raw_last_assistant``.
+    save_path : str | Path | None
+        If given, also write the report (ANSI codes stripped) to this file.
     """
+    # Tee stdout to a buffer so we can save a plain-text copy
+    _original_stdout = sys.stdout
+    _capture = io.StringIO()
+
+    class _Tee:
+        def write(self, s: str) -> int:
+            _original_stdout.write(s)
+            _capture.write(s)
+            return len(s)
+        def flush(self) -> None:
+            _original_stdout.flush()
+
+    sys.stdout = _Tee()  # type: ignore[assignment]
+    try:
+        _print_report_body(report, examples, dropped_examples)
+    finally:
+        sys.stdout = _original_stdout
+
+    if save_path is not None:
+        ansi_re = re.compile(r"\033\[[0-9;]*m")
+        plain = ansi_re.sub("", _capture.getvalue())
+        Path(save_path).write_text(plain)
+
+
+def _print_report_body(
+    report: dict,
+    examples: list[dict] | None,
+    dropped_examples: list[dict] | None,
+) -> None:
+    """Inner report rendering (all print() calls go through the tee)."""
     _print_header("Terminus-2 -> SWE-Agent Conversion Report")
 
     agg = report["aggregate"]

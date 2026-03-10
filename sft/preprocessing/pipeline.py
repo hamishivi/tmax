@@ -18,14 +18,14 @@ import logging
 import os
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fnmatch import fnmatch
-from functools import partial
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
-from datasets import Dataset, Sequence, Value, load_dataset
+from datasets import Dataset, load_dataset
 from datasets.table import InMemoryTable
 from huggingface_hub import HfApi, hf_hub_download
 
@@ -156,9 +156,15 @@ def _convert_fn(row: dict, source_label: str, conversations_column: str) -> dict
     )
 
 
-def _filter_and_flag(row: dict, max_turns: int) -> dict:
+def _filter_and_flag(
+    row: dict,
+    max_turns: int,
+    require_task_complete: bool = True,
+) -> dict:
     """Apply filters and stamp verdicts onto the row."""
-    mandatory = apply_mandatory_filters(row)
+    mandatory = apply_mandatory_filters(
+        row, require_task_complete=require_task_complete,
+    )
     if not mandatory.keep:
         return {
             **row,
@@ -185,71 +191,126 @@ def process_source(
     *,
     output_dir: Path,
     num_workers: int,
-    sample: int | None,
-    sample_frac: float | None,
     max_turns: int,
-    cache_dir: str | None,
+    require_task_complete: bool = True,
+    cache_dir: str | None = None,
     num_examples: int = 3,
-) -> tuple[dict, list[dict]]:
+    preloaded: tuple[Dataset, int] | None = None,
+    sample: int | None = None,
+    sample_frac: float | None = None,
+) -> tuple[dict, list[dict], list[dict]]:
     """Download, convert, filter, and save one source-subset.
 
-    Returns a (statistics_dict, example_traces) tuple.
+    Returns a (statistics_dict, example_traces, dropped_examples) tuple.
     """
     label = item["source_label"]
     safe_name = label.replace("/", "__")
     logger.info("Processing %s ...", label)
     t0 = time.time()
 
-    # 1. Load raw data
-    ds = load_raw_dataset(item, cache_dir=cache_dir)
-    full_count = len(ds)
+    # 1. Load raw data (skip if pre-fetched)
+    if preloaded is not None:
+        ds, full_count = preloaded
+        input_count = len(ds)
+    else:
+        ds = load_raw_dataset(item, cache_dir=cache_dir)
+        full_count = len(ds)
 
-    if sample is not None and sample < full_count:
-        ds = ds.shuffle(seed=42).select(range(sample))
-    elif sample_frac is not None and 0 < sample_frac < 1:
-        n = max(1, int(full_count * sample_frac))
-        ds = ds.shuffle(seed=42).select(range(n))
+        # Efficient sampling: pick random indices directly instead of
+        # shuffling the entire dataset (O(n) vs O(N)).
+        if sample is not None and sample < full_count:
+            indices = sorted(random.Random(42).sample(range(full_count), sample))
+            ds = ds.select(indices)
+        elif sample_frac is not None and 0 < sample_frac < 1:
+            n = max(1, int(full_count * sample_frac))
+            indices = sorted(random.Random(42).sample(range(full_count), n))
+            ds = ds.select(indices)
 
-    input_count = len(ds)
+        input_count = len(ds)
 
-    # 2. Convert
-    map_fn = partial(
-        _convert_fn,
-        source_label=label,
-        conversations_column=item["conversations_column"],
-    )
-    ds = ds.map(map_fn, num_proc=num_workers, desc=f"Converting {label}")
+    # 2+3. Convert + filter + partition + statistics in ONE pass.
+    #
+    # Profiling showed convert_trace itself takes <1 ms per row — the real
+    # bottleneck in datasets.map() is Arrow ser/de overhead (99.6 % of
+    # wall time).  Multiprocessing makes it *worse* because of fork + IPC
+    # cost on already-instant work.
+    #
+    # Instead: bulk-decode every Arrow column to Python once, loop in pure
+    # Python (zero Arrow overhead per row), and build output Datasets from
+    # plain lists at the end.
+    conv_col = item["conversations_column"]
+    logger.info("  Bulk-decoding %d rows from Arrow ...", input_count)
+    raw_cols = {col: ds[col] for col in ds.column_names}
 
-    # 3. Filter
-    filter_fn = partial(_filter_and_flag, max_turns=max_turns)
-    filter_features = ds.features.copy()
-    filter_features["_keep"] = Value("bool")
-    filter_features["_drop_reason"] = Value("string")
-    filter_features["_warning_flags"] = Sequence(Value("string"))
-    ds = ds.map(
-        filter_fn, num_proc=num_workers, features=filter_features,
-        desc=f"Filtering {label}",
-    )
+    kept_data: dict[str, list] = {"messages": [], "source": [], "metadata": []}
+    dropped_data: dict[str, list] = {
+        "messages": [], "source": [], "metadata": [],
+        "warnings": [], "_drop_reason": [],
+    }
+    if conv_col in raw_cols:
+        dropped_data[conv_col] = []
 
-    kept = ds.filter(lambda r: r["_keep"], num_proc=num_workers)
-    dropped = ds.filter(lambda r: not r["_keep"], num_proc=num_workers)
-
-    # 4. Collect statistics
+    dropped_reasons_list: list[str] = []
     drop_reasons: dict[str, int] = {}
-    for reason in dropped["_drop_reason"]:
-        drop_reasons[reason] = drop_reasons.get(reason, 0) + 1
-
-    strategy_counts = {1: 0, 2: 0, 3: 0, 0: 0}
+    strategy_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
     turn_counts: list[int] = []
-    for meta in kept["metadata"]:
+    warning_counts: dict[str, int] = {}
+
+    t_loop = time.time()
+    for i in range(input_count):
+        row = {col: raw_cols[col][i] for col in raw_cols}
+        result = convert_trace(row, source_label=label, conversations_column=conv_col)
+
+        # ── mandatory filters ─────────────────────────────────────
+        mandatory = apply_mandatory_filters(
+            result, require_task_complete=require_task_complete,
+        )
+        if not mandatory.keep:
+            dropped_data["messages"].append(result["messages"])
+            dropped_data["source"].append(result["source"])
+            dropped_data["metadata"].append(result["metadata"])
+            dropped_data["warnings"].append(result["warnings"])
+            dropped_data["_drop_reason"].append(mandatory.drop_reason)
+            if conv_col in dropped_data:
+                dropped_data[conv_col].append(row.get(conv_col, []))
+            dropped_reasons_list.append(mandatory.drop_reason)
+            drop_reasons[mandatory.drop_reason] = drop_reasons.get(mandatory.drop_reason, 0) + 1
+            continue
+
+        # ── optional filters ──────────────────────────────────────
+        optional = apply_optional_filters(result, max_turns=max_turns)
+        if not optional.keep:
+            dropped_data["messages"].append(result["messages"])
+            dropped_data["source"].append(result["source"])
+            dropped_data["metadata"].append(result["metadata"])
+            dropped_data["warnings"].append(result["warnings"])
+            dropped_data["_drop_reason"].append(optional.drop_reason)
+            if conv_col in dropped_data:
+                dropped_data[conv_col].append(row.get(conv_col, []))
+            dropped_reasons_list.append(optional.drop_reason)
+            drop_reasons[optional.drop_reason] = drop_reasons.get(optional.drop_reason, 0) + 1
+            continue
+
+        # ── kept — collect row + statistics ────────────────────────
+        kept_data["messages"].append(result["messages"])
+        kept_data["source"].append(result["source"])
+        kept_data["metadata"].append(result["metadata"])
+
+        flags = apply_warning_flags(result)
+        for f in flags:
+            warning_counts[f] = warning_counts.get(f, 0) + 1
+        meta = result.get("metadata", {})
         for k, v in (meta.get("json_strategy_counts") or {}).items():
             strategy_counts[int(k)] = strategy_counts.get(int(k), 0) + v
         turn_counts.append(meta.get("num_turns", 0))
 
-    warning_counts: dict[str, int] = {}
-    for flags in kept["_warning_flags"]:
-        for f in flags:
-            warning_counts[f] = warning_counts.get(f, 0) + 1
+    logger.info("  Converted + filtered %d rows in %.1fs", input_count, time.time() - t_loop)
+    del raw_cols
+
+    kept = Dataset.from_dict(kept_data)
+    dropped = Dataset.from_dict(dropped_data) if dropped_reasons_list else Dataset.from_dict(
+        {k: [] for k in dropped_data}
+    )
 
     # Turn-count distribution
     turn_stats = {}
@@ -264,13 +325,13 @@ def process_source(
             "p95": turn_counts_sorted[int(n * 0.95)],
         }
 
-    # 5. Collect qualitative examples (sample from kept traces)
+    # 4. Collect qualitative examples (sample from kept traces)
     rng = random.Random(42)
 
     examples: list[dict] = []
     if len(kept) > 0 and num_examples > 0:
-        indices = rng.sample(range(len(kept)), min(num_examples, len(kept)))
-        for idx in indices:
+        ex_indices = rng.sample(range(len(kept)), min(num_examples, len(kept)))
+        for idx in ex_indices:
             row = kept[idx]
             examples.append({
                 "source": row.get("source", label),
@@ -278,15 +339,14 @@ def process_source(
                 "metadata": row.get("metadata", {}),
             })
 
-    # 5b. Sample dropped traces per drop reason for diagnosis
+    # 4b. Sample dropped traces per drop reason for diagnosis
     dropped_examples: list[dict] = []
     if len(dropped) > 0:
         reason_indices: dict[str, list[int]] = {}
-        for idx, reason in enumerate(dropped["_drop_reason"]):
+        for idx, reason in enumerate(dropped_reasons_list):
             reason_indices.setdefault(reason, []).append(idx)
-        conv_col = item["conversations_column"]
-        for reason, indices in reason_indices.items():
-            sampled = rng.sample(indices, min(2, len(indices)))
+        for reason, idxs in reason_indices.items():
+            sampled = rng.sample(idxs, min(2, len(idxs)))
             for idx in sampled:
                 row = dropped[idx]
                 raw_convos = row.get(conv_col, [])
@@ -301,7 +361,7 @@ def process_source(
                     "raw_last_assistant": _extract_last_assistant(raw_convos),
                 })
 
-    # 6. Save kept traces (only training-relevant columns)
+    # 5. Save kept traces (only training-relevant columns)
     out_path = output_dir / f"{safe_name}.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -311,7 +371,7 @@ def process_source(
         kept = kept.remove_columns(drop_cols)
     kept.to_parquet(str(out_path))
 
-    # 7. Save dropped traces for inspection
+    # 6. Save dropped traces for inspection
     if len(dropped) > 0:
         dropped_path = output_dir / f"{safe_name}_dropped.jsonl"
         _save_jsonl(dropped, dropped_path)
@@ -336,6 +396,57 @@ def process_source(
 
 
 # ======================================================================
+# Concurrent pre-fetch
+# ======================================================================
+
+def _prefetch_all(
+    items: list[dict],
+    sample: int | None,
+    sample_frac: float | None,
+    cache_dir: str | None,
+    shard_index: int | None = None,
+    num_shards: int | None = None,
+) -> dict[str, tuple[Dataset, int]]:
+    """Load, sample, and optionally shard all source datasets concurrently.
+
+    Downloads happen via the HF Hub client which is I/O-bound, so
+    overlapping across sources saves wall-clock time proportional to the
+    number of sources.
+    """
+    def _load_and_sample(item: dict) -> tuple[str, Dataset, int]:
+        ds = load_raw_dataset(item, cache_dir=cache_dir)
+        full_count = len(ds)
+        if sample is not None and sample < full_count:
+            n = min(sample, full_count)
+            indices = sorted(random.Random(42).sample(range(full_count), n))
+            ds = ds.select(indices)
+        elif sample_frac is not None and 0 < sample_frac < 1:
+            n = max(1, int(full_count * sample_frac))
+            indices = sorted(random.Random(42).sample(range(full_count), n))
+            ds = ds.select(indices)
+        if num_shards is not None and num_shards > 1:
+            ds = ds.shard(num_shards=num_shards, index=shard_index, contiguous=True)
+        return item["source_label"], ds, full_count
+
+    with ThreadPoolExecutor(max_workers=min(4, len(items))) as pool:
+        futures = {pool.submit(_load_and_sample, it): it["source_label"] for it in items}
+        results: dict[str, tuple[Dataset, int]] = {}
+        for future in as_completed(futures):
+            label = futures[future]
+            try:
+                _, ds, full_count = future.result()
+                results[label] = (ds, full_count)
+                logger.info(
+                    "  Pre-fetched %s (%d rows, sampled to %d)",
+                    label, full_count, len(ds),
+                )
+            except Exception:
+                logger.exception("  Failed to pre-fetch %s", label)
+                raise
+    return results
+
+
+# ======================================================================
 # Top-level pipeline
 # ======================================================================
 
@@ -347,9 +458,12 @@ def run_pipeline(
     sample: int | None = None,
     sample_frac: float | None = None,
     max_turns: int = 999,
+    require_task_complete: bool = True,
     cache_dir: str | None = None,
     sources_yaml: Path | str | None = None,
     num_examples: int = 3,
+    shard_index: int | None = None,
+    num_shards: int | None = None,
 ) -> dict:
     """Run the full conversion pipeline.
 
@@ -373,6 +487,10 @@ def run_pipeline(
         Path to the YAML registry (default: ``config/sources.yaml``).
     num_examples : int
         Number of qualitative examples to sample per source for the report.
+    shard_index : int | None
+        When running distributed, which shard this worker handles (0-based).
+    num_shards : int | None
+        Total number of shards to split each source into.
 
     Returns
     -------
@@ -400,24 +518,33 @@ def run_pipeline(
     sample_desc = f"sample={sample}" if sample else (
         f"sample_frac={sample_frac}" if sample_frac else "full"
     )
+    shard_desc = f", shard {shard_index}/{num_shards}" if num_shards else ""
     logger.info(
-        "Pipeline starting: %d source(s), %d workers, %s",
-        len(items), num_workers, sample_desc,
+        "Pipeline starting: %d source(s), %d workers, %s%s",
+        len(items), num_workers, sample_desc, shard_desc,
+    )
+
+    # Pre-fetch all source datasets concurrently (overlaps I/O)
+    logger.info("Pre-fetching %d source dataset(s) concurrently ...", len(items))
+    prefetched = _prefetch_all(
+        items, sample, sample_frac, cache_dir,
+        shard_index=shard_index, num_shards=num_shards,
     )
 
     all_stats: list[dict] = []
     all_examples: list[dict] = []
     all_dropped_examples: list[dict] = []
     for item in items:
+        label = item["source_label"]
         stats, examples, dropped_examples = process_source(
             item,
             output_dir=output_dir,
             num_workers=num_workers,
-            sample=sample,
-            sample_frac=sample_frac,
             max_turns=max_turns,
+            require_task_complete=require_task_complete,
             cache_dir=cache_dir,
             num_examples=num_examples,
+            preloaded=prefetched[label],
         )
         all_stats.append(stats)
         all_examples.extend(examples)
@@ -430,9 +557,103 @@ def run_pipeline(
         json.dump(report, f, indent=2)
     logger.info("Report written to %s", report_path)
 
-    # Print rich terminal summary
-    print_report(report, examples=all_examples, dropped_examples=all_dropped_examples)
+    # Print rich terminal summary + save plain-text copy
+    report_txt_path = output_dir / "conversion_report.txt"
+    print_report(
+        report, examples=all_examples, dropped_examples=all_dropped_examples,
+        save_path=report_txt_path,
+    )
+    logger.info("Text report written to %s", report_txt_path)
 
+    return report
+
+
+def merge_shards(
+    shard_dirs: list[Path | str],
+    output_dir: Path | str,
+) -> dict:
+    """Combine outputs from multiple sharded pipeline runs.
+
+    Concatenates per-source Parquet files, merges dropped-trace JSONL files,
+    and aggregates per-shard conversion reports into one final report.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    parquet_groups: dict[str, list[Path]] = {}
+    dropped_groups: dict[str, list[Path]] = {}
+    shard_reports: list[dict] = []
+
+    for d in shard_dirs:
+        d = Path(d)
+        if not d.is_dir():
+            logger.warning("Shard dir %s does not exist, skipping", d)
+            continue
+        for f in d.glob("*.parquet"):
+            parquet_groups.setdefault(f.name, []).append(f)
+        for f in d.glob("*_dropped.jsonl"):
+            dropped_groups.setdefault(f.name, []).append(f)
+        report_f = d / "conversion_report.json"
+        if report_f.exists():
+            with open(report_f) as fh:
+                shard_reports.append(json.load(fh))
+
+    # Concatenate per-source Parquet files
+    for name, files in parquet_groups.items():
+        tables = [pq.read_table(str(f)) for f in sorted(files)]
+        merged = pa.concat_tables(tables, promote_options="default")
+        pq.write_table(merged, str(output_dir / name))
+        logger.info("  Merged %s (%d shards, %d rows)", name, len(files), merged.num_rows)
+
+    # Concatenate dropped JSONL files
+    for name, files in dropped_groups.items():
+        with open(output_dir / name, "w") as out:
+            for f in sorted(files):
+                with open(f) as inp:
+                    for line in inp:
+                        out.write(line)
+
+    # Merge per-shard statistics
+    merged_per_source: dict[str, dict] = {}
+    for report in shard_reports:
+        for label, stats in report.get("per_source", {}).items():
+            if label not in merged_per_source:
+                merged_per_source[label] = {
+                    "source_label": label,
+                    "input_traces": 0,
+                    "output_traces": 0,
+                    "dropped": 0,
+                    "drop_reasons": {},
+                    "json_strategy_distribution": {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+                    "warning_counts": {},
+                    "turn_stats": {},
+                    "elapsed_seconds": 0,
+                }
+            m = merged_per_source[label]
+            m["input_traces"] += stats["input_traces"]
+            m["output_traces"] += stats["output_traces"]
+            m["dropped"] += stats["dropped"]
+            m["elapsed_seconds"] = round(
+                m["elapsed_seconds"] + stats.get("elapsed_seconds", 0), 1,
+            )
+            for k, v in stats.get("drop_reasons", {}).items():
+                m["drop_reasons"][k] = m["drop_reasons"].get(k, 0) + v
+            for k, v in stats.get("warning_counts", {}).items():
+                m["warning_counts"][k] = m["warning_counts"].get(k, 0) + v
+            for k, v in stats.get("json_strategy_distribution", {}).items():
+                m["json_strategy_distribution"][int(k)] = (
+                    m["json_strategy_distribution"].get(int(k), 0) + v
+                )
+
+    all_stats = list(merged_per_source.values())
+    report = _build_report(all_stats)
+    report_path = output_dir / "conversion_report.json"
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    logger.info("Merged %d shard(s) → %s", len(shard_dirs), report_path)
+    report_txt_path = output_dir / "conversion_report.txt"
+    print_report(report, examples=[], dropped_examples=[], save_path=report_txt_path)
     return report
 
 
@@ -443,7 +664,7 @@ def _build_report(all_stats: list[dict]) -> dict:
 
     agg_drop: dict[str, int] = {}
     agg_warn: dict[str, int] = {}
-    agg_strat = {1: 0, 2: 0, 3: 0, 0: 0}
+    agg_strat = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
     for s in all_stats:
         for k, v in s["drop_reasons"].items():
             agg_drop[k] = agg_drop.get(k, 0) + v
@@ -548,6 +769,13 @@ def _parse_args() -> argparse.Namespace:
         help="Drop traces exceeding this many turns (default: 999, effectively no limit).",
     )
     p.add_argument(
+        "--include-partial",
+        action="store_true",
+        default=False,
+        help="Keep traces that never set task_complete (partial/truncated). "
+             "They are flagged with a 'no_task_complete' warning for downstream filtering.",
+    )
+    p.add_argument(
         "--num-examples",
         type=int,
         default=3,
@@ -565,6 +793,27 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Path to the YAML source registry.",
     )
+
+    shard_group = p.add_argument_group("sharding", "Distributed processing across jobs")
+    shard_group.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        help="Which shard this worker handles (0-based).  Use with --num-shards.",
+    )
+    shard_group.add_argument(
+        "--num-shards",
+        type=int,
+        default=None,
+        help="Total number of shards to split each source into.",
+    )
+    shard_group.add_argument(
+        "--merge-shards",
+        nargs="+",
+        metavar="DIR",
+        default=None,
+        help="Merge previously-sharded outputs.  Pass the shard output directories.",
+    )
     return p.parse_args()
 
 
@@ -574,6 +823,19 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     args = _parse_args()
+
+    if args.merge_shards:
+        if not args.output_dir:
+            raise SystemExit("--output-dir is required when using --merge-shards")
+        merge_shards(
+            shard_dirs=[Path(d) for d in args.merge_shards],
+            output_dir=Path(args.output_dir),
+        )
+        return
+
+    if (args.shard_index is None) != (args.num_shards is None):
+        raise SystemExit("--shard-index and --num-shards must be used together")
+
     run_pipeline(
         sources=args.sources,
         output_dir=args.output_dir,
@@ -581,9 +843,12 @@ def main() -> None:
         sample=args.sample,
         sample_frac=args.sample_frac,
         max_turns=args.max_turns,
+        require_task_complete=not args.include_partial,
         cache_dir=args.cache_dir,
         sources_yaml=args.sources_yaml,
         num_examples=args.num_examples,
+        shard_index=args.shard_index,
+        num_shards=args.num_shards,
     )
 
 

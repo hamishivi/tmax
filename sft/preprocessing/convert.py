@@ -112,7 +112,9 @@ def convert_trace(
     # ------------------------------------------------------------------
     i = 1
     turn_index = 0
-    strategy_counts: dict[str, int] = {"1": 0, "2": 0, "3": 0, "0": 0}
+    strategy_counts: dict[str, int] = {
+        "0": 0, "1": 0, "2": 0, "3": 0, "4": 0, "5": 0,
+    }
     json_failed = False
     has_task_complete = False
 
@@ -179,7 +181,7 @@ def convert_trace(
         "run_id": row.get("run_id", ""),
         "trial_name": conversation_id,
         "date": row.get("date", ""),
-        "enable_thinking": row.get("enable_thinking", None),
+        "enable_thinking": bool(row.get("enable_thinking", False)),
         "num_turns": turn_index,
         "num_warnings": len(warnings),
         "json_strategy_counts": strategy_counts,
