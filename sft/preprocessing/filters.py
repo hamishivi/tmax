@@ -64,7 +64,7 @@ def apply_warning_flags(row: dict) -> list[str]:
 def apply_optional_filters(
     row: dict,
     *,
-    max_turns: int = 20,
+    max_turns: int = 999,
     drop_trivial_only: bool = False,
 ) -> FilterVerdict:
     """Configurable quality heuristics.  Each can be toggled independently."""

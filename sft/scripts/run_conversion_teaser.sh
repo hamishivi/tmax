@@ -10,15 +10,15 @@ cd "$(dirname "$0")/.."
 #
 # Usage:
 #   bash scripts/run_conversion_teaser.sh
-#   bash scripts/run_conversion_teaser.sh --num-examples 5   # more examples
+# (edit the variables below to tweak behaviour)
 #
-# Output goes to preprocessing/output_teaser/ (separate from full runs).
+# Output: preprocessing/terminus2_sweagent_1pct/ (1% sample, separate from full).
 
-NUM_WORKERS="${NUM_WORKERS:-$(nproc)}"
-OUTPUT_DIR="${OUTPUT_DIR:-preprocessing/output_teaser}"
-SAMPLE_FRAC="${SAMPLE_FRAC:-0.01}"
-MAX_TURNS="${MAX_TURNS:-20}"
-NUM_EXAMPLES="${NUM_EXAMPLES:-3}"
+NUM_WORKERS="$(nproc)"
+OUTPUT_DIR="preprocessing/terminus2_sweagent_1pct"
+SAMPLE_FRAC="0.01"
+MAX_TURNS=999
+NUM_EXAMPLES=3
 
 echo "=== Teaser Run: ${SAMPLE_FRAC} ($(echo "${SAMPLE_FRAC} * 100" | bc)%) of each source ==="
 echo "  Workers:    ${NUM_WORKERS}"

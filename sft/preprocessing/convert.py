@@ -112,7 +112,7 @@ def convert_trace(
     # ------------------------------------------------------------------
     i = 1
     turn_index = 0
-    strategy_counts = {1: 0, 2: 0, 3: 0, 0: 0}
+    strategy_counts: dict[str, int] = {"1": 0, "2": 0, "3": 0, "0": 0}
     json_failed = False
     has_task_complete = False
 
@@ -126,7 +126,7 @@ def convert_trace(
 
         # --- Parse assistant JSON ---
         parsed, prose, strategy = extract_json_from_content(msg["content"])
-        strategy_counts[strategy] += 1
+        strategy_counts[str(strategy)] += 1
 
         if parsed is None:
             json_failed = True

@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
         "--data_dir",
         type=str,
         default=None,
-        help="Directory containing converted Parquet files (default: preprocessing/output).",
+        help="Directory containing converted Parquet files (default: preprocessing/terminus2_sweagent).",
     )
     p.add_argument(
         "--sources",
@@ -108,7 +108,7 @@ def parse_args() -> argparse.Namespace:
 
     # Training
     p.add_argument("--num_gpus", type=int, default=8, help="Total GPU count (for grad accum calc)")
-    p.add_argument("--max_length", type=int, default=32768)
+    p.add_argument("--max_length", type=int, default=65536)
     p.add_argument("--num_train_epochs", type=int, default=2)
     p.add_argument("--per_device_train_batch_size", type=int, default=1)
     p.add_argument("--global_batch_size", type=int, default=128)

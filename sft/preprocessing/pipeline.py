@@ -16,6 +16,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import time
 from fnmatch import fnmatch
 from functools import partial
@@ -24,7 +25,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
-from datasets import Dataset, load_dataset
+from datasets import Dataset, Sequence, Value, load_dataset
 from datasets.table import InMemoryTable
 from huggingface_hub import HfApi, hf_hub_download
 
@@ -40,7 +41,7 @@ from preprocessing.report import print_report
 logger = logging.getLogger(__name__)
 
 _CONFIG_DIR = Path(__file__).resolve().parent / "config"
-_DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+_DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "terminus2_sweagent"
 
 
 # ======================================================================
@@ -112,12 +113,21 @@ def _read_parquet_files(
     columns: list[str] | None = None,
 ) -> pa.Table:
     """Read parquet files with batched iteration to avoid the pyarrow nested-
-    array size bug on large row groups."""
-    batches: list[pa.RecordBatch] = []
+    array size bug on large row groups.
+
+    Uses ``pa.concat_tables`` with schema promotion so files that differ by a
+    column (e.g. one subset has ``source`` and another doesn't) are merged
+    gracefully instead of raising ``ArrowInvalid``.
+    """
+    tables: list[pa.Table] = []
     for path in local_paths:
         pf = pq.ParquetFile(path)
-        batches.extend(pf.iter_batches(batch_size=1024, columns=columns))
-    return pa.Table.from_batches(batches)
+        batches = list(pf.iter_batches(batch_size=1024, columns=columns))
+        if batches:
+            tables.append(pa.Table.from_batches(batches))
+    if not tables:
+        raise ValueError(f"No data found in parquet files: {local_paths}")
+    return pa.concat_tables(tables, promote_options="default")
 
 
 def load_raw_dataset(item: dict, cache_dir: str | None = None) -> Dataset:
@@ -212,7 +222,14 @@ def process_source(
 
     # 3. Filter
     filter_fn = partial(_filter_and_flag, max_turns=max_turns)
-    ds = ds.map(filter_fn, num_proc=num_workers, desc=f"Filtering {label}")
+    filter_features = ds.features.copy()
+    filter_features["_keep"] = Value("bool")
+    filter_features["_drop_reason"] = Value("string")
+    filter_features["_warning_flags"] = Sequence(Value("string"))
+    ds = ds.map(
+        filter_fn, num_proc=num_workers, features=filter_features,
+        desc=f"Filtering {label}",
+    )
 
     kept = ds.filter(lambda r: r["_keep"], num_proc=num_workers)
     dropped = ds.filter(lambda r: not r["_keep"], num_proc=num_workers)
@@ -248,10 +265,10 @@ def process_source(
         }
 
     # 5. Collect qualitative examples (sample from kept traces)
+    rng = random.Random(42)
+
     examples: list[dict] = []
     if len(kept) > 0 and num_examples > 0:
-        import random
-        rng = random.Random(42)
         indices = rng.sample(range(len(kept)), min(num_examples, len(kept)))
         for idx in indices:
             row = kept[idx]
@@ -260,6 +277,29 @@ def process_source(
                 "messages": row.get("messages", []),
                 "metadata": row.get("metadata", {}),
             })
+
+    # 5b. Sample dropped traces per drop reason for diagnosis
+    dropped_examples: list[dict] = []
+    if len(dropped) > 0:
+        reason_indices: dict[str, list[int]] = {}
+        for idx, reason in enumerate(dropped["_drop_reason"]):
+            reason_indices.setdefault(reason, []).append(idx)
+        conv_col = item["conversations_column"]
+        for reason, indices in reason_indices.items():
+            sampled = rng.sample(indices, min(2, len(indices)))
+            for idx in sampled:
+                row = dropped[idx]
+                raw_convos = row.get(conv_col, [])
+                dropped_examples.append({
+                    "source": row.get("source", label),
+                    "drop_reason": reason,
+                    "trial_name": row.get("metadata", {}).get("trial_name", "?"),
+                    "messages": row.get("messages", []),
+                    "warnings": row.get("warnings", []),
+                    "num_raw_messages": len(raw_convos),
+                    "raw_first_user": _extract_first_user(raw_convos),
+                    "raw_last_assistant": _extract_last_assistant(raw_convos),
+                })
 
     # 6. Save kept traces (only training-relevant columns)
     out_path = output_dir / f"{safe_name}.parquet"
@@ -292,7 +332,7 @@ def process_source(
         "  %s: %d -> %d traces (dropped %d) in %.1fs",
         label, input_count, len(kept), len(dropped), elapsed,
     )
-    return stats, examples
+    return stats, examples, dropped_examples
 
 
 # ======================================================================
@@ -306,7 +346,7 @@ def run_pipeline(
     num_workers: int | None = None,
     sample: int | None = None,
     sample_frac: float | None = None,
-    max_turns: int = 20,
+    max_turns: int = 999,
     cache_dir: str | None = None,
     sources_yaml: Path | str | None = None,
     num_examples: int = 3,
@@ -367,8 +407,9 @@ def run_pipeline(
 
     all_stats: list[dict] = []
     all_examples: list[dict] = []
+    all_dropped_examples: list[dict] = []
     for item in items:
-        stats, examples = process_source(
+        stats, examples, dropped_examples = process_source(
             item,
             output_dir=output_dir,
             num_workers=num_workers,
@@ -380,6 +421,7 @@ def run_pipeline(
         )
         all_stats.append(stats)
         all_examples.extend(examples)
+        all_dropped_examples.extend(dropped_examples)
 
     # Aggregate report
     report = _build_report(all_stats)
@@ -389,7 +431,7 @@ def run_pipeline(
     logger.info("Report written to %s", report_path)
 
     # Print rich terminal summary
-    print_report(report, examples=all_examples)
+    print_report(report, examples=all_examples, dropped_examples=all_dropped_examples)
 
     return report
 
@@ -431,8 +473,31 @@ def _build_report(all_stats: list[dict]) -> dict:
 # Utilities
 # ======================================================================
 
+def _extract_first_user(raw_convos: list[dict], max_len: int = 300) -> str:
+    """Return the first user message content, truncated."""
+    for msg in raw_convos:
+        if msg.get("role") == "user":
+            text = msg.get("content", "")
+            if len(text) > max_len:
+                return text[:max_len] + "..."
+            return text
+    return ""
+
+
+def _extract_last_assistant(raw_convos: list[dict], max_len: int = 300) -> str:
+    """Return the last assistant message content, truncated."""
+    for msg in reversed(raw_convos):
+        if msg.get("role") == "assistant":
+            text = msg.get("content", "")
+            if len(text) > max_len:
+                return text[:max_len] + "..."
+            return text
+    return ""
+
+
 def _save_jsonl(ds: Dataset, path: Path) -> None:
-    keep = {"messages", "source", "metadata", "warnings", "_drop_reason"}
+    keep = {"messages", "source", "metadata", "warnings", "_drop_reason",
+            "conversations"}
     cols = [c for c in ds.column_names if c in keep]
     subset = ds.select_columns(cols)
     subset.to_json(str(path), lines=True)
@@ -479,8 +544,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-turns",
         type=int,
-        default=20,
-        help="Drop traces exceeding this many turns (default: 20).",
+        default=999,
+        help="Drop traces exceeding this many turns (default: 999, effectively no limit).",
     )
     p.add_argument(
         "--num-examples",

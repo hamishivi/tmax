@@ -8,15 +8,15 @@ cd "$(dirname "$0")/.."
 #
 # Usage:
 #   bash scripts/run_conversion.sh                        # full pipeline
-#   bash scripts/run_conversion.sh --sample 1000          # 1K per source
-#   bash scripts/run_conversion.sh --sample-frac 0.01     # 1% per source
+# (edit the variables below to tweak behaviour; for ad-hoc overrides you
+#  can still pass CLI flags like --sample or --sample-frac if needed)
 #
 # Sources are defined in preprocessing/config/sources.yaml.
-# Output goes to preprocessing/output/.
+# Output: preprocessing/terminus2_sweagent/
 
-NUM_WORKERS="${NUM_WORKERS:-$(nproc)}"
-OUTPUT_DIR="${OUTPUT_DIR:-preprocessing/output}"
-MAX_TURNS="${MAX_TURNS:-20}"
+NUM_WORKERS="$(nproc)"
+OUTPUT_DIR="preprocessing/terminus2_sweagent"
+MAX_TURNS=999
 
 echo "=== Terminus-2 -> SWE-Agent Conversion Pipeline ==="
 echo "  Workers:    ${NUM_WORKERS}"

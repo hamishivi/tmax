@@ -18,7 +18,7 @@ from datasets import Dataset, concatenate_datasets, load_dataset
 
 from preprocessing.convert import get_tool_schemas
 
-_DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "preprocessing" / "output"
+_DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "preprocessing" / "terminus2_sweagent"
 
 TRAIN_COLUMNS = {"messages", "tools"}
 
@@ -35,7 +35,7 @@ def load_converted_corpus(
     ----------
     data_dir : path
         Directory containing the Parquet files produced by the conversion
-        pipeline (default: ``sft/preprocessing/output``).
+        pipeline (default: ``sft/preprocessing/terminus2_sweagent``).
     sources : list[str] | None
         Source labels to include (e.g.
         ``["nvidia/Nemotron-Terminal-Corpus/skill_based_easy"]``).

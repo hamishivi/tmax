@@ -176,8 +176,8 @@ class TestBuildSubmitMessages:
         msgs = build_submit_messages(parsed, "trace_1", 2, "Done reasoning.")
         assert len(msgs) == 1
         assert msgs[0]["role"] == "assistant"
-        assert msgs[0]["tool_calls"][0]["function"]["name"] == "submit"
-        assert msgs[0]["tool_calls"][0]["function"]["arguments"] == {}
+        assert msgs[0]["tool_calls"][0]["function"]["name"] == "bash"
+        assert "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in msgs[0]["tool_calls"][0]["function"]["arguments"]["command"]
         assert msgs[0]["reasoning_content"] == "Done reasoning."
 
     def test_task_complete_true_with_commands(self):

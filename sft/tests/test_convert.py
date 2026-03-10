@@ -131,7 +131,8 @@ class TestConvertValidTrace:
         result = convert_trace(row)
         msgs = result["messages"]
         submit_msgs = [m for m in msgs if m.get("tool_calls") and
-                       m["tool_calls"][0]["function"]["name"] == "submit"]
+                       "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in
+                       m["tool_calls"][0]["function"]["arguments"].get("command", "")]
         assert len(submit_msgs) == 1
 
     def test_metadata(self):

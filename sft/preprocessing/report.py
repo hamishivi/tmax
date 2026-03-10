@@ -87,7 +87,11 @@ def _print_section(title: str) -> None:
 # Public API
 # ---------------------------------------------------------------------------
 
-def print_report(report: dict, examples: list[dict] | None = None) -> None:
+def print_report(
+    report: dict,
+    examples: list[dict] | None = None,
+    dropped_examples: list[dict] | None = None,
+) -> None:
     """Print a rich terminal summary of the conversion report.
 
     Parameters
@@ -97,6 +101,11 @@ def print_report(report: dict, examples: list[dict] | None = None) -> None:
     examples : list[dict] | None
         Optional list of sampled converted traces to display as qualitative
         examples.  Each dict should have ``source``, ``messages``, ``metadata``.
+    dropped_examples : list[dict] | None
+        Optional list of sampled *dropped* traces for diagnosis.  Each dict
+        has ``source``, ``drop_reason``, ``trial_name``, ``messages``,
+        ``warnings``, ``num_raw_messages``, ``raw_first_user``,
+        ``raw_last_assistant``.
     """
     _print_header("Terminus-2 -> SWE-Agent Conversion Report")
 
@@ -204,11 +213,16 @@ def print_report(report: dict, examples: list[dict] | None = None) -> None:
     else:
         print("  No warnings.\n")
 
-    # ---- Qualitative examples ----
+    # ---- Qualitative examples (kept) ----
     if examples:
-        _print_section(f"Qualitative Examples ({len(examples)} sampled traces)")
+        _print_section(f"Qualitative Examples ({len(examples)} sampled kept traces)")
         for idx, ex in enumerate(examples):
             _print_example(idx + 1, ex)
+
+    # ---- Dropped trace examples ----
+    if dropped_examples:
+        _print_section(f"Dropped Trace Examples ({len(dropped_examples)} sampled)")
+        _print_dropped_examples(dropped_examples)
 
     # ---- Footer ----
     print(_c("-" * 72, _DIM))
@@ -252,9 +266,10 @@ def _print_example(num: int, ex: dict) -> None:
                     args = fn.get("arguments", {})
                     if name == "bash":
                         cmd = args.get("command", "")
-                        print(f"    {_c('[bash]', _GREEN)}    {_truncate(cmd, 100)}")
-                    elif name == "submit":
-                        print(f"    {_c('[submit]', _GREEN)}")
+                        if "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in cmd:
+                            print(f"    {_c('[submit]', _GREEN)}")
+                        else:
+                            print(f"    {_c('[bash]', _GREEN)}    {_truncate(cmd, 100)}")
             elif not reasoning:
                 content = msg.get("content", "")
                 if content:
@@ -267,6 +282,59 @@ def _print_example(num: int, ex: dict) -> None:
     print()
     print(f"    {_c('---', _DIM)}")
     print()
+
+
+def _print_dropped_examples(dropped_examples: list[dict]) -> None:
+    """Print dropped trace examples grouped by drop reason."""
+    by_reason: dict[str, list[dict]] = {}
+    for ex in dropped_examples:
+        by_reason.setdefault(ex["drop_reason"], []).append(ex)
+
+    for reason, examples in sorted(by_reason.items()):
+        print(f"  {_c(f'Drop reason: {reason}', _RED + _BOLD)}  ({len(examples)} sampled)")
+        print()
+        for ex in examples:
+            source = _short_label(ex.get("source", "?"))
+            trial = ex.get("trial_name", "?")
+            n_raw = ex.get("num_raw_messages", 0)
+            n_converted = len(ex.get("messages", []))
+            warnings = ex.get("warnings", [])
+
+            print(f"    {_c('source', _DIM)}={source}  "
+                  f"{_c('trial', _DIM)}={trial}  "
+                  f"{_c('raw_msgs', _DIM)}={n_raw}  "
+                  f"{_c('converted_msgs', _DIM)}={n_converted}")
+
+            if warnings:
+                print(f"    {_c('warnings:', _YELLOW)}  {', '.join(warnings[:5])}"
+                      f"{'...' if len(warnings) > 5 else ''}")
+
+            first_user = ex.get("raw_first_user", "")
+            if first_user:
+                print(f"    {_c('[first user]', _CYAN)}  {_truncate(first_user, 120)}")
+
+            last_asst = ex.get("raw_last_assistant", "")
+            if last_asst:
+                print(f"    {_c('[last asst]', _YELLOW)}  {_truncate(last_asst, 120)}")
+
+            if n_converted > 0:
+                msgs = ex.get("messages", [])
+                last_msg = msgs[-1]
+                role = last_msg.get("role", "?")
+                content = last_msg.get("content", "")
+                tool_calls = last_msg.get("tool_calls", [])
+                if tool_calls:
+                    fn = tool_calls[0].get("function", {})
+                    cmd = fn.get("arguments", {}).get("command", "")
+                    print(f"    {_c('[last converted: ' + role + ']', _DIM)}  "
+                          f"bash: {_truncate(cmd, 100)}")
+                elif content:
+                    print(f"    {_c('[last converted: ' + role + ']', _DIM)}  "
+                          f"{_truncate(content, 100)}")
+
+            print()
+        print(f"    {_c('---', _DIM)}")
+        print()
 
 
 # ---------------------------------------------------------------------------

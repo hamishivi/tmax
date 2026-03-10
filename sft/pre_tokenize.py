@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
         "--data_dir",
         type=str,
         default=None,
-        help="Directory containing converted Parquet files (default: preprocessing/output).",
+        help="Directory containing converted Parquet files (default: preprocessing/terminus2_sweagent).",
     )
     p.add_argument(
         "--sources",

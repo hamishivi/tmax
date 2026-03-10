@@ -116,6 +116,9 @@ def build_tool_result(user_content: str, tool_call_id: str) -> dict:
     }
 
 
+SUBMIT_COMMAND = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+
+
 # ---------------------------------------------------------------------------
 # Submit handling
 # ---------------------------------------------------------------------------
@@ -126,7 +129,7 @@ def build_submit_messages(
     turn_index: int,
     reasoning_content: str,
 ) -> list[dict]:
-    """Return a ``submit`` tool_call assistant message when
+    """Return a ``bash`` tool_call that echoes the submit marker when
     ``task_complete`` is ``True``.  Returns an empty list otherwise.
 
     If the turn also had commands, the reasoning is already on the preceding
@@ -143,8 +146,8 @@ def build_submit_messages(
         "tool_calls": [
             {
                 "function": {
-                    "name": "submit",
-                    "arguments": {},
+                    "name": "bash",
+                    "arguments": {"command": SUBMIT_COMMAND},
                 },
                 "id": submit_id,
                 "type": "function",
