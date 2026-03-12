@@ -119,6 +119,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--logging_steps", type=float, default=0.01, help="<1 = ratio of total steps")
     p.add_argument("--save_steps", type=float, default=0.05, help="<1 = ratio of total steps")
     p.add_argument("--packing", action="store_true", default=False)
+    p.add_argument("--optim", type=str, default="adamw_torch",
+                   help="Optimizer name (e.g. adamw_torch, adamw_torch_fused)")
     p.add_argument(
         "--max_train_samples",
         type=int,
@@ -155,7 +157,9 @@ def main():
         #    produce 3D position_ids [rope_heads, batch, seq] where the seq dim is 2, not 1.
         #    Since rotary embeddings are already applied before attention, position_ids at
         #    this stage is only used by FA2 for packed-sequence detection. For 3D (MROPE)
-        #    position_ids we drop it; for 2D we just ensure contiguity.
+        #    position_ids we collapse to 2D by taking the first MROPE dim (identical for
+        #    text-only inputs) so the Ulysses all-gather works on dim=1 and FA2 can still
+        #    detect packed-sequence resets.
         from deepspeed.runtime.sequence_parallel.ulysses_sp import UlyssesSPAttentionHF
 
         _orig_forward = UlyssesSPAttentionHF.forward
@@ -164,7 +168,7 @@ def main():
             if "position_ids" in kwargs and isinstance(kwargs["position_ids"], torch.Tensor):
                 pos = kwargs["position_ids"]
                 if pos.ndim > 2:
-                    kwargs.pop("position_ids")
+                    kwargs["position_ids"] = pos[0].contiguous()
                 elif not pos.is_contiguous():
                     kwargs["position_ids"] = pos.contiguous()
             return _orig_forward(self, module, query, key, value, attention_mask, *args, **kwargs)
@@ -203,7 +207,7 @@ def main():
         max_length=args.max_length,
         bf16=True,
         fp16=False,
-        optim="adamw_torch",
+        optim=args.optim,
         adam_beta1=0.9,
         adam_beta2=0.95,
         gradient_checkpointing=True,

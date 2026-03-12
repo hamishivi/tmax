@@ -9,7 +9,7 @@ MODEL=Qwen/Qwen3.5-4B
 BASE_PATH="/gpfs/scrubbed/osey/tmax"
 
 # Data — points to the full converted output from run_conversion.sh
-DATA_DIR="${BASE_PATH}/sft/output/preprocessing/terminus2_sweagent_full_20260309"
+DATA_DIR="${BASE_PATH}/sft/output/preprocessing/terminus2_sweagent_full_20260310_v2"
 SEED=42
 
 # Tokenization
@@ -17,7 +17,7 @@ MAX_LENGTH=65536
 NUM_PROC="$(nproc)"
 
 # Output path
-DATASET_NAME="tbmax_terminus2_sweagent_full_20260309"
+DATASET_NAME="tbmax_terminus2_sweagent_full_20260310_v2_qwen3.5"
 BASE_NAME="${DATASET_NAME}_${SEED}"
 
 SHARD_ARGS=()

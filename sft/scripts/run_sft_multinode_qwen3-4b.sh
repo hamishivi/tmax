@@ -16,7 +16,7 @@
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=1440G
-#SBATCH --time=8:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/gpfs/scrubbed/osey/tmax/sft/output/slurm-%j.out
 
 set -euo pipefail
@@ -34,7 +34,7 @@ source /gpfs/scrubbed/osey/tmax/.venv/bin/activate
 export TRITON_CACHE_DIR="/gpfs/scrubbed/osey/.triton_cache"
 
 # ── Config ───────────────────────────────────────────────────────────────────
-MODEL="Qwen/Qwen3-4B-Instruct-2507"
+MODEL="/gpfs/scrubbed/osey/tmax/models/Qwen3-4B-Instruct-2507"
 
 GPUS_PER_NODE=8
 NUM_NODES="${SLURM_NNODES:-2}"
@@ -43,10 +43,10 @@ NUM_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 ACCEL_CONFIG="configs/accelerate_ds_z3_sp8_2x8xh200.yaml"
 
 # Data
-TOKENIZED_DATASET="/gpfs/scrubbed/osey/tmax/sft/data/tokenized_tbmax_terminus2_sweagent_full_20260310_qwen3_42"
+TOKENIZED_DATASET="/gpfs/scrubbed/osey/tmax/sft/data/tokenized_tbmax_terminus2_sweagent_full_20260310_v2_qwen3_42"
 
 # Subsampling (comment out to train on the full dataset)
-# MAX_TRAIN_SAMPLES=10000
+MAX_TRAIN_SAMPLES=100000
 SEED=42
 
 # Training hyperparams

@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 #
-# Multi-node SFT training via SLURM.
+# Multi-node SFT training for Qwen3-4B-Instruct-2507 via SLURM.
 #
 # Usage:
-#   sbatch scripts/run_sft_multinode.sh          # submit as batch job
-#   bash  scripts/run_sft_multinode.sh            # run inside an existing salloc
+#   sbatch scripts/run_sft_multinode_qwen3-4b.sh        # submit as batch job
+#   bash  scripts/run_sft_multinode_qwen3-4b.sh          # run inside an existing salloc
 #
 # For salloc, request nodes first (note: --gpus-per-node, NOT --gpus):
 #   salloc --qos=normal --nodes=2 --gpus-per-node=8 --cpus-per-task=8 --mem=1440G --time=8:00:00
 #
 # ── SLURM directives (used by sbatch, ignored by bash) ───────────────────────
-#SBATCH --job-name=sft-multinode
+#SBATCH --job-name=sft-qwen3-4b
 #SBATCH --qos=normal
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=1440G
@@ -34,23 +34,26 @@ source /gpfs/scrubbed/osey/tmax/.venv/bin/activate
 export TRITON_CACHE_DIR="/gpfs/scrubbed/osey/.triton_cache"
 
 # ── Config ───────────────────────────────────────────────────────────────────
-MODEL="/gpfs/scrubbed/osey/tmax/models/Qwen3.5-4B"
+MODEL="/gpfs/scrubbed/osey/tmax/models/Qwen3-4B-Instruct-2507"
 
 GPUS_PER_NODE=8
-NUM_NODES="${SLURM_NNODES:-2}"
+NUM_NODES="${SLURM_NNODES:-1}"
 NUM_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 
-ACCEL_CONFIG="configs/accelerate_ds_z3_sp4_2x8xh200.yaml"
+ACCEL_CONFIG="configs/accelerate_ds_z3_sp8_8xh200.yaml"
 
 # Data
-TOKENIZED_DATASET="/gpfs/scrubbed/osey/tmax/sft/data/tokenized_nemotron-terminal_0.05_42"
+TOKENIZED_DATASET="/gpfs/scrubbed/osey/tmax/sft/data/tokenized_tbmax_terminus2_sweagent_full_20260310_v2_qwen3_42"
 
-# Training hyperparams (match nemotron-terminal-8B)
+# Subsampling (comment out to train on the full dataset)
+MAX_TRAIN_SAMPLES=100000
+SEED=42
+
+# Training hyperparams
 GLOBAL_BATCH_SIZE=128
 MAX_LENGTH=65536
 NUM_EPOCHS=2
 LR=2e-5
-SEED=42
 
 LOGGING_STEPS=1
 SAVE_STEPS=0.1
@@ -69,7 +72,11 @@ for path in $TOKENIZED_DATASET; do
     fi
 done
 
-OUTPUT_DIR="${BASE_PATH}/${MODEL_NAME}_${DATA_NAME}"
+if [ -n "${MAX_TRAIN_SAMPLES:-}" ]; then
+    DATA_NAME="${DATA_NAME}_n${MAX_TRAIN_SAMPLES}"
+fi
+
+OUTPUT_DIR="${BASE_PATH}/${MODEL_NAME}_${DATA_NAME}_single_node"
 mkdir -p "$OUTPUT_DIR"
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -79,10 +86,13 @@ export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
 export MASTER_PORT=${MASTER_PORT:-29500}
 
 echo "=== Multi-node SFT ==="
+echo "  Model:       $MODEL"
 echo "  Nodes:       $NUM_NODES ($SLURM_JOB_NODELIST)"
 echo "  GPUs:        $NUM_GPUS ($GPUS_PER_NODE/node)"
 echo "  Master:      $MASTER_ADDR:$MASTER_PORT"
 echo "  Config:      $ACCEL_CONFIG"
+echo "  Dataset:     $TOKENIZED_DATASET"
+echo "  Subsample:   ${MAX_TRAIN_SAMPLES:-full}"
 echo "  Output:      $OUTPUT_DIR"
 echo "  Log:         $LOG_FILE"
 echo ""
@@ -94,7 +104,7 @@ TRAIN_ARGS=(
     --output_dir "$OUTPUT_DIR"
     --tokenized_dataset_path $TOKENIZED_DATASET
     --num_gpus "$NUM_GPUS"
-    --per_device_train_batch_size 2
+    --per_device_train_batch_size 1
     --max_length "$MAX_LENGTH"
     --num_train_epochs "$NUM_EPOCHS"
     --learning_rate "$LR"
@@ -103,13 +113,13 @@ TRAIN_ARGS=(
     --save_steps "$SAVE_STEPS"
     --seed "$SEED"
     --dataset_num_proc 1
-    --packing
-    --optim adamw_torch_fused
 )
 
+if [ -n "${MAX_TRAIN_SAMPLES:-}" ]; then
+    TRAIN_ARGS+=(--max_train_samples "$MAX_TRAIN_SAMPLES")
+fi
+
 # ── Launch ───────────────────────────────────────────────────────────────────
-# Write a per-node launcher to the shared filesystem.
-# srun runs it once per node; accelerate launch spawns GPUS_PER_NODE processes.
 NODE_LAUNCHER="${OUTPUT_DIR}/.node_launcher_${SLURM_JOB_ID}.sh"
 cat > "$NODE_LAUNCHER" <<LAUNCHER
 #!/usr/bin/env bash
