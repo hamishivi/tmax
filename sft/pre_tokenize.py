@@ -1,5 +1,7 @@
 import argparse
 import json
+import random
+from pathlib import Path
 from typing import Any
 
 from datasets import Dataset, load_from_disk
@@ -8,6 +10,8 @@ from transformers import AutoTokenizer
 from data import load_converted_corpus
 
 from trl.data_utils import maybe_convert_to_chatml, truncate_dataset
+
+_DIAGNOSTICS_FILENAME = "tokenization_diagnostics.jsonl"
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +71,14 @@ def parse_args() -> argparse.Namespace:
         help="If set, also compute assistant_masks matching TRL's assistant_only_loss behavior.",
     )
 
+    # Diagnostics
+    p.add_argument(
+        "--num_diagnostic_samples",
+        type=int,
+        default=10,
+        help="Number of decoded samples to save for inspection (0 to disable).",
+    )
+
     # Sharding
     p.add_argument(
         "--num_shards",
@@ -107,6 +119,40 @@ def _adapt_messages(messages: list[dict], tokenizer) -> list[dict]:
     return adapted
 
 
+def _build_assistant_masks(input_ids: list[int], tokenizer) -> list[int]:
+    """Build assistant token masks by scanning for ChatML role boundaries.
+
+    Qwen chat templates don't support HuggingFace's ``{% generation %}`` tag,
+    so ``apply_chat_template(return_assistant_tokens_mask=True)`` returns
+    all-zero masks.  Instead, we scan the tokenized output for
+    ``<|im_start|>assistant\\n`` ... ``<|im_end|>`` boundaries and mark the
+    content tokens in between as assistant (1), everything else as non-assistant (0).
+    """
+    im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    assistant_token_id = tokenizer.encode("assistant", add_special_tokens=False)[0]
+
+    mask = [0] * len(input_ids)
+    i = 0
+    while i < len(input_ids):
+        if (
+            input_ids[i] == im_start_id
+            and i + 1 < len(input_ids)
+            and input_ids[i + 1] == assistant_token_id
+        ):
+            # Skip <|im_start|> + "assistant" + "\n"
+            content_start = i + 3
+            j = content_start
+            while j < len(input_ids) and input_ids[j] != im_end_id:
+                j += 1
+            for k in range(content_start, j):
+                mask[k] = 1
+            i = j + 1
+        else:
+            i += 1
+    return mask
+
+
 def _tokenize_messages_example(
     example: dict[str, Any],
     tokenizer,
@@ -127,7 +173,6 @@ def _tokenize_messages_example(
         tools=tools,
         tokenize=True,
         return_dict=True,
-        return_assistant_tokens_mask=assistant_only_loss,
     )
 
     input_ids = processed["input_ids"]
@@ -136,13 +181,45 @@ def _tokenize_messages_example(
 
     out: dict[str, Any] = {"input_ids": input_ids}
 
-    if "assistant_masks" in processed:
-        masks = processed["assistant_masks"]
-        if masks and isinstance(masks[0], list):
-            masks = masks[0]
-        out["assistant_masks"] = masks
+    if assistant_only_loss:
+        out["assistant_masks"] = _build_assistant_masks(input_ids, tokenizer)
 
     return out
+
+
+def save_diagnostics(
+    dataset: Dataset,
+    tokenizer,
+    output_dir: str | Path,
+    num_samples: int = 10,
+    seed: int = 42,
+) -> Path:
+    """Decode random samples from a tokenized dataset and save as JSONL.
+
+    Each line contains the sample index, token count, and the full decoded
+    text so you can inspect exactly what the model sees during training.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / _DIAGNOSTICS_FILENAME
+
+    n = min(num_samples, len(dataset))
+    rng = random.Random(seed)
+    indices = sorted(rng.sample(range(len(dataset)), n))
+
+    with open(out_path, "w") as f:
+        for idx in indices:
+            ids = dataset[idx]["input_ids"]
+            decoded = tokenizer.decode(ids)
+            record = {
+                "index": idx,
+                "num_tokens": len(ids),
+                "decoded_text": decoded,
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    print(f"Saved {n} decoded diagnostic samples to {out_path}")
+    return out_path
 
 
 def main() -> None:
@@ -200,6 +277,15 @@ def main() -> None:
         )
 
     dataset.save_to_disk(args.output_path)
+
+    if args.num_diagnostic_samples > 0:
+        save_diagnostics(
+            dataset,
+            tokenizer,
+            output_dir=args.output_path,
+            num_samples=args.num_diagnostic_samples,
+            seed=args.seed,
+        )
 
 
 if __name__ == "__main__":

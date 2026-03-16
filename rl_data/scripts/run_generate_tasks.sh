@@ -10,12 +10,12 @@
 set -euo pipefail
 
 # ---- Parameters (edit here) ----
-NUM_TASKS=30
-OUT_DIR="tasks"
-MODEL="gemini/gemini-3.1-pro"
+NUM_TASKS=10
+OUT_DIR="rl_data/output/tasks"
+MODEL="gemini/gemini-3.1-pro-preview"
 MAX_TOKENS=32768
-BATCH_SIZE=30
-MAX_CONCURRENCY=64
+BATCH_SIZE=10
+MAX_CONCURRENCY=10
 TASK_TEMPERATURE=1.0
 TEST_TEMPERATURE=0.6
 # --------------------------------

@@ -191,20 +191,26 @@ SCENARIO_CONTEXTS = [
     "artifact manager curating binary repositories",
 ]
 
-def random_user_msg() -> str:
-    """Generate a user instruction by randomly selecting inspiration elements."""
+def random_user_msg() -> tuple[str, dict]:
+    """Generate a user instruction by randomly selecting inspiration elements.
+
+    Returns (prompt_string, metadata_dict) where metadata_dict has keys
+    'category', 'complexity', and 'scenario'.
+    """
     category = random.choice(TASK_CATEGORIES)
     complexity = random.choice(COMPLEXITY_LEVELS)
-    context = random.choice(SCENARIO_CONTEXTS)
-    
-    return (
+    scenario = random.choice(SCENARIO_CONTEXTS)
+
+    msg = (
         f"Write a new task focusing on {category}. "
         f"Complexity: {complexity}. "
-        f"Scenario: {context}. "
+        f"Scenario: {scenario}. "
         "Be very specific about the output format in the task description that the automated test will check. "
         "Write the task description in a way that a user might ask an AI assistant. "
         "The task should be a realistic end-to-end scenario that an AI agent could perform in a Linux terminal."
     )
+    metadata = {"category": category, "complexity": complexity, "scenario": scenario}
+    return msg, metadata
 
 
 def generate_templates_batch(
@@ -217,17 +223,19 @@ def generate_templates_batch(
 ) -> list[dict]:
     """Generate multiple task templates in one batched LLM call set.
 
-    Returns a list of dicts with keys ``description`` and ``truth``. Any
-    failed requests are skipped.
+    Returns a list of dicts with keys ``description``, ``truth``,
+    ``category``, ``complexity``, and ``scenario``.
     """
 
     messages: list[list[dict[str, str]]] = []
+    metadata_list: list[dict] = []
     for _ in range(batch_size):
-        user_msg = random_user_msg()
+        user_msg, metadata = random_user_msg()
         messages.append([
             {"role": "system", "content": SYSTEM_MSG},
             {"role": "user", "content": user_msg},
         ])
+        metadata_list.append(metadata)
 
     responses = chat_completion_batch(
         messages,
@@ -239,14 +247,15 @@ def generate_templates_batch(
     )
 
     results: list[dict] = []
-    for resp in responses:
+    for i, resp in enumerate(responses):
         if resp is None:
             continue
         try:
             content = resp.choices[0].message.content.strip()
-            results.append(parse_template(content))
+            parsed = parse_template(content)
+            parsed.update(metadata_list[i])
+            results.append(parsed)
         except Exception:
-            # Skip malformed entries
             continue
     return results
 

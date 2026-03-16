@@ -10,11 +10,38 @@ from data import load_converted_corpus
 
 
 class SFTTrainerSP(SFTTrainer):
-    """Fixes a bug in transformers' deepspeed_sp_compute_loss that accesses
-    accelerator.torch_device_mesh['sp'] which is None for DeepSpeed SP
-    (accelerate's build_device_mesh explicitly returns None for it).
+    """Custom loss for DeepSpeed Ulysses Sequence Parallelism (SP).
 
-    This override uses deepspeed.utils.groups instead of device_mesh.
+    Purpose:
+    ------------------
+    With Ulysses SP, each packed sequence (e.g. 65536 tokens) is sharded across
+    SP ranks (e.g. SP=4 → 16384 tokens/rank).  Each rank runs the forward pass
+    on its shard and gets a *local* mean loss over the tokens it holds.
+
+    The default transformers SP loss (``deepspeed_sp_compute_loss``) tries to
+    aggregate these local losses via ``accelerator.torch_device_mesh['sp']``,
+    but that attribute is None for DeepSpeed SP (accelerate's build_device_mesh
+    explicitly returns None for it).  So we do the aggregation manually using
+    ``deepspeed.utils.groups``.
+
+    Correct aggregation across SP ranks
+    ------------------------------------
+    Each rank's local loss is ``mean(CE over local good tokens)``.  To get the
+    globally correct mean we need to weight each rank's loss by how many "good"
+    (non -100) tokens it had::
+
+        global_loss = Σ_r (local_loss_r × good_tokens_r) / Σ_r good_tokens_r
+
+    Why some ranks can have zero good tokens
+    -----------------------------------------
+    When ``assistant_only_loss`` is used (via the ``assistant_masks`` column in
+    pre-tokenized data), only assistant-generated tokens contribute to the loss;
+    system prompts, user messages, and tool outputs are masked to -100.  After
+    packing + SP sharding, a rank's 16K-token chunk can land entirely within a
+    long tool output region, leaving that rank with ALL labels = -100.  In that
+    case the model's CE returns nan (0/0) and this rank must be excluded from
+    the weighted sum.  The accumulator is initialized as a zero *tensor* (not
+    Python int) so that DeepSpeed's backward always receives a valid scalar.
     """
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -24,24 +51,39 @@ class SFTTrainerSP(SFTTrainer):
                 inputs["labels"] = inputs["shift_labels"]
 
             outputs = model(**inputs)
-            loss = outputs.loss
+            loss = outputs.loss  # local mean CE over this rank's shard
 
             from deepspeed.utils import groups
 
             sp_group = groups._get_sequence_parallel_group()
             sp_world_size = pc.sp_size
 
+            # Gather each rank's local loss and token count across the SP group
             losses_per_rank = torch.distributed.nn.functional.all_gather(loss, group=sp_group)
             good_tokens = (inputs["shift_labels"] != -100).view(-1).sum()
             good_tokens_per_rank = torch.distributed.nn.functional.all_gather(good_tokens, group=sp_group)
 
-            total_loss = sum(
+            # Weighted sum: skip ranks with 0 good tokens (their loss is nan).
+            # sum() of all_gather tensors naturally preserves grad_fn, which
+            # DeepSpeed requires (it checks loss.grad_fn is not None).
+            terms = [
                 losses_per_rank[rank] * good_tokens_per_rank[rank]
                 for rank in range(sp_world_size)
                 if good_tokens_per_rank[rank] > 0
-            )
-            total_good_tokens = sum(good_tokens_per_rank)
-            loss = total_loss / max(total_good_tokens, 1)
+            ]
+            if terms:
+                total_loss = sum(terms)
+                total_good = sum(
+                    good_tokens_per_rank[rank]
+                    for rank in range(sp_world_size)
+                    if good_tokens_per_rank[rank] > 0
+                )
+                loss = total_loss / total_good
+            else:
+                # All SP ranks have 0 good tokens (happens when assistant_masks
+                # masks all labels to -100 in a packed sequence).  Use loss * 0
+                # to preserve grad_fn while producing zero gradient.
+                loss = loss * 0
 
             return (loss, outputs) if return_outputs else loss
 
@@ -121,13 +163,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--packing", action="store_true", default=False)
     p.add_argument("--optim", type=str, default="adamw_torch",
                    help="Optimizer name (e.g. adamw_torch, adamw_torch_fused)")
+    p.add_argument("--wandb_project", type=str, default=None,
+                   help="W&B project name (sets WANDB_PROJECT env var)")
+    p.add_argument("--run_name", type=str, default=None,
+                   help="W&B / TensorBoard run name")
     p.add_argument(
         "--max_train_samples",
         type=int,
         default=None,
         help="If set, subsample the training dataset to this many examples (uses --seed for reproducibility).",
     )
-
     return p.parse_args()
 
 
@@ -191,10 +236,19 @@ def main():
             seed=args.seed,
         )
 
+    if args.wandb_project:
+        os.environ["WANDB_PROJECT"] = args.wandb_project
+
     if args.max_train_samples is not None and args.max_train_samples < len(dataset):
         dataset = dataset.shuffle(seed=args.seed).select(range(args.max_train_samples))
 
+    # NOTE: assistant_only_loss is NOT set here. For pre-tokenized data, the
+    # assistant_masks column (produced by pre_tokenize.py --assistant_only_loss)
+    # is picked up automatically by TRL's DataCollatorForLanguageModeling.
+    # SFTConfig.assistant_only_loss is only needed when TRL tokenizes the data
+    # itself (i.e., non-pre-tokenized conversational datasets with a messages column).
     training_args = SFTConfig(
+        run_name=args.run_name,
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,

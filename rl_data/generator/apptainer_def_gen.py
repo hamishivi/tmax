@@ -23,10 +23,9 @@ Basically ensure that the task is valid when the container is built: Clone a rep
 Install pytest in the container.
 Don't include the tests in the response (no %test)
 The agent will not have root access. So make sure that the right permissions are set for the files and directories.
-Always use this image: docker://ubuntu:22.04
-To add it to the def file, use:
-Bootstrap: localimage
-From: ./ubuntu_22.04.sif"""
+Always use this base image by putting these two lines at the top of the def file:
+Bootstrap: docker
+From: ubuntu:22.04"""
 
 BASE_USER_TEMPLATE = """
 Using the task description template and pytest failures below, output a complete
@@ -85,10 +84,14 @@ def build_and_test(def_template: str, test_py: str) -> tuple[bool, str]:
         # 2. Build the container image from the .def file
         # ------------------------------------------------------------------
         sif_path = td_path / "img.sif"
-        build_rc = subprocess.run(["apptainer", "build", str(sif_path), str(def_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180).returncode
-        if build_rc:
-            print(f"Apptainer build failed: {build_rc}")
-            return False, "Apptainer build failed"
+        build_proc = subprocess.run(
+            ["apptainer", "build", str(sif_path), str(def_path)],
+            capture_output=True, text=True, timeout=180,
+        )
+        if build_proc.returncode:
+            err_snippet = (build_proc.stderr or build_proc.stdout or "")[-500:]
+            print(f"Apptainer build failed (rc={build_proc.returncode}): {err_snippet}")
+            return False, f"Apptainer build failed: {err_snippet}"
 
         # copy the test file to the container at /home/agent/test_initial_state.py
         # shutil.copy(test_file, td_path / "home" / "agent" / "test_initial_state.py")

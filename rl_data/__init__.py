@@ -13,13 +13,15 @@ from typing import Any, Dict, List, Optional
 from tqdm import tqdm
 
 import litellm
+litellm.suppress_debug_info = True
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
-DEFAULT_MODEL = "gemini/gemini-3.1-pro"
+DEFAULT_MODEL = "gemini/gemini-3.1-pro-preview"
 MAX_RETRIES = 5
 
 
@@ -49,6 +51,9 @@ def chat_completion_batch(
                     n=num_completions,
                 )
                 return resp
+            except litellm.exceptions.AuthenticationError as e:
+                logger.error(f"[req {idx}] Auth error (not retrying): {e}")
+                raise
             except Exception as e:
                 last_error = e
                 error_str = str(e)
@@ -59,8 +64,10 @@ def chat_completion_batch(
                         wait_time = 2
                     else:
                         wait_time = 2 ** attempt
+                    logger.warning(f"[req {idx}] attempt {attempt+1}/{MAX_RETRIES} failed: {type(e).__name__}: {str(e)[:200]}")
                     time.sleep(wait_time)
                 else:
+                    logger.error(f"[req {idx}] all {MAX_RETRIES} attempts failed: {type(e).__name__}: {str(e)[:200]}")
                     raise last_error
 
     results: List[Any] = [None] * len(messages)
@@ -125,6 +132,9 @@ def chat_completion_batch_with_tools(
                     max_tokens=max_tokens,
                 )
                 return resp
+            except litellm.exceptions.AuthenticationError as e:
+                logger.error(f"[req {idx}] Auth error (not retrying): {e}")
+                raise
             except Exception as e:
                 last_error = e
                 error_str = str(e)
@@ -135,8 +145,10 @@ def chat_completion_batch_with_tools(
                         wait_time = 2
                     else:
                         wait_time = 2 ** attempt
+                    logger.warning(f"[req {idx}] attempt {attempt+1}/{MAX_RETRIES} failed: {type(e).__name__}: {str(e)[:200]}")
                     time.sleep(wait_time)
                 else:
+                    logger.error(f"[req {idx}] all {MAX_RETRIES} attempts failed: {type(e).__name__}: {str(e)[:200]}")
                     raise last_error
 
     results: List[Any] = [None] * len(messages)

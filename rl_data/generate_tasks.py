@@ -112,6 +112,9 @@ def _generate_batch(cfg: AsyncBatchConfig, batch_count: int) -> List[Optional[Pa
 
     descriptions: List[str] = [t.get("description", "").strip() for t in task_templates]
     truths: List[str] = [t.get("truth", "").strip() for t in task_templates]
+    categories: List[str] = [t.get("category", "") for t in task_templates]
+    complexities: List[str] = [t.get("complexity", "") for t in task_templates]
+    scenarios: List[str] = [t.get("scenario", "") for t in task_templates]
 
     valid_indices = [i for i, (d, tr) in enumerate(zip(descriptions, truths)) if d and tr]
     if not valid_indices:
@@ -120,6 +123,9 @@ def _generate_batch(cfg: AsyncBatchConfig, batch_count: int) -> List[Optional[Pa
 
     descriptions = [descriptions[i] for i in valid_indices]
     truths = [truths[i] for i in valid_indices]
+    categories = [categories[i] for i in valid_indices]
+    complexities = [complexities[i] for i in valid_indices]
+    scenarios = [scenarios[i] for i in valid_indices]
 
     print(f"Task templates generated: {len(descriptions)}")
 
@@ -136,6 +142,9 @@ def _generate_batch(cfg: AsyncBatchConfig, batch_count: int) -> List[Optional[Pa
     valid_indices = [i for i, test in enumerate(init_tests) if test]
     descriptions = [descriptions[i] for i in valid_indices]
     truths = [truths[i] for i in valid_indices]
+    categories = [categories[i] for i in valid_indices]
+    complexities = [complexities[i] for i in valid_indices]
+    scenarios = [scenarios[i] for i in valid_indices]
     init_tests = [init_tests[i] for i in valid_indices]
 
     print(f"Generated {len(init_tests)} initial tests")
@@ -154,6 +163,9 @@ def _generate_batch(cfg: AsyncBatchConfig, batch_count: int) -> List[Optional[Pa
     valid_indices = [i for i, test in enumerate(final_tests) if test]
     descriptions = [descriptions[i] for i in valid_indices]
     truths = [truths[i] for i in valid_indices]
+    categories = [categories[i] for i in valid_indices]
+    complexities = [complexities[i] for i in valid_indices]
+    scenarios = [scenarios[i] for i in valid_indices]
     init_tests = [init_tests[i] for i in valid_indices]
     final_tests = [final_tests[i] for i in valid_indices]
 
@@ -170,6 +182,9 @@ def _generate_batch(cfg: AsyncBatchConfig, batch_count: int) -> List[Optional[Pa
     valid_indices = [i for i, def_text in enumerate(def_candidates) if def_text]
     descriptions = [descriptions[i] for i in valid_indices]
     truths = [truths[i] for i in valid_indices]
+    categories = [categories[i] for i in valid_indices]
+    complexities = [complexities[i] for i in valid_indices]
+    scenarios = [scenarios[i] for i in valid_indices]
     init_tests = [init_tests[i] for i in valid_indices]
     final_tests = [final_tests[i] for i in valid_indices]
     def_candidates = [def_candidates[i] for i in valid_indices]
@@ -182,6 +197,9 @@ def _generate_batch(cfg: AsyncBatchConfig, batch_count: int) -> List[Optional[Pa
     for i in range(len(descriptions)):
         desc = descriptions[i]
         tr = truths[i]
+        cat = categories[i]
+        comp = complexities[i]
+        scen = scenarios[i]
         init_py = init_tests[i]
         def_text = def_candidates[i]
         final_py = final_tests[i]
@@ -191,11 +209,32 @@ def _generate_batch(cfg: AsyncBatchConfig, batch_count: int) -> List[Optional[Pa
             continue
 
         task_dir = _format_task_dir(cfg.out_dir, idx=0)
-        task_obj = {"description": desc, "truth": tr, "name": task_dir.name}
+        task_obj = {
+            "name": task_dir.name,
+            "category": cat,
+            "complexity": comp,
+            "scenario": scen,
+            "description": desc,
+            "truth": tr,
+        }
 
         task_json, init_path, final_path, def_path, sif_path = _save_task_bundle(
             task_dir, task_obj, init_py, def_text, final_py, summary={}
         )
+
+        summary_txt = (
+            f"Task: {task_dir.name}\n"
+            f"Category: {cat}\n"
+            f"Complexity: {comp}\n"
+            f"Scenario: {scen}\n"
+            f"\n{'='*60}\n"
+            f"DESCRIPTION\n{'='*60}\n\n"
+            f"{desc}\n"
+            f"\n{'='*60}\n"
+            f"GROUND TRUTH\n{'='*60}\n\n"
+            f"{tr}\n"
+        )
+        _safe_write_text(task_dir / "task_summary.txt", summary_txt)
 
         saved_paths.append(task_dir)
 

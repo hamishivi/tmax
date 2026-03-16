@@ -45,14 +45,19 @@ def build_and_test(
         def_text = f.read()
 
     if "chmod 755 /home/user" not in def_text:
-        def_lines = [line for line in def_text.split("\n") if "%" in line]
-        post_idx = [i for i, line in enumerate(def_lines) if "post" in line.lower()]
-        next_section_header = def_lines[post_idx[0] + 1]
-        def_text = def_text.replace(
-            next_section_header, next_section_header + "\n    chmod 755 /home/user\n"
-        )
-        with open(def_path, "w") as f:
-            f.write(def_text)
+        section_headers = [line for line in def_text.split("\n") if line.strip().startswith("%")]
+        post_idx = [i for i, line in enumerate(section_headers) if "post" in line.lower()]
+        if post_idx:
+            idx = post_idx[0]
+            if idx + 1 < len(section_headers):
+                next_header = section_headers[idx + 1]
+                def_text = def_text.replace(
+                    next_header, "    chmod 755 /home/user\n" + next_header
+                )
+            else:
+                def_text = def_text.rstrip() + "\n    chmod 755 /home/user\n"
+            with open(def_path, "w") as f:
+                f.write(def_text)
 
     build_rc = subprocess.run(
         ["apptainer", "build", str(sif_path), str(def_path)],
@@ -99,6 +104,16 @@ def process_task(task_dir: str, cfg: SolutionConfig):
 
     print(f"{task_dir} sif_path: {sif_path}")
     pass_at_k = None
+
+    if not sif_path.exists():
+        if not def_path.exists():
+            print(f"[{task_dir.name}] No def file found, skipping.")
+            return "no def"
+        print(f"[{task_dir.name}] Building SIF from def...")
+        ok, msg = build_and_test(sif_path, def_path, initial_test_path.read_text(), run_initial_tests=False)
+        if not ok:
+            print(f"[{task_dir.name}] SIF build failed: {msg}")
+            return "no sif"
 
     try:
         print(f"[{task_dir.name}] Running {cfg.num_solutions} solutions...")

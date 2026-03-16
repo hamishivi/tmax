@@ -177,6 +177,22 @@ def convert_trace(
             tool_result = None
             i += 1
 
+        # --- Submit (truncate at first submit) ---
+        # Check task_complete BEFORE the reasoning-only buffering path,
+        # because Nemotron traces commonly submit with commands: [] which
+        # produces empty tool_calls.
+        if parsed.get("task_complete", False):
+            has_task_complete = True
+            if pending_reasoning:
+                reasoning = (pending_reasoning + "\n\n" + reasoning).strip()
+                pending_reasoning = ""
+            submit_msgs = build_submit_messages(
+                parsed, conversation_id, turn_index, reasoning,
+            )
+            converted.extend(submit_msgs)
+            turn_index += 1
+            break
+
         # --- Reasoning-only assistant: buffer instead of emitting ---
         if not tool_calls:
             pending_reasoning = (
@@ -200,16 +216,6 @@ def convert_trace(
 
         if tool_result is not None:
             converted.append(tool_result)
-
-        # --- Submit (truncate at first submit) ---
-        if parsed.get("task_complete", False):
-            has_task_complete = True
-            submit_msgs = build_submit_messages(
-                parsed, conversation_id, turn_index, reasoning,
-            )
-            converted.extend(submit_msgs)
-            turn_index += 1
-            break
 
         turn_index += 1
 

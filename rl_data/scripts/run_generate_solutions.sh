@@ -10,12 +10,12 @@
 set -euo pipefail
 
 # ---- Parameters (edit here) ----
-TASKS_DIR="/path/to/tasks"
-MODEL="gemini/gemini-3.1-pro"
-NUM_SOLUTIONS=16
+TASKS_DIR="rl_data/output/tasks"
+MODEL="gemini/gemini-3.1-pro-preview"
+NUM_SOLUTIONS=8
 MAX_ACTIONS=16
 MAX_TOKENS=65536
-NUM_TASKS=200
+NUM_TASKS=10
 START_AT=0
 WORKERS=1
 NUM_POOL_WORKERS=128

@@ -43,7 +43,7 @@ NUM_GPUS=$((NUM_NODES * GPUS_PER_NODE))
 ACCEL_CONFIG="configs/accelerate_ds_z3_sp4_2x8xh200.yaml"
 
 # Data
-TOKENIZED_DATASET="/gpfs/scrubbed/osey/tmax/sft/data/tokenized_nemotron-terminal_0.05_42"
+TOKENIZED_DATASET="/gpfs/scrubbed/osey/tmax/sft/data/tokenized_tbmax_terminus2_sweagent_full_20260315_qwen3.5_42"
 
 # Training hyperparams (match nemotron-terminal-8B)
 GLOBAL_BATCH_SIZE=128
@@ -54,6 +54,7 @@ SEED=42
 
 LOGGING_STEPS=1
 SAVE_STEPS=0.1
+WANDB_PROJECT="tmax-sft"
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 BASE_PATH="/gpfs/scrubbed/osey/tmax/sft/output"
@@ -70,6 +71,7 @@ for path in $TOKENIZED_DATASET; do
 done
 
 OUTPUT_DIR="${BASE_PATH}/${MODEL_NAME}_${DATA_NAME}"
+RUN_NAME="${MODEL_NAME}_${DATA_NAME}"
 mkdir -p "$OUTPUT_DIR"
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -94,7 +96,11 @@ TRAIN_ARGS=(
     --output_dir "$OUTPUT_DIR"
     --tokenized_dataset_path $TOKENIZED_DATASET
     --num_gpus "$NUM_GPUS"
-    --per_device_train_batch_size 2
+    --per_device_train_batch_size 1  # MUST be 1 with Ulysses SP: SP registers
+                                     # attention shapes on the first forward pass,
+                                     # so batch size must be constant. Effective
+                                     # batch size is controlled via global_batch_size
+                                     # and gradient accumulation instead.
     --max_length "$MAX_LENGTH"
     --num_train_epochs "$NUM_EPOCHS"
     --learning_rate "$LR"
@@ -105,6 +111,8 @@ TRAIN_ARGS=(
     --dataset_num_proc 1
     --packing
     --optim adamw_torch_fused
+    --wandb_project "$WANDB_PROJECT"
+    --run_name "$RUN_NAME"
 )
 
 # ── Launch ───────────────────────────────────────────────────────────────────

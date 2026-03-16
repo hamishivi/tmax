@@ -19,7 +19,7 @@ SUBSETS="dataset_adapters skill_based_easy skill_based_medium skill_based_mixed"
 SEED=42
 # SAMPLE_FRAC=0.1  # uncomment for a quick test run
 # Optional: path to a pre-tokenized dataset created by pre_tokenize.py
-TOKENIZED_DATASET="/gpfs/scrubbed/osey/tmax/sft/data/tokenized_tbmax_terminus2_sweagent_full_20260310_v2_qwen3_42"
+TOKENIZED_DATASET="/gpfs/scrubbed/osey/tmax/sft/data/tokenized_tbmax_terminus2_sweagent_full_20260315_qwen3.5_42"
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 BASE_PATH="/gpfs/scrubbed/osey/tmax/sft/output"
@@ -44,8 +44,9 @@ else
 fi
 
 OUTPUT_DIR="${BASE_PATH}/${MODEL_NAME}_${DATA_NAME}"
+RUN_NAME="${MODEL_NAME}_${DATA_NAME}"
 
-# Training parameters. Match nemontron-terminal-8B
+# Training parameters
 GLOBAL_BATCH_SIZE=128
 MAX_LENGTH=65536 # 32768 * 2
 NUM_EPOCHS=2
@@ -54,6 +55,7 @@ LR=2e-5
 # Logging / saving (fractional = ratio of total steps; 0.05 ≈ every 0.1 epoch)
 LOGGING_STEPS=1
 SAVE_STEPS=0.1
+WANDB_PROJECT="tmax-sft"
 
 # ── Launch ───────────────────────────────────────────────────────────────────
 DATA_ARGS=(--subsets $SUBSETS)
@@ -79,7 +81,11 @@ COMMON_ARGS=(
     --output_dir "$OUTPUT_DIR"
     "${DATA_ARGS[@]}"
     --num_gpus "$NUM_GPUS"
-    --per_device_train_batch_size 1
+    --per_device_train_batch_size 1  # MUST be 1 with Ulysses SP: SP registers
+                                     # attention shapes on the first forward pass,
+                                     # so batch size must be constant. Effective
+                                     # batch size is controlled via global_batch_size
+                                     # and gradient accumulation instead.
     --max_length "$MAX_LENGTH"
     --num_train_epochs "$NUM_EPOCHS"
     --learning_rate "$LR"
@@ -90,6 +96,8 @@ COMMON_ARGS=(
     --dataset_num_proc 1
     --packing
     --optim adamw_torch_fused
+    --wandb_project "$WANDB_PROJECT"
+    --run_name "$RUN_NAME"
 )
 
 if [ "$BACKEND" = "fsdp" ]; then
