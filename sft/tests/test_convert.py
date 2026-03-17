@@ -8,6 +8,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from preprocessing.convert import convert_trace
+from preprocessing.builders import SUBMIT_COMMAND
 
 
 # ── Fixture: a minimal valid Terminus-2 trace ─────────────────────────
@@ -265,3 +266,108 @@ class TestStructuralIntegrity:
         assert msgs[1]["role"] == "user"
         for m in msgs[2:]:
             assert m["role"] in ("assistant", "tool")
+
+
+# ── Test: premature submit echo handling ─────────────────────────────
+
+class TestDuplicateSubmitIntegration:
+    """End-to-end test through convert_trace with a trace that has a
+    duplicate submit flow (model echoes submit with task_complete: false,
+    harness confirms, model re-submits with task_complete: true)."""
+
+    def test_duplicate_submit_cleaned_in_conversion(self):
+        first_submit = {
+            "role": "assistant",
+            "content": (
+                '{"analysis": "Done, submitting.", "plan": "Submit.", '
+                '"commands": [{"keystrokes": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\\n"}], '
+                '"task_complete": false}'
+            ),
+        }
+        confirmation = {
+            "role": "user",
+            "content": (
+                "Current terminal state:\n"
+                "New Terminal Output:\n"
+                "root@host:/workspace#\n\n"
+                "Are you sure you want to mark the task as complete? "
+                "This will trigger grading.\n"
+            ),
+        }
+        final_submit = {
+            "role": "assistant",
+            "content": (
+                '{"analysis": "Yes.", "plan": "Confirm.", '
+                '"commands": [], "task_complete": true}'
+            ),
+        }
+        row = _make_trace([
+            MSG0, ASSISTANT_1, USER_1,
+            first_submit, confirmation, final_submit,
+        ])
+        result = convert_trace(row, source_label="test/dup")
+
+        assert result["_conversion_ok"] is True
+        msgs = result["messages"]
+
+        submit_echos = [
+            m for m in msgs
+            if m.get("tool_calls") and
+            SUBMIT_COMMAND in m["tool_calls"][0]["function"]["arguments"].get("command", "")
+        ]
+        assert len(submit_echos) == 1, (
+            f"Expected exactly 1 submit echo, got {len(submit_echos)}"
+        )
+
+        assert any("premature submit" in w.lower() for w in result["warnings"])
+
+    def test_premature_submit_reasoning_preserved(self):
+        """Reasoning from the premature submit turn should be merged into the
+        final submit message rather than discarded."""
+        premature = {
+            "role": "assistant",
+            "content": (
+                '{"analysis": "I believe the task is done.", "plan": "Submit now.", '
+                '"commands": [{"keystrokes": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\\n"}], '
+                '"task_complete": false}'
+            ),
+        }
+        confirmation = {
+            "role": "user",
+            "content": (
+                "Current terminal state:\n"
+                "New Terminal Output:\n"
+                "root@host:/workspace#\n\n"
+                "Are you sure you want to mark the task as complete?\n"
+            ),
+        }
+        final_submit = {
+            "role": "assistant",
+            "content": (
+                '{"analysis": "Confirmed.", "plan": "Done.", '
+                '"commands": [], "task_complete": true}'
+            ),
+        }
+        row = _make_trace([MSG0, ASSISTANT_1, USER_1, premature, confirmation, final_submit])
+        result = convert_trace(row)
+        msgs = result["messages"]
+        submit = msgs[-1]
+        assert "reasoning_content" in submit
+        assert "I believe the task is done" in submit["reasoning_content"]
+        assert "Confirmed" in submit["reasoning_content"]
+
+    def test_normal_trace_unaffected(self):
+        """A trace with a single clean submit (task_complete: true) should be
+        completely unaffected by the premature-submit logic."""
+        row = _make_trace([MSG0, ASSISTANT_1, USER_1, ASSISTANT_2])
+        result = convert_trace(row, source_label="test/normal")
+
+        assert result["_conversion_ok"] is True
+        assert not any("premature" in w.lower() for w in result["warnings"])
+        msgs = result["messages"]
+        submit_echos = [
+            m for m in msgs
+            if m.get("tool_calls") and
+            SUBMIT_COMMAND in m["tool_calls"][0]["function"]["arguments"].get("command", "")
+        ]
+        assert len(submit_echos) == 1

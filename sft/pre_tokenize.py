@@ -126,7 +126,9 @@ def _build_assistant_masks(input_ids: list[int], tokenizer) -> list[int]:
     so ``apply_chat_template(return_assistant_tokens_mask=True)`` returns
     all-zero masks.  Instead, we scan the tokenized output for
     ``<|im_start|>assistant\\n`` ... ``<|im_end|>`` boundaries and mark the
-    content tokens in between as assistant (1), everything else as non-assistant (0).
+    content tokens plus the closing ``<|im_end|>`` as assistant (1), everything
+    else as non-assistant (0).  Including ``<|im_end|>`` is critical so the model
+    learns to produce the stop token.
     """
     im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
     im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
@@ -145,7 +147,7 @@ def _build_assistant_masks(input_ids: list[int], tokenizer) -> list[int]:
             j = content_start
             while j < len(input_ids) and input_ids[j] != im_end_id:
                 j += 1
-            for k in range(content_start, j):
+            for k in range(content_start, j + 1): # Include the closing <|im_end|>
                 mask[k] = 1
             i = j + 1
         else:

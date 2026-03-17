@@ -12,6 +12,7 @@ from pathlib import Path
 
 from preprocessing.json_extraction import extract_json_from_content
 from preprocessing.builders import (
+    SUBMIT_COMMAND,
     build_reasoning_content,
     build_submit_messages,
     build_tool_calls,
@@ -141,17 +142,32 @@ def convert_trace(
 
         tool_calls = build_tool_calls(parsed, conversation_id, turn_index)
 
-        # Track C-c usage
+        next_is_user = (
+            (i + 1) < len(messages) and messages[i + 1].get("role") == "user"
+        )
+
+        # Track C-c usage and detect premature submit echoes
         if tool_calls:
             cmd = tool_calls[0]["function"]["arguments"].get("command", "")
             if "C-c" in cmd:
                 has_ctrl_c = True
 
-        # --- Handle tool result (check for harness errors) ---
-        next_is_user = (
-            (i + 1) < len(messages) and messages[i + 1].get("role") == "user"
-        )
+            # The harness sometimes re-prompts after a submit attempt
+            # ("Are you sure?"), so the model echoes the submit command
+            # with task_complete still false.  Skip the turn entirely
+            # and buffer its reasoning for the real submit later.
+            if cmd.strip() == SUBMIT_COMMAND and not parsed.get("task_complete", False):
+                if reasoning:
+                    pending_reasoning = (
+                        (pending_reasoning + "\n\n" + reasoning).strip()
+                        if pending_reasoning else reasoning
+                    )
+                warnings.append(f"Skipped premature submit echo at index {i}")
+                i += 2 if next_is_user else 1
+                turn_index += 1
+                continue
 
+        # --- Handle tool result (check for harness errors) ---
         if tool_calls and next_is_user:
             raw_tool_content = messages[i + 1]["content"]
 
