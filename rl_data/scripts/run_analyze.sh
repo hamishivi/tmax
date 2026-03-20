@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ---- Parameters (edit here) ----
-TASKS_DIR="rl_data/output/tasks"
+TASKS_DIR="rl_data/output/tasks_skill_tax_20260319"
 PLOTS_DIR=""  # leave empty to default to <TASKS_DIR>/analysis
 # --------------------------------
 
