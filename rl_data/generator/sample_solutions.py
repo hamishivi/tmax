@@ -142,6 +142,8 @@ def run_n_solutions(
     shell_init_attempts: int = 3,
     log_commands: bool = False,
     command_log_dir: Optional[str] = None,
+    base_sifs_dir: Optional[str] = None,
+    max_timeouts_per_solution: int = 2,
 ) -> Dict[str, Any]:
     """Produce n interactive solutions for the given task using tool-calling format."""
 
@@ -192,6 +194,7 @@ def run_n_solutions(
                 read_timeout=command_timeout,
                 shell_init_timeout=shell_init_timeout,
                 shell_init_attempts=shell_init_attempts,
+                base_sifs_dir=base_sifs_dir,
             )
             ok = env.initialize(run_initial_tests=False)
             if not ok:
@@ -209,6 +212,7 @@ def run_n_solutions(
 
         is_done: List[bool] = [False] * num_solutions
         not_done_idx: List[int] = list(range(num_solutions))
+        timeout_counts: List[int] = [0] * num_solutions
         num_steps = 0
 
         while not all(is_done):
@@ -296,6 +300,15 @@ def run_n_solutions(
                         result_back = f"{truncated}\n\n(exit_code=0)"
                     else:
                         result_back = f"{truncated}\n\n(exit_code=1)"
+
+                    if "Command timed out" in output:
+                        timeout_counts[idx] += 1
+                        if timeout_counts[idx] >= max_timeouts_per_solution:
+                            is_done[idx] = True
+                            if idx not in to_mark_done:
+                                to_mark_done.append(idx)
+                            if verbose:
+                                print(f"⏹️  Solution {idx} aborted after {timeout_counts[idx]} timeouts")
 
                     if SUBMIT_MARKER in output:
                         is_done[idx] = True

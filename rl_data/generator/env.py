@@ -39,12 +39,17 @@ class InteractiveContainerEnvironment:
         #: too short and causes spurious "Shell init timed out".
         shell_init_timeout: float = 120.0,
         shell_init_attempts: int = 3,
+        #: Directory containing pre-built base SIFs (``base_{domain}.sif``).
+        #: When set, the env uses a shared base SIF + task delta instead of a
+        #: per-task SIF (saves ~200MB per task on disk).
+        base_sifs_dir: Optional[str] = None,
     ):
         # Resolve all incoming paths to absolute paths
         self.sif_path = Path(container_sif_path).expanduser().resolve()
         self.initial_test_path = Path(initial_test_path).expanduser().resolve()
         self.final_test_path = Path(final_test_path).expanduser().resolve()
         self.def_path = Path(def_path).expanduser().resolve()
+        self.base_sifs_dir = Path(base_sifs_dir).resolve() if base_sifs_dir else None
 
         self.max_actions = max_actions
         self.verbose = verbose
@@ -350,14 +355,56 @@ class InteractiveContainerEnvironment:
             )
             self.instance_name = None
 
-    def _materialize_writable_home_user(self) -> Tuple[bool, str]:
-        """Copy the image's ``/home/user`` tree to the host and bind-mount it on the instance.
+    def _resolve_runtime_sif(self) -> Optional[Path]:
+        """Decide which SIF to use: per-task SIF, or a shared base SIF from ``base_sifs_dir``."""
+        if self.sif_path.exists():
+            return self.sif_path
+
+        if self.base_sifs_dir and self.def_path.exists():
+            from rl_data.generator.apptainer_def_gen import parse_def_to_delta, _resolve_base
+            task_json = self.def_path.parent / "task.json"
+            domain_hint = None
+            if task_json.exists():
+                try:
+                    import json as _json
+                    domain_hint = _json.loads(task_json.read_text()).get("domain")
+                except Exception:
+                    pass
+            base_domain, _ = parse_def_to_delta(self.def_path.read_text(), domain_hint=domain_hint)
+            base_sif = _resolve_base(base_domain, base_sifs_dir=self.base_sifs_dir)
+            if base_sif.exists():
+                return base_sif
+        return None
+
+    def _get_setup_script(self) -> Optional[str]:
+        """Return the task-specific setup script content, or None.
+
+        Prefers ``setup.sh`` next to the def; falls back to parsing the ``.def``.
+        """
+        setup_sh = self.def_path.parent / "setup.sh"
+        if setup_sh.exists():
+            return setup_sh.read_text(encoding="utf-8")
+        if self.def_path.exists():
+            from rl_data.generator.apptainer_def_gen import parse_def_to_delta
+            task_json = self.def_path.parent / "task.json"
+            domain_hint = None
+            if task_json.exists():
+                try:
+                    import json as _json
+                    domain_hint = _json.loads(task_json.read_text()).get("domain")
+                except Exception:
+                    pass
+            _, setup_body = parse_def_to_delta(self.def_path.read_text(), domain_hint=domain_hint)
+            return setup_body
+        return None
+
+    def _materialize_writable_home_user(self, sif_for_materialize: Path) -> Tuple[bool, str]:
+        """Copy the image's ``/home/user`` tree to the host.
 
         With ``--fakeroot`` + ``--writable-tmpfs``, ``/home/user`` often lives on
         ``fuse-overlayfs``. Creating regular files there can fail with
-        ``OSError: [Errno 22] Invalid argument`` (see agent debug logs). Binding a
-        normal host directory (e.g. on GPFS or local disk) over ``/home/user`` makes
-        task outputs and tests reliable.
+        ``OSError: [Errno 22] Invalid argument``. Binding a normal host directory
+        over ``/home/user`` makes task outputs and tests reliable.
         """
         assert self.temp_dir is not None
         dest = self.temp_dir / "_writable_home_user"
@@ -367,25 +414,13 @@ class InteractiveContainerEnvironment:
 
         inner_mount = "/mnt/_agent_home_materialize"
         copy_cmd = [
-            "apptainer",
-            "exec",
-            "--fakeroot",
-            "--userns",
-            "--writable-tmpfs",
-            "--cleanenv",
-            "--bind",
-            f"{dest}:{inner_mount}",
-            str(self.sif_path),
-            "/bin/sh",
-            "-c",
-            f"cp -a /home/user/. {inner_mount}/",
+            "apptainer", "exec",
+            "--fakeroot", "--userns", "--writable-tmpfs", "--cleanenv",
+            "--bind", f"{dest}:{inner_mount}",
+            str(sif_for_materialize),
+            "/bin/sh", "-c", f"cp -a /home/user/. {inner_mount}/",
         ]
-        proc = subprocess.run(
-            copy_cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
+        proc = subprocess.run(copy_cmd, capture_output=True, text=True, timeout=600)
         if proc.returncode != 0:
             err = (proc.stdout or "") + (proc.stderr or "")
             return False, f"materialize /home/user failed (exit {proc.returncode}): {err.strip() or 'no output'}"
@@ -393,6 +428,31 @@ class InteractiveContainerEnvironment:
         self._writable_home_path = dest
         if self.verbose:
             print(f"✅ Materialized writable /home/user at {dest}")
+        return True, ""
+
+    def _apply_setup_delta(self, sif_for_exec: Path, setup_script: str) -> Tuple[bool, str]:
+        """Run the task-specific setup script inside the container.
+
+        The script runs with ``/home/user`` bind-mounted from the host so file
+        creation goes to the real filesystem (not fuse-overlayfs).
+        """
+        assert self.temp_dir is not None and self._writable_home_path is not None
+        script_path = self.temp_dir / "_delta_setup.sh"
+        script_path.write_text(setup_script, encoding="utf-8")
+        script_path.chmod(0o755)
+
+        exec_cmd = [
+            "apptainer", "exec",
+            "--fakeroot", "--userns", "--writable-tmpfs", "--cleanenv",
+            "--bind", f"{self._writable_home_path}:/home/user",
+            "--bind", f"{self.temp_dir}:{self.temp_dir}",
+            str(sif_for_exec),
+            "/bin/bash", str(script_path),
+        ]
+        proc = subprocess.run(exec_cmd, capture_output=True, text=True, timeout=600)
+        if proc.returncode != 0:
+            err = (proc.stdout or "") + (proc.stderr or "")
+            return False, f"setup delta failed (exit {proc.returncode}): {err.strip()[-500:] or '(no output)'}"
         return True, ""
 
     # ----------------------------
@@ -410,25 +470,40 @@ class InteractiveContainerEnvironment:
         if self.verbose:
             print(f"🔧 Initializing container environment with {self.sif_path.name}...")
 
-        if not self.sif_path.exists():
-            if self.verbose:
-                print(f"⚠️  SIF not found at {self.sif_path}, attempting to build...")
+        runtime_sif = self._resolve_runtime_sif()
+        using_base_sif = runtime_sif is not None and runtime_sif != self.sif_path
+
+        if runtime_sif is None:
             if self.def_path.exists():
+                if self.verbose:
+                    print(f"⚠️  No SIF found, building from def...")
                 self.build_container()
+                runtime_sif = self.sif_path
             else:
-                print("❌ Neither SIF nor def file exists")
+                print("❌ Neither SIF nor base SIF nor def file exists")
                 return False
 
         # Create temporary directory for test files (on host)
         self.temp_dir = Path(tempfile.mkdtemp(prefix="agent_env_")).resolve()
 
-        ok_mat, mat_msg = self._materialize_writable_home_user()
+        ok_mat, mat_msg = self._materialize_writable_home_user(runtime_sif)
         if not ok_mat:
             if self.verbose:
                 print(f"❌ {mat_msg}")
             shutil.rmtree(self.temp_dir, ignore_errors=True)
             self.temp_dir = None
             return False
+
+        if using_base_sif:
+            setup_script = self._get_setup_script()
+            if setup_script and setup_script.strip():
+                ok_delta, delta_msg = self._apply_setup_delta(runtime_sif, setup_script)
+                if not ok_delta:
+                    if self.verbose:
+                        print(f"❌ {delta_msg}")
+                    shutil.rmtree(self.temp_dir, ignore_errors=True)
+                    self.temp_dir = None
+                    return False
 
         # Start a long-lived Apptainer instance
         self.instance_name = f"agent_{uuid.uuid4().hex[:8]}"
@@ -440,7 +515,7 @@ class InteractiveContainerEnvironment:
             "--bind", f"{self.temp_dir}:{self.temp_dir}",
             "--bind", f"{self._writable_home_path}:/home/user",
             "--cleanenv",
-            str(self.sif_path),
+            str(runtime_sif),
             self.instance_name,
         ]
         if self.verbose:

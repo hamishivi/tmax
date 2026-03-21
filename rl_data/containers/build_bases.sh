@@ -11,7 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FORCE=false
 
 export APPTAINER_CACHEDIR="/gpfs/projects/h2lab/osey/apptainer_cache"
-export APPTAINER_TMPDIR="/gpfs/projects/h2lab/osey/apptainer_tmp"
+export APPTAINER_TMPDIR="/tmp/apptainer_tmp"
+mkdir -p "$APPTAINER_TMPDIR"
 
 for arg in "$@"; do
     case "$arg" in

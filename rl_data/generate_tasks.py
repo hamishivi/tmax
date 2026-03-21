@@ -25,7 +25,7 @@ from tqdm import tqdm
 from rl_data import DEFAULT_MODEL
 from rl_data.generator.task_template_gen import generate_templates_batch
 from rl_data.generator.initial_state_test_gen import generate_test_templates_batch as generate_initial_tests_batch
-from rl_data.generator.apptainer_def_gen import iterate_def_template_batch
+from rl_data.generator.apptainer_def_gen import iterate_def_template_batch, save_setup_artifacts
 from rl_data.generator.completion_test_gen import generate_test_templates_batch as generate_final_tests_batch
 
 
@@ -92,6 +92,9 @@ def _save_task_bundle(
     _safe_write_text(final_py, final_test_code)
     _safe_write_text(def_file, def_text)
     _safe_write_text(sol_dir / "summary.json", json.dumps(summary, indent=4))
+
+    domain = task_obj.get("domain", "software_engineering")
+    save_setup_artifacts(task_dir, def_text, domain)
 
     return task_json, init_py, final_py, def_file, sif_file
 

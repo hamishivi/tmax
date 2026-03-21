@@ -37,12 +37,114 @@ BASE_IMAGES: dict[str, Path] = {
 
 DEFAULT_BASE = CONTAINERS_DIR / "base_software_engineering.sif"
 
+DOMAIN_LIST = list(BASE_IMAGES.keys())
 
-def _resolve_base(domain: str) -> Path:
-    base = BASE_IMAGES.get(domain, DEFAULT_BASE)
-    if not base.exists():
-        base = DEFAULT_BASE
-    return base
+
+def _resolve_base(domain: str, base_sifs_dir: Optional[Path] = None) -> Path:
+    """Return the path to the base SIF for a domain.
+
+    If *base_sifs_dir* is given, look there; otherwise use ``CONTAINERS_DIR``.
+    """
+    root = Path(base_sifs_dir) if base_sifs_dir else CONTAINERS_DIR
+    path = root / f"base_{domain}.sif"
+    if path.exists():
+        return path
+    fallback = root / "base_software_engineering.sif"
+    return fallback if fallback.exists() else DEFAULT_BASE
+
+
+# ---------------------------------------------------------------------------
+# Def → delta parser: extract task-specific setup from a full .def
+# ---------------------------------------------------------------------------
+
+_PREAMBLE_PATTERNS: list[re.Pattern] = [
+    re.compile(r"^\s*Bootstrap\s*:", re.IGNORECASE),
+    re.compile(r"^\s*From\s*:", re.IGNORECASE),
+    re.compile(r"^\s*%post\b"),
+    re.compile(r"^\s*export\s+DEBIAN_FRONTEND\s*="),
+    re.compile(r"^\s*apt-get\s+update"),
+    re.compile(r"^\s*pip3?\s+install\s+pytest\s*$"),
+    re.compile(r"^\s*useradd\b"),
+    re.compile(r"^\s*chmod\s+.*(/home/user|777|755)"),
+    re.compile(r"^\s*%environment\b"),
+    re.compile(r"^\s*export\s+(LC_ALL|LANG)\s*="),
+]
+
+_APT_GET_RE = re.compile(r"^\s*apt-get\s+(install|update)")
+_PIP_INSTALL_RE = re.compile(r"^\s*pip3?\s+install\s+(.+)")
+
+
+def _is_preamble_line(line: str) -> bool:
+    return any(p.search(line) for p in _PREAMBLE_PATTERNS)
+
+
+def parse_def_to_delta(def_text: str, domain_hint: Optional[str] = None) -> tuple[str, str]:
+    """Split a full ``.def`` into ``(base_domain, setup_script_body)``.
+
+    *base_domain* is a key of ``BASE_IMAGES`` (e.g. ``"debugging"``).
+    *setup_script_body* is a shell script containing only the task-specific
+    ``%post`` commands (file creation, extra pip installs, data generation, etc.)
+    with the standard preamble stripped.
+
+    Falls back to *domain_hint* (from ``task.json``) or ``"software_engineering"``.
+    """
+    lines = def_text.split("\n")
+
+    delta_lines: list[str] = []
+    in_post = False
+    in_heredoc = False
+    heredoc_marker = ""
+
+    for line in lines:
+        if not in_post:
+            if re.match(r"^\s*%post\b", line):
+                in_post = True
+            continue
+
+        if re.match(r"^\s*%\w+", line) and not in_heredoc:
+            break
+
+        if in_heredoc:
+            delta_lines.append(line)
+            if line.strip() == heredoc_marker:
+                in_heredoc = False
+            continue
+
+        heredoc_match = re.search(r"<<\s*['\"]?(\w+)['\"]?", line)
+        if heredoc_match and not _is_preamble_line(line):
+            in_heredoc = True
+            heredoc_marker = heredoc_match.group(1)
+            delta_lines.append(line)
+            continue
+
+        if _is_preamble_line(line) or _APT_GET_RE.match(line) or _PIP_INSTALL_RE.match(line):
+            continue
+
+        stripped = line.rstrip()
+        if stripped:
+            delta_lines.append(stripped)
+
+    while delta_lines and not delta_lines[0].strip():
+        delta_lines.pop(0)
+    while delta_lines and not delta_lines[-1].strip():
+        delta_lines.pop()
+
+    setup_body = "\n".join(delta_lines)
+    base_domain = domain_hint if domain_hint and domain_hint in BASE_IMAGES else "software_engineering"
+
+    header = "#!/bin/bash\nset -euo pipefail\n"
+    return base_domain, header + setup_body + "\n"
+
+
+def save_setup_artifacts(task_dir: Path, def_text: str, domain: str) -> Path:
+    """Parse a ``.def`` and write ``setup.sh`` into *task_dir*.
+
+    Returns the path to the written ``setup.sh``.
+    """
+    _base_domain, setup_body = parse_def_to_delta(def_text, domain_hint=domain)
+    setup_path = task_dir / "setup.sh"
+    setup_path.write_text(setup_body, encoding="utf-8")
+    return setup_path
 
 
 # ---------------------------------------------------------------------------

@@ -10,22 +10,23 @@
 set -euo pipefail
 
 # ---- Parameters (edit here) ----
-TASKS_DIR="rl_data/output/tasks_skill_tax_20260320_v2"
+TASKS_DIR="rl_data/output/tasks_skill_tax_20260321_toy"
 MODEL="gemini/gemini-3-pro-preview" #gemini-3-flash-preview
 NUM_SOLUTIONS=8
 MAX_ACTIONS=16 # max turns
 MAX_TOKENS=65536
-NUM_TASKS=50
+NUM_TASKS=10
 START_AT=0
-WORKERS=25                   # parallel tasks (each runs NUM_SOLUTIONS agent loops)
+WORKERS=10                   # parallel tasks (each runs NUM_SOLUTIONS agent loops)
 NUM_POOL_WORKERS=128        # parallel LLM calls within each turn
 SOLUTION_TEMPERATURE=0.7
-COMMAND_TIMEOUT=60          # per-command timeout in seconds inside containers
+COMMAND_TIMEOUT=30          # per-command timeout in seconds inside containers
 # First shell prompt: under WORKERS×NUM_SOLUTIONS concurrent Apptainers, raise if you see "Shell init timed out"
 SHELL_INIT_TIMEOUT=120
 SHELL_INIT_ATTEMPTS=3
-BUILD_WORKERS=2             # concurrent SIF builds in pre-pass (1 = serial, safe; bump to 2-3 if I/O allows)
+BUILD_WORKERS=1             # concurrent SIF builds in pre-pass (1 = serial, safe; bump to 2-3 if I/O allows)
 BUILD_RETRIES=3             # retries per SIF build with exponential backoff
+BASE_SIFS_DIR="rl_data/containers"  # shared base SIFs; set empty to use per-task SIF builds
 FORCE_RERUN=1               # set to 1 to re-run all tasks even if *_summary.json exists
 LOG_COMMANDS=0              # 1: append bash I/O to per-task log dir (default: solutions/debug_commands)
 # COMMAND_LOG_DIR=output/debug_commands   # optional; relative to each task dir if not absolute
@@ -58,6 +59,9 @@ if [[ "${LOG_COMMANDS:-0}" == "1" ]]; then
 fi
 if [[ -n "${COMMAND_LOG_DIR:-}" ]]; then
   EXTRA_ARGS+=(--command-log-dir "$COMMAND_LOG_DIR")
+fi
+if [[ -n "${BASE_SIFS_DIR:-}" ]]; then
+  EXTRA_ARGS+=(--base-sifs-dir "$BASE_SIFS_DIR")
 fi
 if [[ "${DISABLE_TERMINAL_LOG:-0}" != "1" ]]; then
   TL="${TERMINAL_LOG:-logs/gen_solutions_terminal.log}"

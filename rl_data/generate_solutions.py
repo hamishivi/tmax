@@ -53,6 +53,9 @@ class SolutionConfig:
     build_workers: int = 1
     #: Retries per SIF build (with exponential backoff). Transient failures are common under load.
     build_retries: int = 3
+    #: Directory containing pre-built base SIFs (base_{domain}.sif). When set, per-task SIFs
+    #: are not needed; the env uses a shared base + task-specific delta script.
+    base_sifs_dir: Optional[str] = None
 
 
 class _TeeTextStream:
@@ -175,18 +178,23 @@ def process_task(task_dir: str, cfg: SolutionConfig):
     task_json_path = task_dir / "task.json"
     solutions_dir = task_dir / "solutions"
 
-    print(f"{task_dir} sif_path: {sif_path}")
-    pass_at_k = None
-
-    if not sif_path.exists():
+    if not cfg.base_sifs_dir:
+        print(f"{task_dir} sif_path: {sif_path}")
+        if not sif_path.exists():
+            if not def_path.exists():
+                print(f"[{task_dir.name}] No def file found, skipping.")
+                return "no def"
+            print(f"[{task_dir.name}] Building SIF from def...")
+            ok, msg = build_and_test(sif_path, def_path, initial_test_path.read_text(), run_initial_tests=False)
+            if not ok:
+                print(f"[{task_dir.name}] SIF build failed: {msg}")
+                return "no sif"
+    else:
         if not def_path.exists():
             print(f"[{task_dir.name}] No def file found, skipping.")
             return "no def"
-        print(f"[{task_dir.name}] Building SIF from def...")
-        ok, msg = build_and_test(sif_path, def_path, initial_test_path.read_text(), run_initial_tests=False)
-        if not ok:
-            print(f"[{task_dir.name}] SIF build failed: {msg}")
-            return "no sif"
+
+    pass_at_k = None
 
     try:
         print(f"[{task_dir.name}] Running {cfg.num_solutions} solutions...")
@@ -222,6 +230,7 @@ def process_task(task_dir: str, cfg: SolutionConfig):
             shell_init_attempts=cfg.shell_init_attempts,
             log_commands=cfg.log_commands,
             command_log_dir=str(cmd_log_resolved) if cmd_log_resolved else None,
+            base_sifs_dir=cfg.base_sifs_dir,
         )
 
         model_name = cfg.model.replace("/", "_")
@@ -304,6 +313,14 @@ def parse_args(argv: Optional[List[str]] = None) -> SolutionConfig:
         type=int,
         default=3,
         help="Retries per SIF build with exponential backoff (default: 3)",
+    )
+    ap.add_argument(
+        "--base-sifs-dir",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Directory with pre-built base_{domain}.sif files. When set, per-task SIF builds "
+             "are skipped; the env uses a shared base SIF + task-specific delta script.",
     )
 
     args = ap.parse_args(argv)
@@ -426,50 +443,74 @@ def _run_generate_solutions(cfg: SolutionConfig) -> None:
         return
 
     # ------------------------------------------------------------------
-    # Pre-build phase: build all missing SIFs with controlled concurrency
+    # Pre-build phase
     # ------------------------------------------------------------------
-    to_build: list[tuple[Path, Path]] = []
-    for td in task_dirs:
-        td = Path(td)
-        sif = td / "container.sif"
-        defp = td / "container.def"
-        if not sif.exists() and defp.exists():
-            to_build.append((sif, defp))
+    if cfg.base_sifs_dir:
+        # Ensure all 9 base SIFs exist; build any that are missing.
+        from rl_data.generator.apptainer_def_gen import BASE_IMAGES, CONTAINERS_DIR
+        base_dir = Path(cfg.base_sifs_dir).resolve()
+        missing_bases: list[tuple[Path, Path]] = []
+        for domain in BASE_IMAGES:
+            sif = base_dir / f"base_{domain}.sif"
+            defp = base_dir / f"base_{domain}.def"
+            if not sif.exists() and defp.exists():
+                missing_bases.append((sif, defp))
+        if missing_bases:
+            _prepull_base_images([d for _, d in missing_bases])
+            print(f"\n🔨 Building {len(missing_bases)} missing base SIF(s)...")
+            for sif, defp in tqdm(missing_bases, desc="Building base SIFs"):
+                ok, msg = build_sif(sif, defp, retries=cfg.build_retries, verbose=True)
+                tag = sif.stem
+                if ok:
+                    print(f"  ✅ {tag}")
+                else:
+                    print(f"  ❌ {tag}: {msg}")
+        existing = sum(1 for d in BASE_IMAGES if (base_dir / f"base_{d}.sif").exists())
+        print(f"🔨 Base SIFs ready: {existing}/{len(BASE_IMAGES)} (per-task SIF builds skipped)\n")
+    else:
+        # Legacy: build per-task SIFs for tasks that don't have one yet.
+        to_build: list[tuple[Path, Path]] = []
+        for td in task_dirs:
+            td = Path(td)
+            sif = td / "container.sif"
+            defp = td / "container.def"
+            if not sif.exists() and defp.exists():
+                to_build.append((sif, defp))
 
-    if to_build:
-        _prepull_base_images([defp for _, defp in to_build])
-        print(f"\n🔨 Pre-build phase: {len(to_build)} SIF(s) to build "
-              f"(workers={cfg.build_workers}, retries={cfg.build_retries})")
+        if to_build:
+            _prepull_base_images([defp for _, defp in to_build])
+            print(f"\n🔨 Pre-build phase: {len(to_build)} SIF(s) to build "
+                  f"(workers={cfg.build_workers}, retries={cfg.build_retries})")
 
-        def _build_one(pair: tuple[Path, Path]) -> tuple[str, bool, str]:
-            sif, defp = pair
-            ok, msg = build_sif(
-                sif, defp,
-                retries=cfg.build_retries,
-                verbose=True,
-            )
-            tag = sif.parent.name
-            if ok:
-                print(f"  ✅ {tag}")
+            def _build_one(pair: tuple[Path, Path]) -> tuple[str, bool, str]:
+                sif, defp = pair
+                ok, msg = build_sif(
+                    sif, defp,
+                    retries=cfg.build_retries,
+                    verbose=True,
+                )
+                tag = sif.parent.name
+                if ok:
+                    print(f"  ✅ {tag}")
+                else:
+                    print(f"  ❌ {tag}: {msg}")
+                return tag, ok, msg
+
+            if cfg.build_workers <= 1:
+                for pair in tqdm(to_build, desc="Building SIFs"):
+                    _build_one(pair)
             else:
-                print(f"  ❌ {tag}: {msg}")
-            return tag, ok, msg
+                from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        if cfg.build_workers <= 1:
-            for pair in tqdm(to_build, desc="Building SIFs"):
-                _build_one(pair)
-        else:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+                with ThreadPoolExecutor(max_workers=cfg.build_workers) as bld_exec:
+                    futs = {bld_exec.submit(_build_one, p): p for p in to_build}
+                    with tqdm(total=len(to_build), desc="Building SIFs") as bld_pbar:
+                        for fut in as_completed(futs):
+                            fut.result()
+                            bld_pbar.update(1)
 
-            with ThreadPoolExecutor(max_workers=cfg.build_workers) as bld_exec:
-                futs = {bld_exec.submit(_build_one, p): p for p in to_build}
-                with tqdm(total=len(to_build), desc="Building SIFs") as bld_pbar:
-                    for fut in as_completed(futs):
-                        fut.result()
-                        bld_pbar.update(1)
-
-        built = sum(1 for td in task_dirs if (Path(td) / "container.sif").exists())
-        print(f"🔨 Pre-build done: {built}/{len(task_dirs)} tasks have a SIF\n")
+            built = sum(1 for td in task_dirs if (Path(td) / "container.sif").exists())
+            print(f"🔨 Pre-build done: {built}/{len(task_dirs)} tasks have a SIF\n")
 
     # ------------------------------------------------------------------
     # Solution phase (high concurrency)
