@@ -15,9 +15,12 @@ set -euo pipefail
 #   JOB_NAME           - Job name for resumability (default: tb2)
 
 export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
-MODEL="${MODEL:-openai/default}"
-N_CONCURRENT="${N_CONCURRENT:-25}"
+MODEL_NAME="${MODEL_NAME:-default}"
+VLLM_HOST="${VLLM_HOST:-localhost}"
+VLLM_PORT="${VLLM_PORT:-8008}"
+N_CONCURRENT="${N_CONCURRENT:-20}"
 MAX_STEPS="${MAX_STEPS:-50}"
+N_ATTEMPTS="${N_ATTEMPTS:-3}"
 JOB_NAME="${JOB_NAME:-tb2}"
 JOB_DIR="jobs/${JOB_NAME}"
 
@@ -30,9 +33,11 @@ else
     uv run harbor run \
         --dataset terminal-bench@2.0 \
         --agent-import-path TassieAgent:TassieAgent \
-        --model "$MODEL" \
+        --model "hosted_vllm/${MODEL_NAME}" \
         --env daytona \
         --n-concurrent "$N_CONCURRENT" \
         --agent-kwarg "max_steps=$MAX_STEPS" \
-        --job-name "$JOB_NAME"
+        --agent-kwarg "api_base=http://${VLLM_HOST}:${VLLM_PORT}/v1" \
+        --job-name "$JOB_NAME" \
+        -k "$N_ATTEMPTS"
 fi

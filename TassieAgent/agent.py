@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -167,6 +168,8 @@ class TassieAgent(BaseAgent):
             {"role": "user", "content": instruction},
         ]
 
+        timing_log: list[dict[str, Any]] = []
+
         try:
             for step in range(self.max_steps):
                 logger.info(f"Step {step + 1}/{self.max_steps}")
@@ -175,20 +178,25 @@ class TassieAgent(BaseAgent):
                     logger.warning(f"Cost limit reached: ${self.cost:.2f} >= ${self.cost_limit:.2f}")
                     break
 
+                t0 = time.monotonic()
                 response = await self._query_with_retry(model, messages, bash_tool)
+                llm_time = time.monotonic() - t0
 
                 try:
                     step_cost = litellm.completion_cost(response, model=model)
                 except Exception:
                     step_cost = 0.0
                 self.cost += step_cost
-                logger.info(f"Step cost: ${step_cost:.4f}, total: ${self.cost:.4f}")
 
                 msg = response.choices[0].message.model_dump()
+                n_tokens = response.usage.completion_tokens if response.usage else 0
+                n_prompt = response.usage.prompt_tokens if response.usage else 0
+
                 messages.append(msg)
 
                 tool_calls = msg.get("tool_calls")
                 if not tool_calls:
+                    timing_log.append({"step": step + 1, "llm_s": round(llm_time, 1), "completion_tokens": n_tokens, "prompt_tokens": n_prompt, "stop": True})
                     break
 
                 done = False
@@ -197,7 +205,18 @@ class TassieAgent(BaseAgent):
                     args = json.loads(func["arguments"]) if isinstance(func["arguments"], str) else func["arguments"]
                     command = args.get("command", "")
 
+                    t1 = time.monotonic()
                     output = await self._execute_bash(command, environment)
+                    exec_time = time.monotonic() - t1
+
+                    timing_log.append({
+                        "step": step + 1,
+                        "llm_s": round(llm_time, 1),
+                        "bash_s": round(exec_time, 1),
+                        "completion_tokens": n_tokens,
+                        "prompt_tokens": n_prompt,
+                        "cmd": command[:80],
+                    })
 
                     # Check for submit marker
                     if SUBMIT_MARKER in output:
@@ -208,8 +227,9 @@ class TassieAgent(BaseAgent):
                 if done:
                     break
         finally:
-            # Always save trajectory, even on error
+            # Always save trajectory and timing, even on error
             (self.logs_dir / "trajectory.json").write_text(json.dumps(messages, indent=2, default=str))
+            (self.logs_dir / "timing.json").write_text(json.dumps(timing_log, indent=2))
 
     async def _query_with_retry(self, model: str, messages: list[dict[str, Any]], bash_tool: dict[str, Any]) -> Any:
         for attempt in range(1, MAX_RETRIES + 1):
@@ -248,7 +268,7 @@ class TassieAgent(BaseAgent):
         result = await env.exec(command=command)
         output = result.stdout or ""
         if result.stderr:
-            output += f"\nSTDERR:\n{result.stderr}"
-        if result.return_code != 0:
-            output = f"Exit code {result.return_code}\n{output}"
+            output += f"\n{result.stderr}"
+        # Prefix with the command to match SFT training data format
+        output = f"{command}\n{output}" if output else command
         return output or "(no output)"
