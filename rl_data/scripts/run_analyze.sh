@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ---- Parameters (edit here) ----
-TASKS_DIR="rl_data/output/tasks_skill_tax_20260320_v2"
+TASKS_DIR="rl_data/output/tasks_skill_tax_20260323_1k"
 PLOTS_DIR=""   # leave empty to default to <TASKS_DIR>/analysis
 MODEL=""       # e.g. "gemini/gemini-3-flash-preview"; leave empty to auto-discover all models
 # --------------------------------

@@ -132,8 +132,13 @@ def parse_def_to_delta(def_text: str, domain_hint: Optional[str] = None) -> tupl
     setup_body = "\n".join(delta_lines)
     base_domain = domain_hint if domain_hint and domain_hint in BASE_IMAGES else "software_engineering"
 
-    header = "#!/bin/bash\nset -euo pipefail\n"
-    return base_domain, header + setup_body + "\n"
+    # Rewrite /tmp/ references to /home/user/.setup_tmp/ so temp files land on the
+    # writable bind mount instead of fuse-overlayfs (which can EINVAL on file creation).
+    setup_body = setup_body.replace("/tmp/", "/home/user/.setup_tmp/")
+
+    header = "#!/bin/bash\nset -euo pipefail\nmkdir -p /home/user/.setup_tmp\n"
+    footer = "\nrm -rf /home/user/.setup_tmp\n"
+    return base_domain, header + setup_body + footer
 
 
 def save_setup_artifacts(task_dir: Path, def_text: str, domain: str) -> Path:
@@ -165,6 +170,9 @@ _TRANSIENT_PATTERNS = (
     "tls handshake timeout",
     "could not resolve host",
     "temporary failure in name resolution",
+    "index files failed to download",
+    "failed to fetch",
+    "hash sum mismatch",
 )
 
 
@@ -262,7 +270,10 @@ def build_and_test(
                 break
             last_err = (build_proc.stderr or build_proc.stdout or "")[-500:]
             if attempt < build_retries and _is_transient_error(last_err):
-                logger.info("Transient build error (attempt %d), retrying…", attempt + 1)
+                import time as _time
+                delay = 2 ** (attempt + 1)
+                logger.info("Transient build error (attempt %d), retrying in %ds…", attempt + 1, delay)
+                _time.sleep(delay)
                 continue
             break
 
@@ -270,20 +281,23 @@ def build_and_test(
             print(f"Apptainer build failed (rc={build_proc.returncode}): {last_err}")
             return False, f"Apptainer build failed: {last_err}"
 
-        proc = subprocess.run(
-            [
-                "apptainer", "exec",
-                "--fakeroot", "--userns", "--writable-tmpfs", "--cleanenv",
-                str(sif_path),
-                "pytest", "-q", str(test_file.name),
-            ],
-            cwd=td,
-            capture_output=True, text=True,
-        )
-
-        if sif_path.exists():
-            sif_path.unlink()
-        shutil.rmtree(td_path, ignore_errors=True)
+        try:
+            proc = subprocess.run(
+                [
+                    "apptainer", "exec",
+                    "--fakeroot", "--userns", "--writable-tmpfs", "--cleanenv",
+                    str(sif_path),
+                    "pytest", "-q", str(test_file.name),
+                ],
+                cwd=td,
+                capture_output=True, text=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "Initial-state test timed out after 120s"
+        finally:
+            if sif_path.exists():
+                sif_path.unlink()
 
         return proc.returncode == 0, proc.stdout + proc.stderr
 
@@ -310,19 +324,34 @@ def iterate_def_template_batch(
     max_tokens: int = 2048,
     max_concurrency: int = 64,
     max_retries: int = 0,
+    max_build_workers: int = 4,
+    skip_indices: Optional[set] = None,
+    on_round_complete: Optional[object] = None,
 ) -> List[Optional[str]]:
     """Batched def generation with retry loop and error feedback.
 
     Failed items are re-prompted with the build/test error so the LLM can
     self-correct.  Defs containing ``{{ }}`` build variables are caught
     before an expensive build attempt.
+
+    Parameters
+    ----------
+    skip_indices:
+        Indices to skip entirely (e.g. already processed in a previous run).
+    on_round_complete:
+        ``callback(round_idx, newly_succeeded)`` called after each round.
+        *newly_succeeded* is ``Dict[int, str]`` mapping item index → def text
+        for items that passed build+test in this round.
     """
     if domains is None:
         domains = ["software_engineering"] * len(items)
 
     results: List[Optional[str]] = [None] * len(items)
     error_msgs: List[Optional[str]] = [None] * len(items)
-    pending = list(range(len(items)))
+    pending = [i for i in range(len(items)) if not skip_indices or i not in skip_indices]
+
+    if skip_indices:
+        print(f"  Skipping {len(skip_indices)} already-completed items, {len(pending)} to process")
 
     def _try_build(idx: int, resp_obj) -> Tuple[int, Optional[str], Optional[str]]:
         """Return (original_index, def_text | None, error_msg | None)."""
@@ -340,14 +369,15 @@ def iterate_def_template_batch(
             logger.warning("Def worker failed for item %d: %s", idx, exc)
             return idx, None, str(exc)
 
+    total_succeeded = len(skip_indices) if skip_indices else 0
+
     for attempt in range(1 + max_retries):
         if not pending:
             break
-        if attempt:
-            logger.info(
-                "Def retry round %d/%d: %d items remaining",
-                attempt, max_retries, len(pending),
-            )
+
+        round_label = f"Round {attempt}/{max_retries}"
+        print(f"\n{'─'*60}")
+        print(f"  {round_label}: generating {len(pending)} defs via LLM...")
 
         messages: list[list[dict[str, str]]] = []
         for idx in pending:
@@ -373,19 +403,35 @@ def iterate_def_template_batch(
             max_concurrency=max_concurrency,
         )
 
+        workers = min(max_build_workers, len(pending))
+        print(f"  {round_label}: building + testing {len(pending)} defs with {workers} workers...")
+
         next_pending: list[int] = []
-        with ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
+        newly_succeeded: dict[int, str] = {}
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = [
                 pool.submit(_try_build, pending[pos], resp)
                 for pos, resp in enumerate(responses)
             ]
-            for fut in tqdm(as_completed(futs), total=len(futs)):
+            for fut in tqdm(as_completed(futs), total=len(futs), desc=round_label):
                 idx, def_text, err = fut.result()
                 if def_text is not None:
                     results[idx] = def_text
+                    newly_succeeded[idx] = def_text
                 else:
                     error_msgs[idx] = err
                     next_pending.append(idx)
+
+        total_succeeded += len(newly_succeeded)
+        print(
+            f"  {round_label} done: {len(newly_succeeded)} succeeded, "
+            f"{len(next_pending)} failed  "
+            f"(cumulative: {total_succeeded}/{len(items)})"
+        )
+
+        if on_round_complete and newly_succeeded:
+            on_round_complete(attempt, newly_succeeded)
 
         pending = next_pending
 

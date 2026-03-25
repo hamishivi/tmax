@@ -11,11 +11,16 @@ from __future__ import annotations
 
 import argparse
 
+# (display_name, input_$/1M_tokens, output_$/1M_tokens)  — text only
+# Source: https://ai.google.dev/gemini-api/docs/gemini-3
 PRICING = {
-    "gemini/gemini-3.1-pro-preview": ("Gemini 3.1 Pro Preview", 1.25, 10.00),
-    "gemini/gemini-2.5-pro":         ("Gemini 2.5 Pro",         1.25, 10.00),
-    "gemini/gemini-2.5-flash":       ("Gemini 2.5 Flash",       0.30,  2.50),
-    "gemini/gemini-2.0-flash":       ("Gemini 2.0 Flash",       0.10,  0.40),
+    "gemini/gemini-3.1-pro-preview":       ("Gemini 3.1 Pro Preview",       2.00, 12.00),
+    "gemini/gemini-3-pro-preview":         ("Gemini 3 Pro Preview",         2.00, 12.00),
+    "gemini/gemini-3-flash-preview":       ("Gemini 3 Flash Preview",       0.50,  3.00),
+    "gemini/gemini-3.1-flash-lite-preview":("Gemini 3.1 Flash-Lite Preview",0.25,  1.50),
+    "gemini/gemini-2.5-pro":               ("Gemini 2.5 Pro",               1.25, 10.00),
+    "gemini/gemini-2.5-flash":             ("Gemini 2.5 Flash",             0.15,  0.60),
+    "gemini/gemini-2.0-flash":             ("Gemini 2.0 Flash",             0.10,  0.40),
 }
 
 

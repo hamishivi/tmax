@@ -16,8 +16,8 @@ cd "$(dirname "$0")/../.."
 #   - huggingface-cli login  (or HF_TOKEN env var)
 #   - Python with huggingface_hub
 
-REPO_ID="osieosie/tmax-tasks-skill-taxonomy-20260320-v2"
-INPUT_DIR="/gpfs/scrubbed/osey/tmax/rl_data/output/tasks_skill_tax_20260320_v2"
+REPO_ID="osieosie/tmax-tasks-skill-taxonomy-20260323-1k"
+INPUT_DIR="/gpfs/scrubbed/osey/tmax/rl_data/output/tasks_skill_tax_20260323_1k"
 PRIVATE="false"
 
 while [[ $# -gt 0 ]]; do
@@ -69,7 +69,7 @@ def main():
 
     api = HfApi()
     api.create_repo(args.repo, repo_type="dataset", private=private, exist_ok=True)
-    api.update_repo_visibility(args.repo, repo_type="dataset", private=private)
+    api.update_repo_settings(args.repo, repo_type="dataset", private=private)
     print(f"Repo ready ({'private' if private else 'public'}): https://huggingface.co/datasets/{args.repo}")
 
     print(f"Uploading folder {input_dir} ...")

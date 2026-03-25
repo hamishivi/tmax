@@ -153,6 +153,13 @@ def run_n_solutions(
     results: List[Dict[str, Any]] = []
     num_success = 0
 
+    # Per-solution token usage accumulators
+    usage_accum: List[Dict[str, int]] = [
+        {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+         "reasoning_tokens": 0}
+        for _ in range(num_solutions)
+    ]
+
     out_dir: Optional[Path] = None
     if save_dir:
         out_dir = Path(save_dir)
@@ -234,11 +241,18 @@ def run_n_solutions(
             print(f"solutions generated in {end_time - start_time:.1f} seconds")
 
             response_msgs: List[dict] = []
-            for r in responses_raw:
+            for local_i, r in enumerate(responses_raw):
                 if r is None:
                     response_msgs.append({})
                 else:
                     response_msgs.append(r.choices[0].message.model_dump())
+                    sol_idx = not_done_idx[local_i]
+                    if hasattr(r, "usage") and r.usage is not None:
+                        u = r.usage
+                        usage_accum[sol_idx]["prompt_tokens"] += getattr(u, "prompt_tokens", 0) or 0
+                        usage_accum[sol_idx]["completion_tokens"] += getattr(u, "completion_tokens", 0) or 0
+                        usage_accum[sol_idx]["total_tokens"] += getattr(u, "total_tokens", 0) or 0
+                        usage_accum[sol_idx]["reasoning_tokens"] += getattr(u, "reasoning_tokens", 0) or 0
 
             actions = [_extract_tool_call(msg) for msg in response_msgs]
 
@@ -351,6 +365,7 @@ def run_n_solutions(
                 "messages": messages[i],
                 "output": output,
                 "reward": 1 if success else 0,
+                "usage": usage_accum[i],
             })
         end_time = time.time()
         print(f"final tests executed in {end_time - start_time:.1f} seconds")
@@ -372,10 +387,18 @@ def run_n_solutions(
             p = 1.0 - (comb(n - c, k) / comb(n, k))
         pass_at_k[k] = float(p)
 
+    total_usage = {
+        "prompt_tokens": sum(u["prompt_tokens"] for u in usage_accum),
+        "completion_tokens": sum(u["completion_tokens"] for u in usage_accum),
+        "total_tokens": sum(u["total_tokens"] for u in usage_accum),
+        "reasoning_tokens": sum(u["reasoning_tokens"] for u in usage_accum),
+    }
+
     summary: Dict[str, Any] = {
         "num_runs": num_solutions,
         "num_success": num_success,
         "pass_at_k": pass_at_k,
+        "usage": total_usage,
         "results": results,
     }
 

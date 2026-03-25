@@ -240,6 +240,10 @@ def process_task(task_dir: str, cfg: SolutionConfig):
         )
         pass_at_k = summary.get("pass_at_k", {})
 
+    except Exception as exc:
+        print(f"[{task_dir.name}] ❌ Task failed: {exc}")
+        return "error"
+
     finally:
         if sif_path.exists():
             print(f"[{task_dir.name}] Not deleting SIF file.")
@@ -540,6 +544,9 @@ def _run_generate_solutions(cfg: SolutionConfig) -> None:
             elif result in ("no def", "no sif", "no initial test"):
                 print(f"No def, sif, or initial test for task {task_dir.name}, skipping.")
                 break
+            elif result == "error":
+                print(f"Retrying task {task_dir.name} after error...")
+                max_retries -= 1
             else:
                 print(f"Pass@k: {result} for task {task_dir.name}")
                 break

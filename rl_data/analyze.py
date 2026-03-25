@@ -51,8 +51,62 @@ def discover_models(tasks_dir: Path) -> List[str]:
     return sorted(slugs)
 
 
+_TOK_PER_WORD = 1.3  # rough whitespace-word → BPE-token ratio
+
+# (input_$/1M_tok, output_$/1M_tok) — text only
+# slug → (price_in, price_out).  Slug is model_id with "/" replaced by "_".
+# Source: https://ai.google.dev/gemini-api/docs/gemini-3
+_PRICING: Dict[str, tuple] = {
+    "gemini_gemini-3.1-pro-preview":        (2.00, 12.00),
+    "gemini_gemini-3-pro-preview":          (2.00, 12.00),
+    "gemini_gemini-3-flash-preview":        (0.50,  3.00),
+    "gemini_gemini-3.1-flash-lite-preview": (0.25,  1.50),
+    "gemini_gemini-2.5-pro":                (1.25, 10.00),
+    "gemini_gemini-2.5-flash":              (0.15,  0.60),
+    "gemini_gemini-2.0-flash":              (0.10,  0.40),
+}
+
+# Task generation always uses 3.1 Pro
+_TASK_GEN_MODEL = "gemini_gemini-3.1-pro-preview"
+_TASK_GEN_AVG_INPUT_WORDS = 800
+_TASK_GEN_AVG_OUTPUT_WORDS = 1200
+
+
+def _estimate_cost(input_tokens: int, output_tokens: int,
+                   model_slug: str) -> float:
+    """Return estimated USD cost given token counts and model slug."""
+    pi, po = _PRICING.get(model_slug, (1.0, 5.0))
+    return (input_tokens * pi + output_tokens * po) / 1e6
+
+
+def _count_words_in_messages(
+    messages: List[Dict[str, Any]],
+) -> tuple:
+    """Return (input_words, output_words) across all messages."""
+    inp, out = 0, 0
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content")
+        wc = len(content.split()) if content else 0
+        tc_wc = 0
+        for tc in (msg.get("tool_calls") or []):
+            args = tc.get("function", {}).get("arguments", "")
+            if args:
+                tc_wc += len(args.split())
+        if role == "assistant":
+            out += wc + tc_wc
+        else:
+            inp += wc + tc_wc
+    return inp, out
+
+
 def _load_summary(summary_path: Path, record: Dict[str, Any]) -> None:
-    """Populate *record* with metrics from a model summary file."""
+    """Populate *record* with metrics from a model summary file.
+
+    If the summary contains actual ``usage`` data (prompt_tokens,
+    completion_tokens) captured from the API, those are used directly.
+    Otherwise we fall back to word-count estimation.
+    """
     with open(summary_path) as f:
         sol = json.load(f)
     record["num_runs"] = sol.get("num_runs", 0)
@@ -62,14 +116,65 @@ def _load_summary(summary_path: Path, record: Dict[str, Any]) -> None:
     record["pass@8"] = pass_at_k.get("8", pass_at_k.get(8, None))
 
     turns_per_run = []
+    input_words_per_run = []
+    output_words_per_run = []
     for r in sol.get("results", []):
-        n_turns = sum(
-            1 for m in r.get("messages", []) if m.get("role") == "tool"
-        )
+        msgs = r.get("messages", [])
+        n_turns = sum(1 for m in msgs if m.get("role") == "tool")
         turns_per_run.append(n_turns)
-    record["avg_turns"] = (
-        sum(turns_per_run) / len(turns_per_run) if turns_per_run else 0
+        iw, ow = _count_words_in_messages(msgs)
+        input_words_per_run.append(iw)
+        output_words_per_run.append(ow)
+
+    n = len(turns_per_run)
+    total_in_w = sum(input_words_per_run)
+    total_out_w = sum(output_words_per_run)
+
+    record["avg_turns"] = sum(turns_per_run) / n if n else 0
+    record["total_words"] = total_in_w + total_out_w
+    record["avg_words"] = record["total_words"] / n if n else 0
+
+    # Prefer actual API usage when available; fall back to word-count estimate.
+    top_usage = sol.get("usage")
+    has_actual = (
+        top_usage
+        and (top_usage.get("prompt_tokens", 0) or top_usage.get("completion_tokens", 0))
     )
+
+    if has_actual:
+        record["total_input_tokens"] = top_usage.get("prompt_tokens", 0)
+        record["total_output_tokens"] = top_usage.get("completion_tokens", 0)
+        record["reasoning_tokens"] = top_usage.get("reasoning_tokens", 0)
+        record["tokens_source"] = "api"
+    else:
+        # Try summing per-result usage (newer format may have per-result but no top-level)
+        per_result_in = 0
+        per_result_out = 0
+        found_any = False
+        for r in sol.get("results", []):
+            ru = r.get("usage")
+            if ru and (ru.get("prompt_tokens", 0) or ru.get("completion_tokens", 0)):
+                per_result_in += ru.get("prompt_tokens", 0)
+                per_result_out += ru.get("completion_tokens", 0)
+                found_any = True
+        if found_any:
+            record["total_input_tokens"] = per_result_in
+            record["total_output_tokens"] = per_result_out
+            record["reasoning_tokens"] = sum(
+                (r.get("usage") or {}).get("reasoning_tokens", 0)
+                for r in sol.get("results", [])
+            )
+            record["tokens_source"] = "api"
+        else:
+            record["total_input_tokens"] = int(total_in_w * _TOK_PER_WORD)
+            record["total_output_tokens"] = int(total_out_w * _TOK_PER_WORD)
+            record["reasoning_tokens"] = 0
+            record["tokens_source"] = "estimated"
+
+    record["total_tokens_est"] = (
+        record["total_input_tokens"] + record["total_output_tokens"]
+    )
+    record["avg_tokens_est"] = record["total_tokens_est"] // n if n else 0
     record["has_solutions"] = True
 
 
@@ -109,17 +214,24 @@ def load_tasks(
             "dir": str(task_path),
         }
 
+        _NO_SOLUTION = dict(
+            num_runs=0, num_success=0, avg_turns=0,
+            total_words=0, avg_words=0,
+            total_input_tokens=0, total_output_tokens=0,
+            reasoning_tokens=0,
+            total_tokens_est=0, avg_tokens_est=0,
+            tokens_source="none",
+            has_solutions=False,
+            **{"pass@1": None, "pass@8": None},
+        )
+
         solutions_dir = task_path / "solutions"
         if model_slug:
             summary_file = solutions_dir / f"{model_slug}_summary.json"
             if summary_file.exists():
                 _load_summary(summary_file, record)
             else:
-                record.update(
-                    num_runs=0, num_success=0,
-                    **{"pass@1": None, "pass@8": None},
-                    avg_turns=0, has_solutions=False,
-                )
+                record.update(_NO_SOLUTION)
         else:
             summary_files = (
                 list(solutions_dir.glob("*_summary.json"))
@@ -130,61 +242,205 @@ def load_tasks(
             if summary_files:
                 _load_summary(summary_files[0], record)
             else:
-                record.update(
-                    num_runs=0, num_success=0,
-                    **{"pass@1": None, "pass@8": None},
-                    avg_turns=0, has_solutions=False,
-                )
+                record.update(_NO_SOLUTION)
 
         records.append(record)
     return records
 
 
-def print_summary_table(
-    records: List[Dict[str, Any]], model_name: Optional[str] = None,
+def _fmt_count(n: int) -> str:
+    """Human-friendly large number: 1234 → '1,234', 1234567 → '1.23M'."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 10_000:
+        return f"{n / 1_000:.1f}K"
+    return f"{n:,}"
+
+
+def print_summary(
+    records: List[Dict[str, Any]],
+    model_name: Optional[str] = None,
+    model_slug: Optional[str] = None,
+    max_rows: int = 50,
 ) -> None:
-    """Print a formatted summary table to stdout."""
-    header = (
-        f"{'Task':<30} {'Domain':<24} {'Skill Type':<20} "
-        f"{'Task Cplx':<12} {'Cmd Cplx':<20} "
-        f"{'Runs':>5} {'Pass':>5} "
-        f"{'p@1':>6} {'p@8':>6} {'Turns':>6}"
-    )
-    title = f"TASK SUMMARY — {model_name}" if model_name else "TASK SUMMARY"
-    print("\n" + "=" * len(header))
-    print(title)
-    print("=" * len(header))
-    print(header)
-    print("-" * len(header))
-
-    for r in records:
-        p1 = f"{r['pass@1']:.2f}" if r["pass@1"] is not None else "-"
-        p8 = f"{r['pass@8']:.2f}" if r["pass@8"] is not None else "-"
-        turns = f"{r['avg_turns']:>6.1f}" if r["has_solutions"] else f"{'-':>6}"
-        print(
-            f"{r['name']:<30} {r['domain']:<24} {r['skill_type']:<20} "
-            f"{r['task_complexity']:<12} {r['command_complexity']:<20} "
-            f"{r['num_runs']:>5} {r['num_success']:>5} "
-            f"{p1:>6} {p8:>6} {turns}"
-        )
-
+    """Print model stats banner, optionally per-task rows, and aggregate table."""
     solved = [r for r in records if r["has_solutions"]]
+
+    # ── Model-level stats banner ──────────────────────────────────────
+    total_runs = sum(r["num_runs"] for r in records)
+    total_words = sum(r["total_words"] for r in records)
+    total_in_tok = sum(r["total_input_tokens"] for r in records)
+    total_out_tok = sum(r["total_output_tokens"] for r in records)
+    total_tokens = total_in_tok + total_out_tok
+    avg_words = int(total_words / total_runs) if total_runs else 0
+    avg_tokens = int(total_tokens / total_runs) if total_runs else 0
+
+    title = model_name or "all models"
+    print(f"\n{'═'*80}")
+    print(f"  {title}")
+    print(f"{'═'*80}")
+    print(
+        f"  Tasks: {len(records)}  "
+        f"│  With solutions: {len(solved)}  "
+        f"│  Total runs: {total_runs}"
+    )
     if solved:
         avg_p1 = (
-            sum(r["pass@1"] for r in solved if r["pass@1"] is not None) / len(solved)
+            sum(r["pass@1"] for r in solved if r["pass@1"] is not None)
+            / len(solved)
         )
         avg_p8 = (
-            sum(r["pass@8"] for r in solved if r["pass@8"] is not None) / len(solved)
+            sum(r["pass@8"] for r in solved if r["pass@8"] is not None)
+            / len(solved)
         )
         avg_turns = sum(r["avg_turns"] for r in solved) / len(solved)
-        print("-" * len(header))
-        pad = 30 + 24 + 20 + 12 + 20 + 4
         print(
-            f"{'AVERAGE (solved)':<{pad}} {'':>5} {'':>5} "
-            f"{avg_p1:>6.2f} {avg_p8:>6.2f} {avg_turns:>6.1f}"
+            f"  Mean p@1: {avg_p1:.2f}  "
+            f"│  Mean p@8: {avg_p8:.2f}  "
+            f"│  Avg turns: {avg_turns:.1f}"
+        )
+    print(
+        f"  Total words: {_fmt_count(total_words)}  "
+        f"│  Avg words/run: {_fmt_count(avg_words)}  "
+        f"│  Avg tokens/run: {_fmt_count(avg_tokens)}"
+    )
+    # Determine token source label
+    sources = {r.get("tokens_source", "none") for r in records if r["has_solutions"]}
+    if sources == {"api"}:
+        tok_label = "actual"
+    elif "api" in sources:
+        tok_label = "actual+est"
+    else:
+        tok_label = "est"
+
+    total_reasoning = sum(r.get("reasoning_tokens", 0) for r in records)
+    reasoning_info = ""
+    if total_reasoning:
+        reasoning_info = f"  (incl. {_fmt_count(total_reasoning)} reasoning)"
+
+    print(
+        f"  Input tokens: {_fmt_count(total_in_tok)}  "
+        f"│  Output tokens: {_fmt_count(total_out_tok)}  "
+        f"│  Total tokens: {_fmt_count(total_tokens)}  ({tok_label})"
+    )
+    if reasoning_info:
+        print(f"  {reasoning_info}")
+
+    # Cost estimation
+    slug = model_slug
+    if slug and slug in _PRICING:
+        pi, po = _PRICING[slug]
+        sol_cost = _estimate_cost(total_in_tok, total_out_tok, slug)
+
+        # Task generation cost (always 3.1 Pro)
+        n_tasks = len(records)
+        tg_in = int(n_tasks * _TASK_GEN_AVG_INPUT_WORDS * _TOK_PER_WORD)
+        tg_out = int(n_tasks * _TASK_GEN_AVG_OUTPUT_WORDS * _TOK_PER_WORD)
+        tg_cost = _estimate_cost(tg_in, tg_out, _TASK_GEN_MODEL)
+
+        cost_per_run = sol_cost / total_runs if total_runs else 0
+        print(
+            f"  Solution cost (est): ${sol_cost:,.2f}  "
+            f"(${pi:.2f}/${po:.2f} per 1M tok)  "
+            f"│  $/run: ${cost_per_run:,.4f}"
+        )
+        print(
+            f"  Task gen cost (est): ${tg_cost:,.2f}  "
+            f"(3.1-pro, {n_tasks} tasks)  "
+            f"│  Total pipeline: ${tg_cost + sol_cost:,.2f}"
+        )
+    elif slug:
+        print(f"  Cost: pricing not available for {slug}")
+
+    print(f"{'─'*80}")
+
+    # ── Per-task rows (skip if too many) ──────────────────────────────
+    show_rows = max_rows == 0 or len(records) <= max_rows
+    if show_rows:
+        header = (
+            f"{'Task':<30} {'Domain':<24} {'Skill Type':<20} "
+            f"{'Task Cplx':<12} {'Cmd Cplx':<20} "
+            f"{'Runs':>5} {'Pass':>5} "
+            f"{'p@1':>6} {'p@8':>6} {'Turns':>6}"
+        )
+        print(header)
+        print("-" * len(header))
+        for r in records:
+            p1 = f"{r['pass@1']:.2f}" if r["pass@1"] is not None else "-"
+            p8 = f"{r['pass@8']:.2f}" if r["pass@8"] is not None else "-"
+            turns = (
+                f"{r['avg_turns']:>6.1f}" if r["has_solutions"] else f"{'-':>6}"
+            )
+            print(
+                f"{r['name']:<30} {r['domain']:<24} {r['skill_type']:<20} "
+                f"{r['task_complexity']:<12} {r['command_complexity']:<20} "
+                f"{r['num_runs']:>5} {r['num_success']:>5} "
+                f"{p1:>6} {p8:>6} {turns}"
+            )
+        print()
+    else:
+        print(
+            f"  ({len(records)} tasks — per-task rows hidden; "
+            f"use --max-rows 0 to show all)\n"
         )
 
-    print(f"\nTotal tasks: {len(records)}, With solutions: {len(solved)}")
+    # ── Aggregate breakdown ───────────────────────────────────────────
+    if not solved:
+        return
+    _print_aggregate(solved, "domain", "Domain", model_slug=slug)
+    _print_aggregate(solved, "task_complexity", "Task Complexity",
+                     key_order=_TASK_COMPLEXITY_ORDER, model_slug=slug)
+    _print_aggregate(solved, "command_complexity", "Cmd Complexity",
+                     key_order=_CMD_COMPLEXITY_ORDER, model_slug=slug)
+
+
+def _print_aggregate(
+    solved: List[Dict[str, Any]],
+    field: str,
+    label: str,
+    key_order: Optional[List[str]] = None,
+    model_slug: Optional[str] = None,
+) -> None:
+    """Print a small aggregate table grouped by *field*."""
+    buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in solved:
+        buckets[r[field]].append(r)
+
+    keys = key_order if key_order else sorted(buckets.keys())
+    has_cost = model_slug and model_slug in _PRICING
+
+    hdr = (
+        f"  {'':2}{label:<24} {'n':>4} {'p@1':>6} {'p@8':>6} "
+        f"{'Turns':>6} {'Tokens':>10}"
+    )
+    if has_cost:
+        hdr += f" {'Cost':>10}"
+    print(hdr)
+    print(f"  {'':2}{'-'*(len(hdr)-4)}")
+    for k in keys:
+        recs = buckets.get(k, [])
+        if not recs:
+            line = (f"  {'':2}{k:<24} {'0':>4} {'-':>6} {'-':>6} "
+                    f"{'-':>6} {'-':>10}")
+            if has_cost:
+                line += f" {'-':>10}"
+            print(line)
+            continue
+        n = len(recs)
+        mp1 = sum(r["pass@1"] for r in recs if r["pass@1"] is not None) / n
+        mp8 = sum(r["pass@8"] for r in recs if r["pass@8"] is not None) / n
+        mt = sum(r["avg_turns"] for r in recs) / n
+        ti = sum(r["total_input_tokens"] for r in recs)
+        to = sum(r["total_output_tokens"] for r in recs)
+        tt = ti + to
+        line = (
+            f"  {'':2}{k:<24} {n:>4} {mp1:>6.2f} {mp8:>6.2f} "
+            f"{mt:>6.1f} {_fmt_count(tt):>10}"
+        )
+        if has_cost:
+            c = _estimate_cost(ti, to, model_slug)
+            line += f" {'${:,.2f}'.format(c):>10}"
+        print(line)
     print()
 
 
@@ -403,18 +659,16 @@ def _analyze_model(
     tasks_dir: Path,
     plots_base: Path,
     model_slug: str,
-    all_records: List[Dict[str, Any]],
+    max_rows: int = 50,
 ) -> None:
     """Run the full per-model analysis (table + quality plots)."""
     display = model_slug.replace("_", "/", 1)
-    print(f"\n{'─'*72}")
-    print(f"Model: {display}  (slug: {model_slug})")
-    print(f"{'─'*72}")
 
     records = load_tasks(tasks_dir, model_slug=model_slug)
 
     model_dir = plots_base / model_slug
-    print_summary_table(records, model_name=display)
+    print_summary(records, model_name=display, model_slug=model_slug,
+                  max_rows=max_rows)
 
     print(f"Generating quality plots for {display}...")
     plot_quality(records, model_dir, model_name=display, model_slug=model_slug)
@@ -447,6 +701,15 @@ def main():
             "Omit to auto-discover and analyze all models."
         ),
     )
+    ap.add_argument(
+        "--max-rows",
+        type=int,
+        default=50,
+        help=(
+            "Max per-task rows to print (default 50). "
+            "Set to 0 to show all rows regardless of count."
+        ),
+    )
     args = ap.parse_args()
 
     tasks_dir = args.tasks_dir
@@ -474,7 +737,7 @@ def main():
         print(f"Discovered {len(slugs)} model(s): {', '.join(slugs)}")
 
     for slug in slugs:
-        _analyze_model(tasks_dir, plots_dir, slug, all_records)
+        _analyze_model(tasks_dir, plots_dir, slug, max_rows=args.max_rows)
 
     print(f"\nDone. All plots saved under {plots_dir}/")
 
