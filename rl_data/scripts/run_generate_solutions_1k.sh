@@ -1,72 +1,67 @@
 #!/bin/bash
 #SBATCH --job-name=rl-gen-sol-1k
-#SBATCH --output=logs/gen_sol_1k_%A_%a.out
-#SBATCH --error=logs/gen_sol_1k_%A_%a.err
+#SBATCH --output=logs/gen_sol_1k_%j.out
+#SBATCH --error=logs/gen_sol_1k_%j.err
 #SBATCH --time=48:00:00
 #SBATCH --ntasks=1
 
 # ╔═══════════════════════════════════════════════════════════════════════╗
-# ║  Multi-node configuration — pick ONE block and uncomment it.        ║
+# ║  Single-node setup — pick ONE GPU allocation.                       ║
 # ║                                                                     ║
-# ║  Both setups use 4 GPUs total and finish in ~42 h.                  ║
-# ║  • 4-node: lower per-node load, better fault isolation              ║
-# ║  • 2-node: fewer jobs to monitor, slightly more per-node headroom   ║
+# ║  Each GPU gives 8 CPUs + 240 GB RAM.                               ║
+# ║  Concurrent containers = WORKERS × NUM_SOLUTIONS.                  ║
+# ║  Rule: containers ≤ CPUs (1:1) for safety, up to 1.5× for I/O     ║
+# ║  heavy workloads.                                                   ║
 # ╚═══════════════════════════════════════════════════════════════════════╝
 
-# ── Option A: 4 nodes × 1 GPU (default) ──
-#SBATCH --array=0-3
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=240G
-N_NODES=4
-WORKERS=1                   # 1 task at a time → 8 containers = 8 CPUs
+# ── Option A: 4 GPUs (default) ──
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=960G
+# WORKERS=4                    # 4 tasks × 8 solutions = 32 containers = 32 CPUs
+                             # ~1000/4 = 250 rounds × ~10 min = ~42h
 
-# ── Option B: 2 nodes × 2 GPUs ──
-# Uncomment below (and comment Option A lines above):
-# #SBATCH --array=0-1
-# #SBATCH --gres=gpu:2
-# #SBATCH --cpus-per-task=16
-# #SBATCH --mem=480G
-# N_NODES=2
-# WORKERS=2                 # 2 tasks at a time → 16 containers = 16 CPUs
+# ── Option B: 8 GPUs (faster) ──
+# #SBATCH --gres=gpu:8
+# #SBATCH --cpus-per-task=64
+# #SBATCH --mem=1920G
+WORKERS=8                  # 8 tasks × 8 solutions = 64 containers = 64 CPUs
+#                            # ~1000/8 = 125 rounds × ~10 min = ~21h
 
 set -euo pipefail
 
 # ---- Parameters (edit here) ----
-TASKS_DIR="rl_data/output/tasks_skill_tax_20260323_1k"
+TASKS_DIR="rl_data/output/tasks_skill_tax_20260324_1k"
 MODEL="gemini/gemini-3-flash-preview"
-NUM_SOLUTIONS=8
-MAX_ACTIONS=16
-MAX_TOKENS=65536
-SOLUTION_TEMPERATURE=0.7
-COMMAND_TIMEOUT=30
-SHELL_INIT_TIMEOUT=180      # higher than toy — more concurrent containers system-wide
-SHELL_INIT_ATTEMPTS=3
-BUILD_WORKERS=2              # concurrent SIF builds in pre-pass (safe at 2 on GPFS)
-BUILD_RETRIES=3
-BASE_SIFS_DIR="rl_data/containers"
-FORCE_RERUN=0                # set 1 to regenerate even if *_summary.json exists
-LOG_COMMANDS=0
-DISABLE_TERMINAL_LOG=0
+NUM_SOLUTIONS=8              # solution attempts per task (determines pass@k quality)
+MAX_ACTIONS=16               # max agent turns per solution attempt
+MAX_TOKENS=65536             # LLM context window for the agent
+NUM_TASKS=999999             # processes all task_* dirs in TASKS_DIR
+START_AT=0                   # skip first N tasks (useful for resuming a partial run)
+SOLUTION_TEMPERATURE=0.7     # LLM sampling temperature for solutions
+COMMAND_TIMEOUT=60           # per-command timeout (seconds) inside containers;
+                             # bumped from 30 — C/Rust/Go compile commands can take 10-30s
+SHELL_INIT_TIMEOUT=240       # seconds to wait for Apptainer shell to initialise;
+                             # higher than default (120) due to many concurrent containers
+SHELL_INIT_ATTEMPTS=3        # retries if shell init times out
+BUILD_WORKERS=4              # concurrent SIF builds in pre-pass; mostly a no-op with BASE_SIFS_DIR
+BUILD_RETRIES=3              # retries per SIF build with exponential backoff
+BASE_SIFS_DIR="rl_data/containers"  # pre-built base SIFs; skips per-task SIF builds entirely
+FORCE_RERUN=0                # 0 = skip tasks that already have a *_summary.json (default)
+                             # 1 = re-run all tasks even if solutions already exist (overwrites)
+LOG_COMMANDS=0               # 0 = off (default); 1 = write every bash command + raw PTY output
+                             # to per-solution log files under each task dir (debug only, large files)
+DISABLE_TERMINAL_LOG=0       # 0 = tee stdout/stderr to a log file in TASKS_DIR/logs/ (default)
+                             # 1 = skip the terminal log file, only print to console
 
-# ---- Multi-node task partitioning (auto-computed) ----
-# Total tasks in TASKS_DIR that we want to process across all array members.
-# Set to the number of surviving tasks from the task-generation step.
-# If the directory has fewer task_* dirs, each node just processes what exists.
-TOTAL_TASKS=1000
-TASKS_PER_NODE=$(( (TOTAL_TASKS + N_NODES - 1) / N_NODES ))  # ceiling division
-START_AT=$(( SLURM_ARRAY_TASK_ID * TASKS_PER_NODE ))
-NUM_TASKS=$TASKS_PER_NODE
-
-# Pool workers: controls ThreadPoolExecutor size for container init, command
-# execution, and final tests *within each task*.  Only needs to be ≥ NUM_SOLUTIONS.
-# Set to 2× for headroom.
+# Pool workers: ThreadPoolExecutor size for container init, command exec,
+# and final tests *within each task*.  Needs to be ≥ NUM_SOLUTIONS.
 NUM_POOL_WORKERS=16
 # --------------------------------
 
 _MODEL_TAG=$(echo "$MODEL" | tr '/' '_')
 _RUN_TS=$(date -u +%Y%m%d_%H%M%S)
-TERMINAL_LOG="${TASKS_DIR}/logs/${_MODEL_TAG}_node${SLURM_ARRAY_TASK_ID}_${_RUN_TS}.log"
+TERMINAL_LOG="${TASKS_DIR}/logs/${_MODEL_TAG}_${_RUN_TS}.log"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -74,8 +69,8 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 mkdir -p logs
 
-# Docker Hub auth — avoids anonymous rate limit (100 pulls/6h).
-# ⚠️  Do NOT commit real credentials.  Replace or source from a secrets file.
+# Docker Hub auth — avoids anonymous rate limit.
+# ⚠️  Do NOT commit real credentials.
 export APPTAINER_DOCKER_USERNAME="${APPTAINER_DOCKER_USERNAME:?Set APPTAINER_DOCKER_USERNAME before running}"
 export APPTAINER_DOCKER_PASSWORD="${APPTAINER_DOCKER_PASSWORD:?Set APPTAINER_DOCKER_PASSWORD before running}"
 
@@ -102,8 +97,8 @@ if [[ "${DISABLE_TERMINAL_LOG:-0}" != "1" ]]; then
   EXTRA_ARGS+=(--terminal-log "$TL")
 fi
 
-echo "=== Array task ${SLURM_ARRAY_TASK_ID}/${N_NODES}: tasks ${START_AT}..$(( START_AT + NUM_TASKS - 1 )) ==="
-echo "=== WORKERS=${WORKERS}  NUM_SOLUTIONS=${NUM_SOLUTIONS}  containers=$(( WORKERS * NUM_SOLUTIONS )) ==="
+echo "=== Single-node: ${NUM_TASKS} tasks, WORKERS=${WORKERS}, NUM_SOLUTIONS=${NUM_SOLUTIONS} ==="
+echo "=== Concurrent containers: $(( WORKERS * NUM_SOLUTIONS )) ==="
 
 uv run python -m rl_data.generate_solutions \
     --tasks-dir "$TASKS_DIR" \

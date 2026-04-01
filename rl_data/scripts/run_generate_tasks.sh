@@ -11,8 +11,9 @@ set -euo pipefail
 
 # ---- Parameters (edit here) ----
 NUM_TASKS=10
-OUT_DIR="rl_data/output/tasks_skill_tax_20260321_toy"
-MODEL="gemini/gemini-3.1-pro-preview"
+OUT_DIR="rl_data/output/tasks_skill_tax_20260327_toy"
+MODEL="gemini/gemini-3-flash-preview"
+#MODEL="gemini/gemini-3.1-pro-preview"
 MAX_TOKENS=32768
 BATCH_SIZE=10
 MAX_CONCURRENCY=10

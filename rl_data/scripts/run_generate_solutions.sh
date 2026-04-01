@@ -10,7 +10,7 @@
 set -euo pipefail
 
 # ---- Parameters (edit here) ----
-TASKS_DIR="rl_data/output/tasks_skill_tax_20260321_toy"
+TASKS_DIR="rl_data/output/tasks_skill_tax_20260327_toy"
 MODEL="gemini/gemini-3-flash-preview" #gemini-3-flash-preview, gemini-3.1-flash-lite-preview, "gemini/gemini-3.1-pro-preview"
 NUM_SOLUTIONS=8
 MAX_ACTIONS=16 # max turns

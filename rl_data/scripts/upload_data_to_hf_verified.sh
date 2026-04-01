@@ -2,23 +2,23 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-# ── Upload RL task dataset to Hugging Face ───────────────────────────
+# ── Upload VERIFIED RL tasks to Hugging Face ─────────────────────────
 #
-# Uploads the raw task folder structure (task_*/*, analysis/*) AND a
-# consolidated .parquet file so HuggingFace Dataset Viewer can preview
-# the data directly on the web.
+# Same as upload_data_to_hf.sh but only includes tasks that have at
+# least one non-zero pass@k in their *_summary.json — i.e. tasks where
+# a solution has been tested and verified to work.
 #
 # Usage:
-#   bash rl_data/scripts/upload_data_to_hf.sh
-#   bash rl_data/scripts/upload_data_to_hf.sh --input-dir rl_data/output/tasks_v2
-#   bash rl_data/scripts/upload_data_to_hf.sh --repo osieosie/tmax-rl-v2 --private
-#   bash rl_data/scripts/upload_data_to_hf.sh --no-parquet
+#   bash rl_data/scripts/upload_data_to_hf_verified.sh
+#   bash rl_data/scripts/upload_data_to_hf_verified.sh --input-dir rl_data/output/tasks_v2
+#   bash rl_data/scripts/upload_data_to_hf_verified.sh --repo osieosie/tmax-rl-v2-verified --private
+#   bash rl_data/scripts/upload_data_to_hf_verified.sh --no-parquet
 #
 # Requirements:
 #   - huggingface-cli login  (or HF_TOKEN env var)
 #   - Python with huggingface_hub, pandas, pyarrow
 
-REPO_ID="osieosie/tmax-tasks-skill-taxonomy-20260324-1k"
+REPO_ID="osieosie/tmax-tasks-skill-taxonomy-20260324-1k-verified"
 INPUT_DIR="/gpfs/scrubbed/osey/tmax/rl_data/output/tasks_skill_tax_20260324_1k"
 PRIVATE=""
 NO_PARQUET=""
@@ -34,12 +34,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "=== Upload RL Dataset to Hugging Face ==="
+echo "=== Upload VERIFIED RL Dataset to Hugging Face ==="
 echo "  Repo:       ${REPO_ID}"
 echo "  Input dir:  ${INPUT_DIR}"
+echo "  Filter:     verified-only (pass@k > 0)"
 echo ""
 
 exec uv run python -m rl_data.upload_to_hf \
     --repo "${REPO_ID}" \
     --input-dir "${INPUT_DIR}" \
+    --verified-only \
     ${PRIVATE} ${NO_PARQUET}

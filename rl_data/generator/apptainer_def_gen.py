@@ -264,7 +264,7 @@ def build_and_test(
                 sif_path.unlink()
             build_proc = subprocess.run(
                 ["apptainer", "build", str(sif_path), str(def_path)],
-                capture_output=True, text=True, timeout=300,
+                capture_output=True, text=True, timeout=600,
             )
             if build_proc.returncode == 0:
                 break

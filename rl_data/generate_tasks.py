@@ -35,7 +35,7 @@ from rl_data.generator.completion_test_gen import generate_test_templates_batch 
 class PipelineConfig:
     num_tasks: int
     out_dir: Path
-    max_def_retries: int = 5
+    max_def_retries: int = 3
     max_num_completions: int = 4
     num_solutions: int = 256
     max_actions: int = 20
@@ -139,6 +139,8 @@ def _generate_intermediates_batch(
             "task_complexity": t.get("task_complexity", ""),
             "command_complexity": t.get("command_complexity", ""),
             "scenario": t.get("scenario", ""),
+            "language": t.get("language", ""),
+            "anchor": t.get("anchor"),
         }
         for t in task_templates
     ]
@@ -257,6 +259,8 @@ def _save_one_task(
         "task_complexity": m["task_complexity"],
         "command_complexity": m["command_complexity"],
         "scenario": m["scenario"],
+        "language": m.get("language", ""),
+        "anchor": m.get("anchor"),
         "description": desc,
         "truth": tr,
     }

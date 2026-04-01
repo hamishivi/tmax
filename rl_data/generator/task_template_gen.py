@@ -105,6 +105,15 @@ SKILL_TAXONOMY: dict[str, dict[str, list[str]]] = {
             "Checksum and error-correcting codes",
             "Character and data encoding",
         ],
+        "Multi-Language": [
+            "C program compilation, debugging, and Makefile repair",
+            "Rust ownership and borrow checker debugging",
+            "Go concurrency patterns (goroutines, channels)",
+            "C/C++ memory safety and undefined behaviour repair",
+            "Polyglot build orchestration (multiple compiled languages)",
+            "FFI and cross-language interop (C bindings, ctypes, cgo)",
+            "Assembly-level analysis and minimal program construction",
+        ],
     },
     "file_operations": {
         "File I/O": [
@@ -261,6 +270,15 @@ SKILL_TAXONOMY: dict[str, dict[str, list[str]]] = {
             "Formula implementation correction",
             "Statistical anomaly investigation",
             "Precision loss tracking",
+        ],
+        "Forensics": [
+            "Database recovery from corrupted files (WAL, journal)",
+            "Deleted file recovery and filesystem inspection",
+            "Binary reverse engineering and decompilation",
+            "Network packet capture analysis (pcap)",
+            "Git history forensics and secret recovery",
+            "Memory dump analysis and string extraction",
+            "Log timeline reconstruction across services",
         ],
     },
     "scientific_computing": {
@@ -576,6 +594,8 @@ DOMAIN_SCENARIOS: dict[str, list[str]] = {
         "compliance analyst generating audit trails",
         "incident responder investigating issues",
         "network engineer inspecting traffic",
+        "forensics analyst recovering evidence from a compromised host",
+        "red-team operator crafting an evasion payload",
     ],
     "software_engineering": [
         "developer organizing project files",
@@ -587,6 +607,12 @@ DOMAIN_SCENARIOS: dict[str, list[str]] = {
         "web developer building a feature",
         "script developer creating utilities",
         "mobile build engineer maintaining pipelines",
+        "open-source maintainer reviewing a broken PR",
+        "developer migrating from Python 2 to Python 3",
+        "engineer porting a Linux tool to work in a minimal container",
+        "developer fixing a multi-file Rust project that fails to compile",
+        "systems programmer debugging a C library linking issue",
+        "engineer setting up a polyglot build system from scratch",
     ],
     "file_operations": [
         "developer organizing project files",
@@ -621,6 +647,11 @@ DOMAIN_SCENARIOS: dict[str, list[str]] = {
         "operations engineer triaging incidents",
         "performance engineer profiling applications",
         "IT support technician resolving tickets",
+        "on-call engineer responding to a 3am page",
+        "developer inheriting an unfamiliar codebase",
+        "security researcher analysing a suspicious binary",
+        "engineer investigating a memory leak in a long-running service",
+        "developer bisecting a regression across 200 commits",
     ],
     "scientific_computing": [
         "researcher running simulations",
@@ -655,8 +686,102 @@ DOMAIN_SCENARIOS: dict[str, list[str]] = {
         "edge computing engineer deploying to IoT devices",
         "observability engineer tuning dashboards",
         "site administrator managing user accounts",
+        "engineer diagnosing why a systemd service fails to start",
+        "admin fixing an nginx config that returns 502 bad gateway",
     ],
 }
+
+
+# ---------------------------------------------------------------------------
+# Real-software anchors: concrete buggy-scenario templates sampled as optional
+# inspiration for the LLM.  ~35% of tasks include one.
+# ---------------------------------------------------------------------------
+
+REAL_SOFTWARE_ANCHORS: dict[str, list[str]] = {
+    "software_engineering": [
+        "a small C project with a Makefile that has a linking error",
+        "a Python package with a broken setup.py/pyproject.toml",
+        "a multi-file Rust project that fails to compile due to lifetime issues",
+        "a Go module with a circular import that prevents building",
+        "a Node.js project whose npm install fails due to conflicting peer deps",
+        "a CMake project that can't find a shared library at link time",
+        "a Python project whose test suite passes locally but fails in CI due to import ordering",
+    ],
+    "debugging": [
+        "a C program with a buffer overflow that only manifests with specific input",
+        "a Python script with a subtle timezone bug",
+        "a shell script that breaks on filenames with spaces",
+        "a multithreaded program that deadlocks under high contention",
+        "a Rust program that panics on unwrap() with certain edge-case data",
+        "a Go service that leaks goroutines under cancellation",
+        "a program that works on x86 but produces wrong results due to signed integer overflow",
+    ],
+    "system_administration": [
+        "an nginx config that returns 502 due to wrong upstream socket path",
+        "a systemd service that fails to start because of a missing After= dependency",
+        "a cron job that runs but writes to the wrong location due to PATH differences",
+        "an SSH config that silently rejects key-based login",
+        "a Docker Compose setup where services can't reach each other due to network misconfiguration",
+    ],
+    "security": [
+        "a web server with an open redirect vulnerability in its login flow",
+        "a script that leaks credentials via command-line arguments visible in /proc",
+        "a JWT implementation that accepts tokens with algorithm=none",
+        "a file upload handler susceptible to path traversal",
+    ],
+    "data_querying": [
+        "a SQL query that returns wrong results due to an implicit cross join",
+        "an SQLite database with a corrupted index that returns stale rows",
+        "a query that deadlocks two concurrent transactions",
+    ],
+    "data_processing": [
+        "a CSV pipeline that silently drops rows containing embedded newlines",
+        "a JSON-lines parser that breaks on unicode escape sequences",
+        "an ETL job that produces duplicate records on retry",
+    ],
+    "file_operations": [
+        "a backup script that follows symlinks into infinite loops",
+        "an archive extraction that overwrites files outside the target directory (zip slip)",
+        "a log rotation script that races with the writing process",
+    ],
+    "data_science": [
+        "a pandas pipeline that silently converts ints to floats via NaN introduction",
+        "a scikit-learn pipeline where data leaks between train and test via fit_transform",
+        "a matplotlib script that produces blank plots due to backend misconfiguration",
+    ],
+    "scientific_computing": [
+        "a numerical integrator that diverges due to wrong step-size adaptation",
+        "a matrix factorisation that fails on near-singular input",
+        "a simulation that produces non-reproducible results due to floating-point reduction order",
+    ],
+}
+
+_ANCHOR_PROBABILITY = 0.35
+
+
+# ---------------------------------------------------------------------------
+# Language axis: sampled alongside domain and complexity to encourage
+# non-Python tasks.  Weights are tuned to keep Python dominant but ensure
+# meaningful coverage of compiled languages.
+# ---------------------------------------------------------------------------
+
+TASK_LANGUAGES: list[tuple[str, float]] = [
+    ("Python",          0.35),
+    ("C",               0.15),
+    ("Bash",            0.15),
+    ("C++",             0.10),
+    ("Rust",            0.07),
+    ("Go",              0.07),
+    ("multi-language",  0.06),
+    ("any (model's choice)", 0.05),
+]
+
+_LANG_NAMES = [l for l, _ in TASK_LANGUAGES]
+_LANG_WEIGHTS = [w for _, w in TASK_LANGUAGES]
+
+
+def _sample_language() -> str:
+    return random.choices(_LANG_NAMES, weights=_LANG_WEIGHTS, k=1)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -752,7 +877,8 @@ def random_user_msg() -> tuple[str, str, dict]:
     """Generate a domain-specific (system_msg, user_msg, metadata) tuple.
 
     Selects a domain, samples primitive skills, picks complexity levels,
-    and draws a domain-appropriate persona.
+    draws a domain-appropriate persona, optionally injects a real-software
+    anchor, and samples a primary language.
     """
     domain = random.choice(list(SKILL_TAXONOMY.keys()))
     skill_types = SKILL_TAXONOMY[domain]
@@ -768,13 +894,30 @@ def random_user_msg() -> tuple[str, str, dict]:
     task_complexity = random.choice(TASK_COMPLEXITY)
     command_complexity = random.choice(COMMAND_COMPLEXITY)
     scenario = random.choice(DOMAIN_SCENARIOS[domain])
+    language = _sample_language()
+
+    anchor: str | None = None
+    domain_anchors = REAL_SOFTWARE_ANCHORS.get(domain)
+    if domain_anchors and random.random() < _ANCHOR_PROBABILITY:
+        anchor = random.choice(domain_anchors)
 
     system_msg = build_system_prompt(domain)
 
     skills_formatted = "\n".join(f"- {s}" for s in primitive_skills)
+
+    anchor_block = ""
+    if anchor:
+        anchor_block = (
+            f"\n## Scenario Anchor (use as inspiration, not literally)\n"
+            f"{anchor}\n"
+        )
+
     user_msg = (
         f"# Task Generation Request\n"
         f"Category: {skill_type}\n"
+        f"\n"
+        f"## Primary Language\n"
+        f"{language}\n"
         f"\n"
         f"## Primitive Skills (Building Blocks)\n"
         f"{skills_formatted}\n"
@@ -787,6 +930,7 @@ def random_user_msg() -> tuple[str, str, dict]:
         f"\n"
         f"## Scenario\n"
         f"{scenario}\n"
+        f"{anchor_block}"
         f"\n"
         f"## Instructions\n"
         f"CREATE A NOVEL TASK that:\n"
@@ -796,6 +940,8 @@ def random_user_msg() -> tuple[str, str, dict]:
         f"4. Has clear, unambiguous specifications\n"
         f"5. Is a realistic end-to-end scenario that an AI agent could perform "
         f"in a Linux terminal\n"
+        f"6. Uses **{language}** as the primary language for any code that must be "
+        f"written or debugged (shell commands are always allowed alongside it)\n"
         f"\n"
         f"Think of an original scenario or application -- don't just combine "
         f"primitives mechanically.\n"
@@ -811,6 +957,8 @@ def random_user_msg() -> tuple[str, str, dict]:
         "task_complexity": task_complexity,
         "command_complexity": command_complexity,
         "scenario": scenario,
+        "language": language,
+        "anchor": anchor,
     }
     return system_msg, user_msg, metadata
 

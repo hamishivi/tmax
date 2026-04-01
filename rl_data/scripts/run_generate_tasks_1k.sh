@@ -14,8 +14,8 @@ set -euo pipefail
 # Request 2000 tasks: with ~50% pipeline survival rate (template→init_test→
 # final_test→def_build), expect ~1000 surviving tasks.  Increase if survival
 # is lower on your workload; decrease if you only need ~500 usable tasks.
-NUM_TASKS=1200
-OUT_DIR="rl_data/output/tasks_skill_tax_20260323_1k"
+NUM_TASKS=1100
+OUT_DIR="rl_data/output/tasks_skill_tax_20260324_1k"
 MODEL="gemini/gemini-3.1-pro-preview"
 MAX_TOKENS=32768
 # Process in batches of 100 — each batch runs stages 1-3 (LLM calls).
@@ -28,7 +28,7 @@ MAX_CONCURRENCY=128
 # Concurrent Apptainer build+test workers in stage 4.
 # Each uses ~1 CPU + ~4 GB RAM.  With 4 GPUs (32 CPUs): 24 workers
 # leaves 8 cores for Python + LLM I/O overhead.
-DEF_BUILD_WORKERS=48
+DEF_BUILD_WORKERS=64
 TASK_TEMPERATURE=1.0
 TEST_TEMPERATURE=0.6
 
