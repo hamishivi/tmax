@@ -444,6 +444,7 @@ class InteractiveContainerEnvironment:
         exec_cmd = [
             "apptainer", "exec",
             "--fakeroot", "--userns", "--writable-tmpfs", "--cleanenv",
+            "--pwd", "/home/user",
             "--bind", f"{self._writable_home_path}:/home/user",
             "--bind", f"{self.temp_dir}:{self.temp_dir}",
             str(sif_for_exec),
@@ -552,6 +553,7 @@ class InteractiveContainerEnvironment:
         if self.verbose:
             print("✅ Container environment ready")
         self.exec("cd /home/user")
+        self.exec("export PYTHONPATH=/home/user/.local/lib/python3/dist-packages:${PYTHONPATH:-}")
         return True
 
     def exec(self, command: str, timeout: Optional[float] = None) -> Tuple[bool, str]:

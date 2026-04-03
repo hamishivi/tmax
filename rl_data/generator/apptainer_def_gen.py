@@ -68,10 +68,18 @@ _PREAMBLE_PATTERNS: list[re.Pattern] = [
     re.compile(r"^\s*chmod\s+.*(/home/user|777|755)"),
     re.compile(r"^\s*%environment\b"),
     re.compile(r"^\s*export\s+(LC_ALL|LANG)\s*="),
+    # Rust/Go env vars and installers — already in base images
+    re.compile(r"^\s*export\s+(RUSTUP_HOME|CARGO_HOME|GOPATH|GOROOT|PATH)\s*="),
+    re.compile(r"^\s*curl\s+.*rustup\.rs", re.IGNORECASE),
+    re.compile(r"^\s*curl\s+.*sh\.rustup\.rs", re.IGNORECASE),
+    re.compile(r"^\s*(wget|curl)\s+.*go\d+\.\d+.*\.tar\.gz"),
+    re.compile(r"^\s*tar\s+.*-C\s+/usr/local\b"),
+    re.compile(r"^\s*ln\s+-s[f]?\s+.*/usr/local/"),
+    # Cleanup lines that write to system dirs
+    re.compile(r"^\s*rm\s+-rf\s+/var/lib/apt"),
 ]
 
 _APT_GET_RE = re.compile(r"^\s*apt-get\s+(install|update)")
-_PIP_INSTALL_RE = re.compile(r"^\s*pip3?\s+install\s+(.+)")
 
 
 def _is_preamble_line(line: str) -> bool:
@@ -117,7 +125,7 @@ def parse_def_to_delta(def_text: str, domain_hint: Optional[str] = None) -> tupl
             delta_lines.append(line)
             continue
 
-        if _is_preamble_line(line) or _APT_GET_RE.match(line) or _PIP_INSTALL_RE.match(line):
+        if _is_preamble_line(line) or _APT_GET_RE.match(line):
             continue
 
         stripped = line.rstrip()
@@ -136,7 +144,17 @@ def parse_def_to_delta(def_text: str, domain_hint: Optional[str] = None) -> tupl
     # writable bind mount instead of fuse-overlayfs (which can EINVAL on file creation).
     setup_body = setup_body.replace("/tmp/", "/home/user/.setup_tmp/")
 
+    # Redirect pip installs to /home/user/.local so packages land on the writable
+    # bind mount instead of /usr/local/lib/... on fuse-overlayfs (EINVAL).
+    setup_body = re.sub(
+        r"^(\s*pip3?\s+install)\b",
+        r"\1 --target /home/user/.local/lib/python3/dist-packages",
+        setup_body,
+        flags=re.MULTILINE,
+    )
+
     header = "#!/bin/bash\nset -euo pipefail\nmkdir -p /home/user/.setup_tmp\n"
+    header += "export PYTHONPATH=/home/user/.local/lib/python3/dist-packages:${PYTHONPATH:-}\n"
     footer = "\nrm -rf /home/user/.setup_tmp\n"
     return base_domain, header + setup_body + footer
 
@@ -327,6 +345,7 @@ def iterate_def_template_batch(
     max_build_workers: int = 4,
     skip_indices: Optional[set] = None,
     on_round_complete: Optional[object] = None,
+    on_item_success: Optional[object] = None,
 ) -> List[Optional[str]]:
     """Batched def generation with retry loop and error feedback.
 
@@ -342,6 +361,10 @@ def iterate_def_template_batch(
         ``callback(round_idx, newly_succeeded)`` called after each round.
         *newly_succeeded* is ``Dict[int, str]`` mapping item index → def text
         for items that passed build+test in this round.
+    on_item_success:
+        ``callback(idx, def_text)`` called immediately when a single item
+        passes build+test, before the round finishes.  Use for streaming
+        saves so progress survives partial-round interruptions.
     """
     if domains is None:
         domains = ["software_engineering"] * len(items)
@@ -419,6 +442,8 @@ def iterate_def_template_batch(
                 if def_text is not None:
                     results[idx] = def_text
                     newly_succeeded[idx] = def_text
+                    if on_item_success:
+                        on_item_success(idx, def_text)
                 else:
                     error_msgs[idx] = err
                     next_pending.append(idx)

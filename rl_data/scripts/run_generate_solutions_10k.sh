@@ -25,8 +25,7 @@
 # #SBATCH --gres=gpu:8
 # #SBATCH --cpus-per-task=64
 # #SBATCH --mem=1920G
-WORKERS=8                  # 8 tasks × 8 solutions = 64 containers = 64 CPUs
-#                            # ~1000/8 = 125 rounds × ~10 min = ~21h
+WORKERS=12                  # 8 tasks × 8 solutions = 64 containers = 64 CPUs
 
 set -euo pipefail
 
@@ -77,6 +76,14 @@ export APPTAINER_DOCKER_PASSWORD="${APPTAINER_DOCKER_PASSWORD:?Set APPTAINER_DOC
 export APPTAINER_CACHEDIR="/gpfs/projects/h2lab/osey/apptainer_cache"
 export APPTAINER_TMPDIR="/tmp/apptainer_tmp"
 mkdir -p "$APPTAINER_TMPDIR"
+
+# Redirect Apptainer instance logs off $HOME to avoid home quota exhaustion
+# under high concurrency (12 workers × 8 solutions = thousands of instance logs).
+if [ ! -L "$HOME/.apptainer/instances" ]; then
+  rm -rf "$HOME/.apptainer/instances"
+  mkdir -p /tmp/apptainer_instances
+  ln -s /tmp/apptainer_instances "$HOME/.apptainer/instances"
+fi
 
 EXTRA_ARGS=()
 if [[ "${FORCE_RERUN:-0}" == "1" ]]; then

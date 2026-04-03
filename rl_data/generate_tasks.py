@@ -399,23 +399,22 @@ def run_pipeline(cfg: AsyncBatchConfig) -> Dict[str, Any]:
 
     stage4_start = time.monotonic()
     _round_start = [stage4_start]
+    _save_lock = __import__("threading").Lock()
 
-    def _on_round_complete(round_idx: int, newly_succeeded: Dict[int, str]) -> None:
-        """Save tasks, record progress, and log round stats."""
-        round_elapsed = time.monotonic() - _round_start[0]
-        _round_start[0] = time.monotonic()
-
-        new_entries: List[Dict[str, Any]] = []
-        for idx, def_text in newly_succeeded.items():
-            task_dir = _save_one_task(
-                all_intermediates[idx], def_text, cfg.out_dir, idx=idx,
-            )
-            entry = {"idx": idx, "task_dir": str(task_dir)}
-            new_entries.append(entry)
+    def _on_item_success(idx: int, def_text: str) -> None:
+        """Save a single task to disk immediately when it passes build+test."""
+        task_dir = _save_one_task(
+            all_intermediates[idx], def_text, cfg.out_dir, idx=idx,
+        )
+        with _save_lock:
             all_saved_dirs.append(str(task_dir))
             done_indices.add(idx)
+            _append_stage4_done(progress_path, [{"idx": idx, "task_dir": str(task_dir)}])
 
-        _append_stage4_done(progress_path, new_entries)
+    def _on_round_complete(round_idx: int, newly_succeeded: Dict[int, str]) -> None:
+        """Log round-level stats (saves already happened per-item)."""
+        round_elapsed = time.monotonic() - _round_start[0]
+        _round_start[0] = time.monotonic()
 
         round_stats.append({
             "round": round_idx,
@@ -436,6 +435,7 @@ def run_pipeline(cfg: AsyncBatchConfig) -> Dict[str, Any]:
         max_build_workers=cfg.def_build_workers,
         skip_indices=done_indices if done_indices else None,
         on_round_complete=_on_round_complete,
+        on_item_success=_on_item_success,
     )
 
     stage4_elapsed = time.monotonic() - stage4_start
