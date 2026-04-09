@@ -16,29 +16,37 @@ cd "$(dirname "$0")/.."
 # Output: output/preprocessing/terminus2_sweagent/
 
 NUM_WORKERS="$(nproc)"
-OUTPUT_DIR="output/preprocessing/terminus2_sweagent_full_20260317"
+OUTPUT_DIR="output/preprocessing/terminus2_sweagent_full_20260403"
 MAX_TURNS=999
 NUM_EXAMPLES=3
-HF_REPO="osieosie/tmax-sft-full-20260317"
+HF_REPO="osieosie/tmax-sft-full-20260403"
 UPLOAD=true
 UPLOAD_FLAGS=""
+INCLUDE_PARTIAL=true
 
 # Parse our flags, pass the rest through to pipeline.py
 PIPELINE_EXTRA=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --upload)  UPLOAD=true; shift ;;
-        --public)  UPLOAD_FLAGS="${UPLOAD_FLAGS} --public"; shift ;;
-        --repo)    HF_REPO="$2"; shift 2 ;;
-        *)         PIPELINE_EXTRA="${PIPELINE_EXTRA} $1"; shift ;;
+        --upload)            UPLOAD=true; shift ;;
+        --public)            UPLOAD_FLAGS="${UPLOAD_FLAGS} --public"; shift ;;
+        --repo)              HF_REPO="$2"; shift 2 ;;
+        --include-partial)   INCLUDE_PARTIAL=true; shift ;;
+        *)                   PIPELINE_EXTRA="${PIPELINE_EXTRA} $1"; shift ;;
     esac
 done
+
+PARTIAL_FLAG=""
+if [ "${INCLUDE_PARTIAL}" = true ]; then
+    PARTIAL_FLAG="--include-partial"
+fi
 
 echo "=== Terminus-2 -> SWE-Agent Full Conversion Pipeline ==="
 echo "  Workers:    ${NUM_WORKERS}"
 echo "  Output:     ${OUTPUT_DIR}"
 echo "  Max turns:  ${MAX_TURNS}"
 echo "  Examples:   ${NUM_EXAMPLES} per source"
+echo "  Partial:    ${INCLUDE_PARTIAL}"
 echo ""
 
 # shellcheck disable=SC2086
@@ -47,6 +55,7 @@ python -m preprocessing.pipeline \
     --output-dir "${OUTPUT_DIR}" \
     --max-turns "${MAX_TURNS}" \
     --num-examples "${NUM_EXAMPLES}" \
+    ${PARTIAL_FLAG} \
     ${PIPELINE_EXTRA}
 
 echo ""
