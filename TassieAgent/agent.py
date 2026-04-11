@@ -181,7 +181,11 @@ class TassieAgent(BaseAgent):
                     break
 
                 t0 = time.monotonic()
-                response = await self._query_with_retry(model, messages, bash_tool)
+                try:
+                    response = await self._query_with_retry(model, messages, bash_tool)
+                except litellm.exceptions.ContextWindowExceededError:
+                    logger.warning("Context window exceeded — stopping and submitting current work")
+                    break
                 llm_time = time.monotonic() - t0
 
                 try:
@@ -239,6 +243,7 @@ class TassieAgent(BaseAgent):
                 temperature = 1.0 if "gpt-5" in model else 0.7
                 return await litellm.acompletion(
                     model=model, messages=messages, tools=[bash_tool], temperature=temperature,
+                    top_p=0.95,
                     api_base=self.api_base,
                 )
             except ABORT_EXCEPTIONS as e:

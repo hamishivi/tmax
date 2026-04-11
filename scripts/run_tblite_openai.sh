@@ -30,6 +30,7 @@ else
         --dataset openthoughts-tblite@2.0 \
         --agent-import-path TassieAgent:TassieAgent \
         --model "$MODEL" \
+        -k 3 \
         --env daytona \
         --n-concurrent "$N_CONCURRENT" \
         --agent-kwarg "max_steps=$MAX_STEPS" \

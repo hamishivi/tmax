@@ -35,10 +35,12 @@ TP_SIZE=""
 DP_SIZE=""
 PORT=8008
 MAX_MODEL_LEN=""
+TOOL_CALL_PARSER="hermes"
 CLUSTER="ai2/saturn"
 BUDGET="ai2/oe-adapt"
 PRIORITY="high"
 BEAKER_WORKSPACE="${BEAKER_WORKSPACE:-ai2/open-instruct-dev}"
+EXTRA_ARGS=""
 
 usage() {
     echo "Usage: $0 <model_path> [options]"
@@ -55,6 +57,8 @@ usage() {
     echo "  --budget BUDGET      Beaker budget (default: ai2/oe-adapt)"
     echo "  --priority PRIORITY  Priority: high, normal, low (default: high)"
     echo "  --workspace WS       Beaker workspace (default: ai2/tmax)"
+    echo "  --tool-call-parser P Tool call parser (default: hermes)"
+    echo "  --extra-args ARGS    Extra arguments to pass to vllm serve"
     exit 1
 }
 
@@ -78,6 +82,8 @@ while [ $# -gt 0 ]; do
         --budget) BUDGET="$2"; shift 2 ;;
         --priority) PRIORITY="$2"; shift 2 ;;
         --workspace) BEAKER_WORKSPACE="$2"; shift 2 ;;
+        --tool-call-parser) TOOL_CALL_PARSER="$2"; shift 2 ;;
+        --extra-args) EXTRA_ARGS="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
 done
@@ -104,7 +110,7 @@ VLLM_CMD+=" --revision ${REVISION}"
 VLLM_CMD+=" --tokenizer-revision ${REVISION}"
 VLLM_CMD+=" --served-model-name ${SERVED_MODEL_NAME}"
 VLLM_CMD+=" --enable-auto-tool-choice"
-VLLM_CMD+=" --tool-call-parser hermes"
+VLLM_CMD+=" --tool-call-parser ${TOOL_CALL_PARSER}"
 VLLM_CMD+=" --port ${PORT}"
 if [ -n "${MAX_MODEL_LEN}" ]; then
     VLLM_CMD+=" --max-model-len ${MAX_MODEL_LEN}"
@@ -113,6 +119,9 @@ VLLM_CMD+=" --gpu-memory-utilization 0.85"
 VLLM_CMD+=" --tensor-parallel-size ${TP_SIZE}"
 if [ "${DP_SIZE}" -gt 1 ]; then
     VLLM_CMD+=" --data-parallel-size ${DP_SIZE}"
+fi
+if [ -n "${EXTRA_ARGS}" ]; then
+    VLLM_CMD+=" ${EXTRA_ARGS}"
 fi
 
 BEAKER_NAME="vllm-${SERVED_MODEL_NAME}"
