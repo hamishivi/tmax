@@ -56,6 +56,13 @@ class SolutionConfig:
     #: Directory containing pre-built base SIFs (base_{domain}.sif). When set, per-task SIFs
     #: are not needed; the env uses a shared base + task-specific delta script.
     base_sifs_dir: Optional[str] = None
+    #: Random-sample at most this many tasks from ``tasks_dir`` (0 = disabled;
+    #: use ``num_tasks``/``start_at`` for sequential sampling instead).
+    #: Applied **after** ``filter_solved`` and ``use_parquet`` so the random
+    #: subsample is drawn from the already-filtered set.
+    sample_size: int = 0
+    #: Seed for the random sample; keep fixed across runs for reproducibility.
+    sample_seed: int = 0
 
 
 class _TeeTextStream:
@@ -326,6 +333,19 @@ def parse_args(argv: Optional[List[str]] = None) -> SolutionConfig:
         help="Directory with pre-built base_{domain}.sif files. When set, per-task SIF builds "
              "are skipped; the env uses a shared base SIF + task-specific delta script.",
     )
+    ap.add_argument(
+        "--sample-size",
+        type=int,
+        default=0,
+        help="Random-sample at most N tasks from --tasks-dir (0 = disabled). "
+             "Great for cost-bounded comparison runs against large baselines.",
+    )
+    ap.add_argument(
+        "--sample-seed",
+        type=int,
+        default=0,
+        help="Seed for --sample-size so reruns pick the same tasks (default: 0).",
+    )
 
     args = ap.parse_args(argv)
     return SolutionConfig(**vars(args))
@@ -440,6 +460,17 @@ def _run_generate_solutions(cfg: SolutionConfig) -> None:
         task_dirs = [d["extra_info"]["task_dir"] for d in dataset]
 
     task_dirs = list(sorted(task_dirs))
+
+    # Optional random subsample for cost-bounded runs.  Runs BEFORE the
+    # start_at/num_tasks window so the sample is drawn once, then the usual
+    # slice still applies if someone wants to chunk the sampled set.
+    if cfg.sample_size and cfg.sample_size > 0 and cfg.sample_size < len(task_dirs):
+        import random as _random
+        rng = _random.Random(cfg.sample_seed)
+        task_dirs = rng.sample(task_dirs, cfg.sample_size)
+        task_dirs = list(sorted(task_dirs))  # deterministic ordering post-sample
+        print(f"Random sample (seed={cfg.sample_seed}): {cfg.sample_size} tasks")
+
     task_dirs = task_dirs[cfg.start_at : min(cfg.start_at + cfg.num_tasks, len(task_dirs))]
 
     if not task_dirs:

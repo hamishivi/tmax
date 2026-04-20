@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../.."
 
 # ── Upload RL task dataset to Hugging Face ───────────────────────────
 #
@@ -9,10 +9,10 @@ cd "$(dirname "$0")/../.."
 # the data directly on the web.
 #
 # Usage:
-#   bash rl_data/scripts/upload_data_to_hf.sh
-#   bash rl_data/scripts/upload_data_to_hf.sh --input-dir rl_data/output/tasks_v2
-#   bash rl_data/scripts/upload_data_to_hf.sh --repo osieosie/tmax-rl-v2 --private
-#   bash rl_data/scripts/upload_data_to_hf.sh --no-parquet
+#   bash rl_data/scripts/upload/upload_data_to_hf.sh
+#   bash rl_data/scripts/upload/upload_data_to_hf.sh --input-dir rl_data/output/tasks_v2
+#   bash rl_data/scripts/upload/upload_data_to_hf.sh --repo osieosie/tmax-rl-v2 --private
+#   bash rl_data/scripts/upload/upload_data_to_hf.sh --no-parquet
 #
 # Requirements:
 #   - huggingface-cli login  (or HF_TOKEN env var)

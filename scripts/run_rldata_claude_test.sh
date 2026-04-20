@@ -63,7 +63,7 @@ fi
 if [ ! -d "$FULL_DATASET" ]; then
     echo "ERROR: Harbor dataset not found at $FULL_DATASET"
     echo "Run the conversion script first:"
-    echo "  uv run python rl_data/scripts/convert_to_harbor.py \\"
+    echo "  uv run python rl_data/scripts/analyze/convert_to_harbor.py \\"
     echo "      --src rl_data/output/tasks_skill_tax_20260401_10k \\"
     echo "      --dst $FULL_DATASET"
     exit 1

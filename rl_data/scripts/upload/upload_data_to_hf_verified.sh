@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../.."
 
 # ── Upload VERIFIED RL tasks to Hugging Face ─────────────────────────
 #
@@ -9,10 +9,10 @@ cd "$(dirname "$0")/../.."
 # a solution has been tested and verified to work.
 #
 # Usage:
-#   bash rl_data/scripts/upload_data_to_hf_verified.sh
-#   bash rl_data/scripts/upload_data_to_hf_verified.sh --input-dir rl_data/output/tasks_v2
-#   bash rl_data/scripts/upload_data_to_hf_verified.sh --repo osieosie/tmax-rl-v2-verified --private
-#   bash rl_data/scripts/upload_data_to_hf_verified.sh --no-parquet
+#   bash rl_data/scripts/upload/upload_data_to_hf_verified.sh
+#   bash rl_data/scripts/upload/upload_data_to_hf_verified.sh --input-dir rl_data/output/tasks_v2
+#   bash rl_data/scripts/upload/upload_data_to_hf_verified.sh --repo osieosie/tmax-rl-v2-verified --private
+#   bash rl_data/scripts/upload/upload_data_to_hf_verified.sh --no-parquet
 #
 # Requirements:
 #   - huggingface-cli login  (or HF_TOKEN env var)

@@ -14,13 +14,13 @@ threshold checks (Max and Min collapse to the same value).
 
 Usage:
     # Single model
-    python rl_data/scripts/classify_difficulty.py \\
+    python rl_data/scripts/analyze/classify_difficulty.py \\
         --job jobs/rldata_10k_claude \\
         --dataset rl_data/output/tasks_skill_tax_20260401_10k \\
         --output rl_data/output/difficulty_report
 
     # Two models (after running both evals)
-    python rl_data/scripts/classify_difficulty.py \\
+    python rl_data/scripts/analyze/classify_difficulty.py \\
         --job jobs/rldata_10k_claude jobs/rldata_10k_gpt5 \\
         --dataset rl_data/output/tasks_skill_tax_20260401_10k \\
         --output rl_data/output/difficulty_report
