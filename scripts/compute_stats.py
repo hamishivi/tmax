@@ -23,9 +23,6 @@ def load_job(job_dir: str) -> dict[str, list[float]]:
         r = json.load(open(rpath))
         task = r["task_name"]
         vr = r.get("verifier_result")
-        err = r.get("exception_info")
-        if err:
-            continue
         if vr and "rewards" in vr:
             reward = vr["rewards"].get("reward", 0.0)
         else:
