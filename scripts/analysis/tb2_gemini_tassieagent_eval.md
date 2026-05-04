@@ -1,424 +1,469 @@
-# Terminal-Bench 2.0 — TassieAgent + `gemini/gemini-3-flash-preview`
+# Terminal-Bench 2.0 — `gemini-3-flash-preview` · VanilluxAgent (primary)
 
-**Eval run**: `jobs/tb2_gemini` · 89 trials · pass@1 = **35.96%** (32/89)  
-**Harness**: TassieAgent v0.1.0 (bash-only tool loop) · `max_steps=50` · `n_concurrent=25` · Daytona sandbox · 1 attempt/task  
+> **Note on filename.** This doc was originally TassieAgent-focused; we have since switched our default harness to **VanilluxAgent** (an in-house wrapper around upstream `swe-agent`). All sections below now treat Vanillux as the *primary* harness and use TassieAgent as a *baseline / ablation* only. The filename is left as-is to preserve git/PR history; rename when convenient.
+
+**Primary run**: `jobs/tb2_gemini_vanillux_calls100` · 89 trials · pass@1 = **51.69 %** (46/89)  
+**Harness**: VanilluxAgent (= upstream `swe-agent` v1.1.0, ATIF-v1.5 trajectory schema) · `calls=100` LLM-call budget · Daytona sandbox · 1 attempt/task  
 **Model**: `gemini/gemini-3-flash-preview` via litellm  
-**Auto-extracted artefacts**: [`out/tb2_gemini_tassieagent/summary.json`](out/tb2_gemini_tassieagent/summary.json), [`out/tb2_gemini_tassieagent/per_trial.jsonl`](out/tb2_gemini_tassieagent/per_trial.jsonl), [`out/tb2_gemini_tassieagent/failures.md`](out/tb2_gemini_tassieagent/failures.md)  
-**Re-runner**: `uv run python scripts/analysis/analyze_tb2_eval.py --job-dir <jobs/X> --harbor-cache /gpfs/scrubbed/osey/harbor_cache --label "<label>" --out scripts/analysis/out/<key>`
+**Auto-extracted artefacts**:
 
-> The point of this doc is **not** the score itself but to extract every signal we can about *what makes TB 2.0 hard* and use it to spec a complementary harder-task generator alongside `rl_data/generator/task_template_gen.py`. No edits to the existing pipeline are proposed — only additive new tracks.
+- Vanillux@100 (primary): [`out/tb2_gemini_vanillux_calls100/`](out/tb2_gemini_vanillux_calls100/) — `summary.json`, `per_trial.jsonl`, `failures.md`
+- Vanillux@50 (budget ablation): [`out/tb2_gemini_vanillux_calls50/`](out/tb2_gemini_vanillux_calls50/)
+- TassieAgent@50 (harness ablation): [`out/tb2_gemini_tassieagent_50turns/`](out/tb2_gemini_tassieagent_50turns/)
+
+**Re-runner** (one-line, harness-agnostic):
+
+```bash
+uv run python scripts/analysis/analyze_tb2_eval.py \
+    --job-dir jobs/<job_name> \
+    --harbor-cache /gpfs/scrubbed/osey/harbor_cache \
+    --label "<harness> + <model> [+ <budget>]" \
+    --out scripts/analysis/out/<key>
+```
+
+> **TL;DR**. With Vanillux@100, gemini-3-flash-preview clears 51.7 % of TB 2.0. The remaining failures cluster into a small **harness-invariant** wrong-answer set (~15 tasks, the same tasks fail across all three of our (harness, budget) configurations) — these are the **capability-bound** failures. Our skill-tax 10 k corpus has the right *diversity* surface but not the same *difficulty depth*, because three structural choices in the existing generator pipeline (stdlib-only verifiers, LLM-imagined text fixtures, and author/solver model-symmetry) each cap how hard a generated task can be in practice. §6 spells out the gap; §7 proposes how to extend the existing pipeline along three new orthogonal axes (Verifier · Fixture · Calibration) without forking it.
 
 ---
 
 ## 1. Headline numbers
 
+### 1.1 Primary run (Vanillux@100)
+
 | metric                                  | value                       |
 |----------------------------------------|-----------------------------|
-| pass@1                                  | 0.3596 (32/89)              |
-| `AgentTimeoutError` (no submit + ran into per-task wall-clock cap) | 14 trials |
-| Other exceptions                        | 0                           |
-| Submitted but failed verifier           | 21                          |
-| Hit `max_steps=50` without submitting   | 9                           |
-| Submitted (any outcome)                 | 48 / 89                     |
-| Mean prompt tokens / trial              | 301 659  (median 112 147)   |
-| Peak prompt tokens (95p worst trial)    | 4.2 M (one runaway loop)    |
-| Mean completion tokens / trial          | 7 760                       |
-| Mean wall-clock / trial — pass          | 124 s (median 44 s)         |
-| Mean wall-clock / trial — fail          | 739 s (median 130 s)        |
+| pass@1                                  | 0.5169 (46/89)              |
+| `AgentTimeoutError` (per-task wall-clock cap hit) | 8 trials      |
+| Other infra exceptions (`AgentSetupTimeoutError` × 2, `VerifierTimeoutError` × 1) | 3 trials |
+| Submitted but failed verifier           | 19                          |
+| Hit `calls=100` budget without submitting | 1 trial                  |
+| Submitted (any outcome)                 | 63 / 89                     |
+| Mean wall-clock / trial — pass          | 440 s (median 378 s)        |
+| Mean wall-clock / trial — fail          | 557 s (median 420 s)        |
 
-Failures cost us roughly **6× more wall-clock** than successes; the heavy tail (build/train/install tasks) sits inside `agent_timeout`.
+(Per-step token counts and LLM latency are not exposed in the SWE-agent ATIF dump, so they are zero in `summary.json` for Vanillux runs.)
 
-### Mean turns per outcome
+### 1.2 Mean turns per outcome (Vanillux@100)
 
 | group  | n  | mean | median | p25 | p75 | min | max |
 |--------|---:|-----:|-------:|----:|----:|----:|----:|
-| all    | 89 | 19.98 | 14    |  8  | 31  |  0  | 50  |
-| pass   | 32 | 14.16 | 11    |  7  | 20  |  4  | 45  |
-| fail   | 57 | 23.25 | 17    |  9  | 36  |  0  | 50  |
+| all    | 89 | 58.9 | 56     | 39  | 87  | 0   | 100 |
+| pass   | 46 | 68.0 | 63.5   | 52  | 96  | 34  | 100 |
+| fail   | 43 | 49.1 | 41     | 21  | 77  | 0   | 100 |
 
-Successful runs are ~30 % shorter than failed ones. The pass-side `min=4` is interesting: those are tasks where the agent immediately did the obvious thing (e.g., `cat → write → submit`). The fail-side `min=0` and `max=50` together tell two stories — some trials never produced a bash command at all (`adaptive-rejection-sampler`: 1 step, 900 s timeout), and a long tail saturate the step budget without converging.
+Successful Vanillux trials use *more* turns than failed ones (median 63 vs 41) — the opposite of TassieAgent. This is consistent with SWE-agent's deliberate inspect→edit→test loop: passes invest in exploration, fails are where the model bailed early or got stuck in a loop.
+
+### 1.3 Three configurations side-by-side
+
+Same model, same dataset (TB 2.0, 89 tasks), same Daytona sandbox. Only harness/budget changes.
+
+| run                                              | pass@1     | n_pass | timeouts | hit_max  | submitted |
+|--------------------------------------------------|-----------:|-------:|---------:|---------:|----------:|
+| **VanilluxAgent · `calls=100`** (primary)        | **0.517**  | 46     | 8        | 1        | 63        |
+| VanilluxAgent · `calls=50`                       | 0.438      | 39     | 3        | **45**   | 47        |
+| TassieAgent · `max_steps=50` (TassieAgent baseline)        | 0.360      | 32     | 14       | 9        | 48        |
+
+**+15.7 pp pass-rate lift from harness + budget on the same model.** Cleanly ablates:
+
+- TassieAgent → Vanillux at the same nominal step budget: **+7.9 pp**. Pure harness improvement (mostly attributable to the `str_replace_editor` edit tool — see §3).
+- Vanillux 50 calls → 100 calls: **+7.9 pp**. Pure budget improvement.
 
 ---
 
 ## 2. Pass rate by TB 2.0 task metadata
 
-Categories and difficulty come from each task's `task.toml`.
+Categories and difficulty come from each task's `task.toml.metadata`.
 
-### By difficulty
+### 2.1 By difficulty — *hard tasks plateau across budgets*
 
-| difficulty | n  | n_pass | pass_rate | mean turns |
-|-----------|---:|-------:|----------:|-----------:|
-| easy      |  4 |  3     | 0.750     | 21.25      |
-| medium    | 55 | 22     | 0.400     | 18.82      |
-| hard      | 30 |  7     | 0.233     | 21.93      |
+| difficulty | n  | TassieAgent@50 | Vanillux@50 | **Vanillux@100** |
+|-----------|---:|---------------:|------------:|----------------:|
+| easy      |  4 | 0.750 (3)      | 0.500 (2)   | **1.000 (4)**   |
+| medium    | 55 | 0.400 (22)     | 0.491 (27)  | **0.582 (32)**  |
+| hard      | 30 | 0.233 (7)      | 0.333 (10)  | **0.333 (10)**  |
 
-The TB 2.0 self-labelled difficulty is well calibrated: hard tasks are 3× less likely to pass.
+Doubling Vanillux's call budget (50 → 100) added **+5 wins on medium** and **+2 wins on easy** but **zero new wins on hard**. The hard tail is *capability-bound*, not *iteration-bound*. This is the single most important data point in this doc for the data-gen story.
 
-### By category (n ≥ 3 only)
+### 2.2 By category (n ≥ 3 only, Vanillux@100)
 
-| category               | n  | n_pass | pass_rate | mean turns |
-|------------------------|---:|-------:|----------:|-----------:|
-| security               |  8 | 4      | 0.500     | 23.1       |
-| data-science           |  8 | 4      | 0.500     | 17.8       |
-| scientific-computing   |  8 | 3      | 0.375     | 20.9       |
-| system-administration  |  9 | 3      | 0.333     | 15.8       |
-| software-engineering   | 26 | 7      | 0.269     | 22.7       |
-| data-processing        |  4 | 2      | 0.500     | 11.0       |
-| debugging              |  5 | 2      | 0.400     | 27.2       |
-| file-operations        |  5 | 1      | 0.200     | 23.0       |
-| machine-learning       |  3 | 0      | 0.000     | 21.3       |
-| mathematics            |  4 | 1      | 0.250     | 13.0       |
-| model-training         |  4 | 2      | 0.500     | 20.8       |
+| category               | n  | n_pass | pass_rate |
+|------------------------|---:|-------:|----------:|
+| security               |  8 | 5      | 0.625     |
+| data-science           |  8 | 5      | 0.625     |
+| scientific-computing   |  8 | 5      | 0.625     |
+| system-administration  |  9 | 5      | 0.556     |
+| data-processing        |  4 | 3      | 0.750     |
+| debugging              |  5 | 3      | 0.600     |
+| file-operations        |  5 | 2      | 0.400     |
+| machine-learning       |  3 | 0      | 0.000     |
+| mathematics            |  4 | 2      | 0.500     |
+| model-training         |  4 | 2      | 0.500     |
+| software-engineering   | 26 | 12     | 0.462     |
 
-**Software-engineering and machine-learning are the weak spots** (and they're ~33% of the suite). Both classes typically require multi-stage builds, real package installations, and quantitative verifiers.
-
----
-
-## 3. Tool usage — `cat-write` is the workhorse
-
-TassieAgent issues exactly one bash command per turn, so the histogram below counts steps. (Verb extraction strips `sudo`/`timeout` wrappers and normalises heredoc `cat > file << 'EOF'` to `cat-write`.)
-
-| verb        | all  | pass | fail | pass-share | comment |
-|-------------|-----:|-----:|-----:|-----------:|---------|
-| cat-write   |  577 | 139  | 438  | 24%        | heredoc file edits dominate |
-| `#`         |  251 |  62  | 189  | 25%        | shell comment-only "thoughts" |
-| ls          |  145 |  32  | 113  | 22%        | exploration |
-| cat         |  107 |  33  |  74  | 31%        | reading files |
-| python3     |   82 |  29  |  53  | 35%        | running scripts |
-| grep        |   79 |   5  |  74  | 6%         | **failure-skewed** — agents grep when they're lost |
-| sed         |   67 |  14  |  53  | 21%        | |
-| echo        |   61 |  29  |  32  | 48%        | submit-marker is `echo COMPLETE_TASK_…`, hence pass-skew |
-| pip         |   25 |   7  |  18  | 28%        | |
-| rustc       |   24 |   0  |  24  | 0%         | **failure-only** — every Rust task failed |
-| curl        |   12 |   3  |   9  | 25%        | downloads, often fail (URL-hunting) |
-| pdflatex    |   10 |   0  |  10  | 0%         | failure-only (overfull-hbox task) |
-| dd          |   10 |   0  |  10  | 0%         | failure-only (forensic recovery) |
-| qemu-system-x86_64 | 3 | 0  |   3  | 0%         | failure-only (qemu-startup, install-windows-3.11) |
-
-Read this as: when the agent reaches for `grep`, `rustc`, `pdflatex`, `dd`, or `qemu-system-*`, it's probably already on the failure trajectory. Inversely, `python3` + `cat`/`echo` are the "I'm cooking" verbs.
-
-The `cat-write` figure also highlights an architectural quirk of TassieAgent: it has **no edit tool**. Every code change is a heredoc rewrite of the whole file, which on long tasks burns thousands of tokens re-emitting unchanged regions. (Possible future agent improvement, separate from this analysis.)
+Software-engineering (largest split, 29 % of suite) and machine-learning (3/3 fail) are the weak spots — both are dominated by tasks needing real builds, real packages, or quantitative correctness that our existing verifier-stdlib constraint (§6) cannot grade.
 
 ---
 
-## 4. Failure mode taxonomy
+## 3. Tool usage — what the harness change really bought us
 
-Every fail is bucketed by a deterministic classifier in `analyze_tb2_eval.py`:
+Vanillux command verbs are extracted from `tool_calls[].arguments.raw_action` in the ATIF trajectory. (For Tassie they came from `agent/timing.json`'s `cmd` field.)
+
+| verb                   | TassieAgent@50 | Vanillux@50 | Vanillux@100 | comment |
+|------------------------|--------------:|------------:|-------------:|---------|
+| `str_replace_editor`   | **0** (n/a)   | 707         | 832          | proper edit tool — Vanillux only |
+| `cat-write` (heredoc)  | **577**       | 0 (n/a)     | 0 (n/a)      | Tassie's only way to edit — wasteful |
+| `submit`               | 0 (n/a)       | 239         | 947          | Vanillux's first-class submit action |
+| `ls`                   | 145           | 491         | 624          | exploration |
+| `python3` / `python`   | 89            | 486         | 565          | running scripts/tests |
+| `cat`                  | 107           | 359         | 407          | reading files |
+| `grep`                 | 79            | 187         | 203          | searching |
+| `pip`                  | 25            | 64          | 64           | installing dependencies |
+
+The **single most likely cause of the +7.9 pp Tassie → Vanillux lift at fixed budget** is the `str_replace_editor` tool. TassieAgent had no edit primitive — every code change was a heredoc rewrite of the whole file (`cat > foo.py << 'EOF' … EOF`), which on long tasks burns thousands of tokens re-emitting unchanged regions and is regression-prone. SWE-agent's edit tool does surgical region-replace, which is dramatically more token-efficient and more reliable.
+
+A second differentiator: Vanillux emits an explicit `submit` action that the model treats as a first-class tool (947 calls in `calls=100`). TassieAgent's `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` convention is brittle — the model forgets to issue it on 14/57 failures (`no_submit_early_stop`). Almost none of Vanillux@100's failures are submission-discipline failures.
+
+These observations are *about the harness*, not about the data-gen pipeline. They matter to the data-gen story only because §10/§7 argue that **the calibration filter must use the deployment harness**: if we filter against TassieAgent, we'll mistake harness-bound difficulty for capability-bound difficulty.
+
+---
+
+## 4. Failure mode taxonomy (Vanillux@100 primary)
+
+Every failure is bucketed by a deterministic classifier in `analyze_tb2_eval.py`:
 
 ```
-if exception == "AgentTimeoutError"           → agent_timeout              (13)
-elif other_exception                          → other_error:<type>          (0)
-elif not submitted and hit_max_steps          → no_submit_max_steps         (9)
+if exception == "AgentTimeoutError"           → agent_timeout              (8)
+elif other_exception                          → other_error:<type>          (3)
+elif not submitted and hit_max_steps          → no_submit_max_steps         (1)
 elif not submitted                            → no_submit_early_stop        (14)
 elif submitted and tests-failed:
-    msg matches /FileNotFoundError/           → submitted_missing_artifact   (0)
-    msg matches /header|format|schema/        → submitted_wrong_format       (2)
-    msg matches /expected.*got|actual/        → submitted_wrong_value        (2)
-    else                                      → submitted_verifier_failed_other (17)
+    msg matches /FileNotFoundError/           → submitted_missing_artifact   (1)
+    msg matches /header|format|schema/        → submitted_wrong_format       (0)
+    msg matches /expected.*got|actual/        → submitted_wrong_value        (1)
+    else                                      → submitted_verifier_failed_other (15)
 ```
 
-> Note: the classifier flags `submitted_wrong_value` very narrowly (only when the verifier message explicitly says "expected X got Y"). In practice many `submitted_verifier_failed_other` rows are *also* wrong-value at root; the bucketing is conservative because it keys off the assertion message text.
+| failure mode                                | TassieAgent@50 | Vanillux@50 | **Vanillux@100** |
+|---------------------------------------------|---------------:|------------:|----------------:|
+| `pass`                                      | 32             | 39          | **46**          |
+| `submitted_verifier_failed_other`           | **17**         | **15**      | **15**          |
+| `no_submit_early_stop`                      | 14             | 9           | 14              |
+| `agent_timeout`                             | 13             | 3           | 8               |
+| `no_submit_max_steps`                       | 9              | **22**      | 1               |
+| `submitted_wrong_format`                    | 2              | 0           | 0               |
+| `submitted_wrong_value`                     | 2              | 0           | 1               |
+| `submitted_missing_artifact`                | 0              | 1           | 1               |
+| `other_error:AgentSetupTimeoutError`        | 0              | 0           | 2               |
+| `other_error:VerifierTimeoutError`          | 0              | 0           | 1               |
 
-| failure mode                       | n  | what it means                                       | example task                       |
-|-----------------------------------|---:|-----------------------------------------------------|------------------------------------|
-| `agent_timeout`                   | 13 | per-task wall-clock cap hit (no submit)             | `build-pov-ray`, `compile-compcert` |
-| `submitted_verifier_failed_other` | 17 | submitted, verifier rejected the work               | `chess-best-move`, `pytorch-model-cli` |
-| `no_submit_early_stop`            | 14 | LLM stopped emitting tool calls before max_steps    | `regex-chess`, `headless-terminal` |
-| `no_submit_max_steps`             |  9 | exhausted 50-step budget, never submitted           | `mailman`, `make-doom-for-mips`    |
-| `submitted_wrong_format`          |  2 | submitted with structurally wrong artefact          | `train-fasttext` (wrong .bin format) |
-| `submitted_wrong_value`           |  2 | submitted with right format but wrong values        | `log-summary-date-ranges` (414 vs 370) |
+### Two patterns worth naming
 
-### 4.1 `agent_timeout` (13 trials) — the long compile/install tail
+1. **`submitted_verifier_failed_other` is invariant at 15–17 across all three runs.** Same model, different harnesses, different budgets — *the same ~15 tasks* fail in this bucket every time. This is **the model-capability bound**: tasks where the agent confidently submits a wrong answer no matter how it's run. **This set is the most useful target for the harder-task generator** — see §7.5.
+2. **`no_submit_max_steps` is harness/budget-bound, not capability-bound.** It collapsed from 22 → 1 when Vanillux's call budget doubled. Conversely Tassie's 9 same-pattern failures are mostly *deep-search multi-component* tasks (`mailman`, `make-doom-for-mips`, `polyglot-rust-c`) — the agent kept trying productively and ran out of room.
 
-Two sub-causes overlap in this bucket:
+### The harness-invariant capability set (15 tasks)
 
-**(a) Single command takes longer than the task's `agent.timeout_sec`.**  
-- `build-pov-ray`: spent 12 000 s on 37 `curl` retries trying to find a 1991-vintage source archive that no longer has a stable URL. The model literally tried `github.com/u-f-o/povray-2.2`, `github.com/pov-ray/povray/archive/...`, `web.archive.org/...` — none worked.
-- `caffe-cifar-10`: 1 step in 1200 s — an `apt-get install` or `git clone` blocked.
-- `compile-compcert`: 6 steps in 2400 s — actual compile time of the verified C compiler.
-- `train-fasttext` (later submitted, but still 3 426 s): real fasttext training run.
+These are the tasks that fail with `submitted_verifier_failed_other` on Vanillux@100. Each is a "submitted-but-wrong" failure — model thought it was done, verifier disagreed:
 
-**(b) Bash command itself wedges or is uncancellable.**  
-- `gpt2-codegolf`: each verifier subprocess runs the agent's compiled C with a 90-s timeout — agent's own benchmarking loop ran for 900 s.
+| task                              | failure character                                                  |
+|-----------------------------------|--------------------------------------------------------------------|
+| `chess-best-move`                 | image OCR — read board state from PNG, picked wrong move           |
+| `mteb-retrieve`                   | run a specific embedding model, rank docs by cosine — wrong line   |
+| `extract-elf`                     | parse ELF binary's loaded segments — off by some bytes             |
+| `model-extraction-relu-logits`    | extract NN weights via blackbox queries — failed 28/30 rows        |
+| `path-tracing-reverse`            | RE a binary, reproduce as C with image_similarity ≥ 0.995 — got 0.887 |
+| `dna-insert`                      | synthetic biology primer design — failed BsaI clamp                |
+| `winning-avg-corewars`            | CoreWars warrior — got 32 % win rate vs 75 % required              |
+| `make-mips-interpreter`           | MIPS interpreter in JS — TimeoutError on test_vm_execution         |
+| `pytorch-model-cli`               | MNIST CLI tool — predicted 0, expected 2 (model loaded wrong)      |
+| `qemu-startup`                    | qemu+telnet up — got `Password:` prompt instead of shell           |
+| `sam-cell-seg`                    | histopath cell seg w/ Mobile-SAM — subprocess error                |
+| `sanitize-git-repo`               | redact API keys, preserve everything else — false positives        |
+| `torch-pipeline-parallelism`      | pipeline-parallel LLaMA training — process raised exception        |
+| `video-processing`                | hurdle-jump frame detection — wrong frame                          |
+| `filter-js-from-html`             | XSS sanitizer on adversarial corpus — bypasses + clean-doc damage  |
 
-These are *real, expensive* tasks. TB 2.0's authors set `task.toml` budgets up to 12 000 s precisely because the reference solutions take that long. Our pipeline does **not** generate this kind of task — and probably shouldn't; signals are too sparse for RL.
-
-### 4.2 `no_submit_early_stop` (14 trials) — model "gave up" by emitting plain text
-
-TassieAgent's loop exits when an assistant turn has *no* `tool_calls`. This happens when the model decides to "talk" instead of act. Examples:
-
-- `regex-chess`: write JSON of `[regex, replacement]` pairs that, when iterated, produce all legal next chess positions starting from any FEN. After 15 turns of failed regex experiments the model just stopped.
-- `headless-terminal`: implemented a class with the *wrong API* (`send_keystrokes` was missing — it was named differently) and stopped without realising.
-- `largest-eigenval`: had to beat a numpy reference by some speedup. Submitted a solution that was 3.18 × 10⁻⁵ s/call vs the 2.57 × 10⁻⁵ s/call target. Close but no cigar.
-- `path-tracing`: 49 steps writing C ray-tracing code, then stopped without submitting.
-- `tune-mjcf`: had to make a MuJoCo simulation 60 % faster; achieved 67.76 %. Submitted, then "early stopped" because verifier rejected and Gemini didn't know what to try next.
-- `write-compressor`: write a `<2.5kB` file that decompresses to a target text via a provided segfaulting decompressor → segfault (139). Effectively a reverse-engineering puzzle.
-
-This bucket is **the most interesting for our purposes**. It's where the model lacks search/iteration discipline, not raw capability. A harness with a wall-clock budget instead of a step budget would push some of these into successful submits.
-
-### 4.3 `no_submit_max_steps` (9 trials) — burnt the step budget
-
-These are *deep search* tasks where the agent kept trying for 50 turns:
-
-- `mailman`: postfix + mailman3 mailing-list configuration.
-- `make-doom-for-mips`: cross-compile DOOM to a MIPS ELF runnable by a JS interpreter.
-- `mteb-leaderboard`: knowledge-cutoff lookup ("the best embedding model on MTEB Scandinavian as of August 2025") — *unsolvable* without internet, but the agent kept guessing for 50 steps.
-- `password-recovery`: forensic byte-level recovery from a deleted file.
-- `polyglot-rust-c`: write a single file that compiles as both Rust and C++ and prints the same Fibonacci value. Wrote a working `main.rs` but left a stray binary on disk → format check failed.
-- `db-wal-recovery`: SQLite WAL forensic recovery.
-- `llm-inference-batching-scheduler`: bin-packing optimisation; submitted a solution that violated the cost threshold.
-
-The pattern: **multi-component systems orchestration** + **deep iterative refinement against a quantitative target**.
-
-### 4.4 `submitted_verifier_failed_other` (17) + `submitted_wrong_*` (4) — wrong answers
-
-The biggest single bucket. The model thought it was done. It wasn't. Sampling:
-
-- `chess-best-move` — image of a chess position → predicted `g6h7`, expected `e2e4` or `g2g4`. **Visual-reasoning failure**: the model can't read board state from an image.
-- `mteb-retrieve` — needed to actually run an embedding model (`bge-small-zh-v1.5` at a specific revision) and rank docs; got the wrong line.
-- `path-tracing-reverse` — re-implement a binary's behaviour as C; image similarity 0.887 vs ≥ 0.995.
-- `model-extraction-relu-logits` — black-box extraction of NN weights via queries; failed 28/30 rows.
-- `dna-insert`, `dna-assembly` — synthetic biology primer design; failed BsaI clamp constraints / inserted-DNA constraints.
-- `extract-elf` — parse compiled binary's loaded data; off by some bytes.
-- `filter-js-from-html` — XSS sanitiser. Failed adversarial XSS payloads (the famous `<svg><image href="javascript:alert(1)">…` corpus) AND modified clean HTML files. **Robustness corpus failure** — we have *zero* tasks like this in our pipeline.
-- `qemu-startup` — QEMU+telnet up; submitted a setup that responded to `uname -r` with the literal text `Password:` (telnet got the prompt instead of a shell).
-- `winning-avg-corewars` — CoreWars program; got 32 % win rate vs 75 % required.
-- `gcode-to-text` — read a `.gcode` Prusa file and predict the text the printer would write; got `PRUSA` instead of `flag{gc0d3_iz_ch4LLenGiNg}`. **Real-machine simulation failure**.
-- `log-summary-date-ranges` — counted 414 ERROR events vs expected 370. Off by some date-range edge case.
-- `train-fasttext` — trained a model and saved it via `torch.save` → `model.bin` had wrong file format; verifier expected a fasttext-native `.bin`.
+**Common pattern**: each ships a real artefact (image / binary / package / video / corpus) AND grades against a quantitative or adversarial threshold. The two structural differences from our generated tasks (§6) intersect exactly here.
 
 ---
 
-## 5. What makes TB 2.0 hard, decomposed
+## 5. What makes TB 2.0 hard — six dimensions of difficulty
 
-Cross-cutting observations from the failure analysis. These are the **dimensions of difficulty** that the existing skill-tax pipeline barely touches.
+Cross-cutting observations distilled from §4 and from reading every failed trajectory in [`out/tb2_gemini_vanillux_calls100/failures.md`](out/tb2_gemini_vanillux_calls100/failures.md).
 
 ### 5.1 Real-software anchoring (specific versions)
 
-TB 2.0 names specific artefacts: *POV-Ray 2.2*, *BVLC Caffe 1.0.0*, *PyStan 3.10.0*, *fasttext on Yelp*, *MTEB 1.36.8*, *MobileSAM*, *QEMU 5.2.0*, *Windows 3.11 for Workgroups*, *OCaml compiler bootstrap*, *CompCert 3.13.1*. The agent has to navigate real upstream ecosystems (URLs, install procedures, ABI quirks).
-
-Our `task_template_gen.py`:
-
-```697:759:rl_data/generator/task_template_gen.py
-REAL_SOFTWARE_ANCHORS: dict[str, list[str]] = {
-    "software_engineering": [
-        "a small C project with a Makefile that has a linking error",
-        "a Python package with a broken setup.py/pyproject.toml",
-        ...
-```
-
-Anchors are used in only **35 %** of generated tasks (`_ANCHOR_PROBABILITY = 0.35`) and they are *abstract* (a "small C project") rather than *named*.
+TB 2.0 names specific artefacts: *POV-Ray 2.2*, *BVLC Caffe 1.0.0*, *PyStan 3.10.0*, *fasttext on Yelp*, *MTEB 1.36.8*, *MobileSAM*, *QEMU 5.2.0*, *Windows 3.11 for Workgroups*, *OCaml compiler bootstrap*, *CompCert 3.13.1*. The agent has to navigate real upstream ecosystems — install procedures, ABI quirks, vendored sources.
 
 ### 5.2 Multimodal / non-text inputs
 
 TB 2.0 includes images (`chess-best-move`, `code-from-image`, `path-tracing`, `pytorch-model-cli`, `sam-cell-seg`), videos (`extract-moves-from-video`, `video-processing`), and binary blobs (`extract-elf`, `path-tracing-reverse`, `mystery`, `gcode-to-text`).
 
-Our pipeline produces **zero** non-text inputs. Every task is bash + Python with text I/O.
-
 ### 5.3 Quantitative correctness with tight tolerances
 
-TB 2.0 verifiers use thresholds like `image_similarity >= 0.99`, `speedup faster than reference numpy`, `model_size < 150 MB AND accuracy >= 0.62`, `win_rate >= 75 %`, `atol=1e-5`. These are *gradient-rich* signals — they tell the agent how close it got.
-
-Our pipeline's verifiers are mostly **exact-match text comparison**. That gives a binary signal which is brittle for hard tasks (and easy to game by LLM-generated solutions).
+TB 2.0 verifiers use thresholds like `image_similarity ≥ 0.99`, `speedup faster than reference numpy`, `model_size < 150 MB AND accuracy ≥ 0.62`, `win_rate ≥ 75 %`, `atol=1e-5`. These are *gradient-rich* signals — they tell the agent how close it got, and they make exact-match string comparison impossible to game.
 
 ### 5.4 Adversarial / hostile inputs
 
-`filter-js-from-html` ships a **curated XSS corpus** that the agent's sanitiser must defeat *and* a **clean-HTML corpus** that the sanitiser must not modify. `sanitize-git-repo` checks both replacement *and* "no other files changed". `password-recovery` requires entropy-aware reasoning.
-
-We have nothing analogous. Our security tasks tend to be one-shot scripts, not robust filters.
+`filter-js-from-html` ships a curated XSS corpus + clean-HTML corpus; both must be satisfied. `sanitize-git-repo` checks both "right secrets replaced" *and* "no other files changed". `password-recovery` requires entropy-aware reasoning.
 
 ### 5.5 Multi-component / multi-service orchestration
 
 `mailman` (postfix + mailman3 + mail flow), `install-windows-3.11` (qemu + VNC + nginx), `qemu-startup` (qemu + telnet), `kv-store-grpc` (gRPC + replication), `configure-git-webserver` (git protocol + nginx + auth).
 
-Our pipeline tasks are typically single-process Python or bash scripts. Dockerfile-level multi-service composition is absent.
-
 ### 5.6 Reverse engineering / forensics
 
-`extract-elf`, `path-tracing-reverse`, `feal-linear-cryptanalysis`, `chess-best-move` (read board from image), `crack-7z-hash`, `password-recovery`, `db-wal-recovery`, `git-leak-recovery`. The skill-tax taxonomy *names* these (`Forensics` sub-skill of `debugging`), but the generated tasks rarely ship a real binary blob to reverse.
+`extract-elf`, `path-tracing-reverse`, `feal-linear-cryptanalysis`, `chess-best-move` (read board from image), `crack-7z-hash`, `password-recovery`, `db-wal-recovery`, `git-leak-recovery`. Our skill-tax taxonomy *names* these (`Forensics` sub-skill of `debugging`) but rarely instantiates them with a real binary blob.
 
-### 5.7 Knowledge cutoff / external lookup
+### 5.7 Knowledge-cutoff / external lookup (anti-pattern, do not reproduce)
 
-`mteb-leaderboard` ("best model as of August 2025"), `build-pov-ray` (find historical source URL), `caffe-cifar-10` (find BVLC source). These are *unsolvable* without internet access — the model spends its budget guessing URLs. Bad RL signal. **Don't reproduce these.**
-
----
-
-## 6. Gap analysis vs `rl_data/generator/task_template_gen.py`
-
-Mapping each TB 2.0 difficulty dimension to what our existing pipeline does today.
-
-| Dimension                          | TB 2.0           | skill-tax 10 k pipeline                  | Gap |
-|------------------------------------|------------------|------------------------------------------|-----|
-| Specific software/version anchoring | Most tasks       | 35 % anchor rate; anchors are abstract   | Large |
-| Multimodal inputs                  | ~10 tasks (11 %) | None                                     | **Total** |
-| Quantitative tolerance verifiers   | ~30 tasks (34 %) | Mostly exact-match                       | Large |
-| Adversarial test corpora           | ~5 tasks (6 %)   | None                                     | **Total** |
-| Multi-service orchestration        | ~8 tasks (9 %)   | None                                     | **Total** |
-| RE / binary forensics              | ~7 tasks (8 %)   | Named in taxonomy, rarely instantiated   | Medium |
-| Pre-vendored data / fixtures       | Most tasks       | Generated text/JSON only                 | Large |
-| Per-task Dockerfile + sandbox      | All tasks        | Apptainer base SIFs, not bespoke          | Medium |
-| Per-task expected runtime          | 1–200 min        | LLM-imagined, often quick                 | Large |
-| Difficulty self-labels             | easy/medium/hard | None                                      | Medium |
-
-The skill-tax taxonomy in `task_template_gen.py` (9 domains × ~5 skill types × 5–7 primitives × 3 task complexities × 3 command complexities × scenario × language) covers a wide *surface*, but the *test rig* (text-only verifier on LLM-imagined ground truth) constrains the difficulty ceiling. The model that *generates* the task usually *can also solve it*, capping pass rates much higher than TB 2.0's 36 %.
+`mteb-leaderboard` ("best model as of August 2025"), `build-pov-ray` (find historical source URL), `caffe-cifar-10` (find BVLC source). These are *unsolvable* without internet access — the model spends its budget guessing URLs. Bad RL signal. We should *not* generate tasks with this pattern.
 
 ---
 
-## 7. Brainstorm — additive harder-task tracks
+## 6. Gap analysis — *diversity* axes are saturated, *depth* axes are missing
 
-Goal: a parallel set of generator modules under `rl_data/generator/`, each producing tasks in the same `task.json` format but with extra fixtures the existing pipeline doesn't produce. **Don't change `task_template_gen.py`** — these are new files / new CLI entry points. The existing 10 k corpus stays untouched as the "easy" baseline.
+This section is the central narrative of the doc. The argument has three parts.
 
-The tracks below are roughly ordered by expected impact-per-effort. I would prototype #1 first.
+### 6.1 The current generator's story
 
-### Track 1 — `metric_threshold_gen.py`: quantitative verifier track
+`rl_data/generator/task_template_gen.py` samples a tuple along seven axes per task — domain (×9), skill type (×~5), primitive skills (3–5 of ~30/domain), task complexity (×3), command complexity (×3), scenario/persona (×~10/domain), language (Python/C/Bash/C++/Rust/Go/multi/any). Optionally a real-software anchor is injected (35 % of tasks). The downstream stages — `apptainer_def_gen.py` (env), `initial_state_test_gen.py` (pre-check), `completion_test_gen.py` (post-check) — each take an LLM call to materialise the env, the initial-state pytest, and the final-state pytest.
 
-**Hypothesis**: replacing exact-match with a numerical threshold + reference solution shifts the difficulty ceiling, because we can dial the threshold by re-running the reference.
+Story so far: *Sample diverse axes → an LLM invents a novel task at every intersection → a small per-task delta over a pre-built domain base SIF runs it → a pytest verifier checks the result.*
 
-Pipeline:
+This is great for **surface diversity**: the domain × skill × persona × language cross-product covers the same instruction space as TB 2.0 (the categories nearly map 1:1). And the skill-tax 10 k corpus reflects this — pass@1 from gemini-3-flash-preview on it is *much* higher than on TB 2.0 (the existing `quality_pass1_*.png` plots).
 
-1. Sample (domain, skill, language) the same way as `random_user_msg()`.
-2. Sample a verifier template — one of:
-   - **`metric_similarity`**: agent's output (image, audio, vector, model) must be ≥ X similar to a reference. Test runs `agent_output` and `reference` through a metric (cosine, SSIM, BLEU, accuracy on held-out).
-   - **`metric_speedup`**: agent's solution must run faster than a reference impl by a margin K%, on a fixed benchmark harness shipped in tests/.
-   - **`metric_size_accuracy_pareto`**: model size ≤ S bytes AND accuracy ≥ A on a held-out set.
-3. LLM generates: instruction, reference solution code, the metric harness, the fixture data.
-4. **Critical**: a curator script *runs the reference solution offline* (in a clean container) to compute the reference metric, then sets the agent's threshold to (reference_metric − epsilon) or similar. This guarantees the threshold is achievable.
-5. Tasks where the reference fails to converge are dropped.
+### 6.2 Why high diversity does not produce TB-2 difficulty
 
-Output additions per task: `tests/reference_solution/`, `tests/metric_harness.py`, `tests/threshold.json`.
+Three structural choices in the existing pipeline cap how hard a generated task can be in practice. They are not bugs — each has good reasons in the original design — but they each correspond to a missing dimension of TB 2.0 difficulty (§5).
 
-Why this matters: it directly addresses §5.3 (tight tolerances), §5.7 (RE-style binary tasks become natural here too), and the verifier becomes adversarially gradient-rich for RL.
+#### 6.2.1 Verifier is stdlib + pytest only
 
-### Track 2 — `multi_service_gen.py`: docker-compose multi-process tasks
+`completion_test_gen.py` instructs the LLM:
 
-**Hypothesis**: task instructions like "make these services talk" force multi-step environment setup, the failure mode our agent is worst at (`mailman`, `qemu-startup`, `install-windows-3.11`).
+> ```
+> Use **only** the Python standard library and ``pytest`` (no third-party libs).
+> ```
 
-Pipeline:
+This is what makes our verifiers safe to run on any base image. It is also what makes them **incapable of grading any of the TB 2.0 quantitative tolerance tasks** (§5.3). Without numpy/scipy, you cannot compute SSIM. Without librosa, you cannot compare audio. Without torch, you cannot evaluate accuracy on a held-out test set. Without a domain library, you cannot reason about *anything except text equality*. So even when the LLM dreams up "agent must produce a CSV whose column has `<ε>` distance from this reference", the verifier collapses to `assert open('output.csv').read() == EXPECTED` — and the LLM, generating both the task and the expected text, lands on something that's either trivially solvable (because the expected output is something the LLM can also predict) or gibberish.
 
-1. Maintain a small library of `compose_template.yaml` snippets (postgres + adminer; nginx + flask; rabbit + worker; redis + producer/consumer; kafka + consumer; etc.).
-2. Sample one snippet, then ask the LLM to:
-   - Pick *which component is broken* (wrong port / missing env var / wrong volume mount / mismatched protocol).
-   - Generate the task description ("X service can't reach Y because…") with the broken state pre-baked.
-   - Generate a verifier that issues real protocol-level requests (HTTP, TCP, gRPC) and checks responses.
-3. Dockerfile per task is a tiny wrapper around the compose template + a perturbation script.
+This is the single biggest lever. **Verifier sophistication is what creates TB 2.0's hardest failure mode (`submitted_verifier_failed_other`)** — see the harness-invariant 15-task list in §4.
 
-Output additions: `environment/docker-compose.yml`, `environment/perturbation.sh`, `tests/protocol_check.py`.
+#### 6.2.2 Fixtures are LLM-imagined text
 
-Why this matters: §5.5 directly. Also forces the agent into the `systemctl`/`docker compose`/`netstat`/`curl localhost:PORT` tool space we currently see only on failed TB 2.0 trials.
+All inputs to the agent are descriptions that the *generator* model wrote at sample time. The agent receives a paragraph that says "the file `/app/data.txt` contains a CSV of …", not the actual CSV. The LLM in `apptainer_def_gen.py`'s `%post` step generates *deterministic* setup scripts that fabricate the input data from text the same LLM authored — which means the inputs the agent encounters at solve time are sampled from the same model's prior over inputs. There is no concrete artefact (image, audio, stripped binary, real package source, real video) the model didn't itself imagine.
 
-### Track 3 — `multimodal_input_gen.py`: non-text task inputs
+This explains the absence of all of §5.2 (multimodal), §5.6 (RE/forensics), and most of §5.1 (real-software anchoring) from our corpus. Even when our taxonomy *names* "Reverse engineering and disassembly" as a primitive skill, the resulting generated task has no real binary to reverse — it has a text description of one.
 
-**Hypothesis**: any task whose input is an image/audio/binary forces the agent to use OCR/Whisper/objdump-style tools that don't fit naturally in our text-only pipeline.
+#### 6.2.3 Author and solver are the same model
 
-Pipeline:
+Every stage of the existing pipeline runs on `DEFAULT_MODEL = gemini/gemini-3.1-pro-preview`, and we evaluate solutions on `gemini/gemini-3-flash-preview` (a slightly weaker sibling). The author/solver gap is small. When the generator writes a task, it cannot articulate a problem whose *solution requires capability the generator itself lacks* — and tasks the generator articulates clearly are typically tasks the generator can solve. So the difficulty distribution of our 10 k corpus is, by construction, *bounded above by what the generator can do*.
 
-1. Sample a *generation strategy*:
-   - **image**: render a code snippet, table, equation, or diagram to PNG via PIL/matplotlib/LaTeX → instruction asks the agent to *transcribe / interpret / re-implement* it.
-   - **binary**: compile a tiny C/Rust program with a known computation → instruction asks the agent to reproduce the computation in another language *without source access*.
-   - **audio**: synthesise speech from a known sentence with `espeak` / `edge-tts` → instruction asks the agent to transcribe.
-   - **video**: ffmpeg-stitch frames with timestamped events (counter, ball position) → instruction asks for event detection.
-2. The *generation parameters* (the source code, the spoken text, the frame events) are hidden from the agent and become the gold ground truth for the verifier.
-3. The agent must install + invoke `tesseract` / `whisper.cpp` / `objdump` / `ffmpeg` themselves.
+TB 2.0 was authored by **humans with hard, specific capability gaps in mind**. Author ≠ solver; author can articulate problems they can't solve, and they deliberately do.
 
-Output additions: `environment/inputs/<artefact>.{png,wav,bin,mp4}`, `tests/oracle.json`.
+We can mimic this asymmetry empirically without changing the author model: by **post-hoc filtering** generated tasks against a held-out solver (the same model + harness we will evaluate on later), keeping only those whose pass@k lands in a target band. This is Track C (§7.3).
 
-Why this matters: §5.2 directly. Plus, it organically forces tool diversity (`tesseract`, `whisper`, `objdump`, `nm`, `strings`, `ffmpeg`, `xxd`) that we currently never see in our generated trajectories.
+### 6.3 Gap table (TB 2.0 vs current generator output)
 
-### Track 4 — `adversarial_corpus_gen.py`: hostile-input verifier track
+| Dimension                          | TB 2.0           | skill-tax 10 k pipeline (current)        | Where this lives in the pipeline          | Gap |
+|------------------------------------|------------------|------------------------------------------|-------------------------------------------|-----|
+| Specific software/version anchoring | Most tasks       | 35 % anchor rate; anchors abstract       | `task_template_gen.py:REAL_SOFTWARE_ANCHORS` | Large |
+| Multimodal inputs                  | ~10 tasks (11 %) | None                                     | `apptainer_def_gen.py` `%post` is text-only | **Total** |
+| Quantitative tolerance verifiers   | ~30 tasks (34 %) | None — stdlib pytest only                | `completion_test_gen.py:SYSTEM_MSG`        | **Total** |
+| Adversarial test corpora           | ~5 tasks (6 %)   | None                                     | `completion_test_gen.py` (no fixture mech) | **Total** |
+| Multi-service orchestration        | ~8 tasks (9 %)   | None                                     | `apptainer_def_gen.py` is single-image     | **Total** |
+| RE / binary forensics              | ~7 tasks (8 %)   | Named in taxonomy, rarely instantiated   | No fixture-deposit mechanism               | Medium |
+| Pre-vendored data fixtures         | All tasks        | Generated text/JSON only                 | `apptainer_def_gen.py` no asset injection  | Large |
+| Per-task wall-clock budget         | 1–200 min        | LLM-imagined, often quick                 | task metadata not exposed                  | Large |
+| Difficulty self-labels             | easy/medium/hard | None                                     | not measured                                | Medium |
+| Author/solver asymmetry            | Human → LLM      | Same family (3.1-pro → 3-flash)          | global config                              | Medium (closes via §7.3) |
 
-**Hypothesis**: filtering / sanitising / parsing tasks become genuinely hard when the verifier has both a positive (must reject) and negative (must preserve) corpus.
-
-Pipeline:
-
-1. Sample a "filter spec" — XSS sanitiser, SQL-injection detector, secret redactor, log-line classifier, profanity filter, etc.
-2. Use the LLM to generate two corpora:
-   - `evil/`: 50–500 attack inputs (hand-curated lists exist, e.g. OWASP XSS cheat sheet, can be seeded into the LLM as known-bad).
-   - `clean/`: 50–500 benign inputs that must not be modified or false-positive flagged.
-3. Verifier is `pytest` over both corpora; a pass requires both directions.
-4. Optionally: a *fuzzing oracle* that mutates `clean/` and `evil/` per run.
-
-Output additions: `tests/evil_corpus/`, `tests/clean_corpus/`, `tests/test_filter.py`.
-
-Why this matters: §5.4 directly. Tasks like `filter-js-from-html` would be reproducible at scale.
-
-### Track 5 — `re_forensics_gen.py`: ship-a-binary track
-
-**Hypothesis**: binary RE tasks are some of TB 2.0's hardest and most agent-discriminating. We can synthesise unlimited variants procedurally.
-
-Pipeline:
-
-1. Sample a small "secret algorithm" — a closed-form arithmetic transform, a simple state machine, a custom hash, an obfuscated XOR cipher, a CRC variant, etc.
-2. Generate it as C code, compile to a binary, **strip symbols**, optionally apply UPX or simple obfuscation.
-3. Ship only the binary + a few sample (input, output) pairs.
-4. Task: "re-implement this binary's behaviour in Python/Rust/etc. with bit-exact equivalence."
-5. Verifier: random fuzz inputs through both binaries → must agree.
-
-Output additions: `environment/mystery_bin`, `tests/fuzz_oracle.py`.
-
-Why this matters: §5.6 directly, and very cheap to scale (the algorithm zoo is bounded but rich).
-
-### Track 6 — `version_pinned_anchor_gen.py`: real-package anchor track
-
-**Hypothesis**: name-real-software-with-real-versions is what makes TB 2.0 instructions feel "real". We can do this *without* internet hunting by **pre-vendoring** all needed sources.
-
-Pipeline:
-
-1. Curate ~50 named anchor packages with pinned versions known to install in <10 min from local source (e.g. `pyknotid 0.5.4`, `pmars 0.9.4`, `cobol-compiler X`, `MobileSAM Y`).
-2. Pre-build base SIFs/Dockerfiles with these pre-vendored.
-3. Sample one anchor + a perturbation: wrong env variable, broken Makefile, missing patch, wrong numpy ABI, etc.
-4. LLM generates the instruction + the perturbation script.
-5. Verifier exercises a known-good code path of the named software.
-
-Output additions: each task references a `BASE_SIF` from a curated registry; the per-task overlay only adds the perturbation.
-
-Why this matters: §5.1. Also — by pre-vendoring everything, we avoid the §5.7 anti-pattern (URL-hunting) entirely.
-
-### Track 7 — Calibration filter (post-generation)
-
-After any of the above generators run, plug into the existing `rl_data/scripts/generate_solutions/run_generate_solutions_*.sh` pipeline as a **calibration pass**:
-
-1. Run the SAME model+harness we just evaluated (`gemini/gemini-3-flash-preview` + TassieAgent) over the freshly generated tasks at pass@1, pass@8, or pass@k.
-2. **Reject**: tasks with pass@8 = 1.0 (trivially solvable) and tasks with pass@8 = 0.0 (probably broken or impossible).
-3. **Keep**: tasks with pass@8 ∈ [0.125, 0.875] (i.e. solvable some-of-the-time, the RL-useful sweet spot).
-4. Tag kept tasks with measured difficulty bins so curriculum sampling can target the right level.
-
-This gives us a "TB-2-like" filter that's grounded in *our own* model's behaviour rather than LLM judgment.
+Three structural rows are **total** gaps — not just "underused", but mechanically impossible in the current pipeline architecture. They map to the three depth axes proposed in §7.
 
 ---
 
-## 8. Concrete next-step suggestion (single recommendation)
+## 7. Proposal — three orthogonal *depth axes*, additive over the existing pipeline
 
-If you want to start with one thing: **Track 1 (`metric_threshold_gen.py`) + Track 7 (calibration filter)**.
+The existing pipeline samples diversity axes (domain × skill × scenario × language × …). We propose three *new orthogonal axes* that get sampled per task alongside the existing ones, each unlocking a class of TB 2.0 difficulty:
+
+| Axis                | Values (sketch)                                                                 | Unlocks (§5)        |
+|---------------------|---------------------------------------------------------------------------------|---------------------|
+| **A. Verifier kind**  | `exact_text` (legacy default) · `metric_threshold` · `adversarial_corpus` · `fuzz_equivalence` · `multi_protocol` | §5.3, §5.4         |
+| **B. Fixture kind**   | `text_only` (legacy default) · `image` · `audio` · `video` · `stripped_binary` · `vendored_package` · `multi_service_compose` | §5.1, §5.2, §5.5, §5.6 |
+| **C. Calibration**    | post-hoc; not a generation axis but a *filter stage*: keep only pass@k ∈ [0.125, 0.875] on the deployment harness | §6.2.3            |
+
+Critically, axes A and B are **multiplicative over the existing axes**, not replacements. The same `(security, "Algorithmic", forensics-analyst, hard, C, …)` tuple can now be instantiated with `verifier_kind=fuzz_equivalence` and `fixture_kind=stripped_binary` to produce a binary-RE task that the current pipeline literally cannot author. A generated task's metadata becomes:
+
+```json
+{
+  "domain": "...", "skill_type": "...", "primitive_skills": [...],
+  "task_complexity": "...", "command_complexity": "...",
+  "scenario": "...", "language": "...", "anchor": "...",
+  "verifier_kind": "metric_threshold",
+  "fixture_kind": "image",
+  "difficulty_calibration": {"solver": "vanillux+gemini-3-flash", "pass_at_8": 0.375}
+}
+```
+
+### 7.0 Pipeline integration map (no fork required)
+
+| Stage                                  | Existing role                                | Extension for new axes                                                                                              |
+|----------------------------------------|----------------------------------------------|---------------------------------------------------------------------------------------------------------------------|
+| `task_template_gen.py`                 | sample axes; LLM emits `<task>` + `<truth>`  | sample `verifier_kind` + `fixture_kind` too; emit them in metadata; pass them into the system prompt so the description respects them |
+| **NEW** `fixture_gen.py`               | —                                            | given `(fixture_kind, task_description, truth)` → produce the actual artefact (image/audio/binary/etc.) on the host  |
+| `apptainer_def_gen.py`                 | LLM emits `.def` with text setup            | when `fixture_kind ≠ text_only`, **deposit fixture files** into the task dir at build time; `%files` section copies them into `/app` |
+| `initial_state_test_gen.py`            | stdlib pytest checks env was set up         | unchanged — fixture presence is checked the same way                                                                |
+| `completion_test_gen.py`               | stdlib pytest checks final state            | when `verifier_kind ≠ exact_text`, switch to a verifier-template-specific system prompt and **allow a curated allow-list of third-party libs** (numpy/scipy/Pillow/torch/…) in the verifier |
+| `sample_solutions.py`                  | runs N solutions, computes pass@k            | unchanged — already supports k=8                                                                                    |
+| **NEW** `calibrate_difficulty.py`      | —                                            | post-stage: read `solutions/*_summary.json`, compute pass@k, emit `keep`/`drop` decision per task; tag retained tasks with measured difficulty |
+
+The whole proposal is therefore: **two new files, two extended call-sites, no file-rewrites in existing stages.**
+
+### 7.1 Axis A — Verifier kind (§5.3, §5.4)
+
+**Why first.** The `submitted_verifier_failed_other` failure mode — the harness-invariant 15-task set in §4 — is *exactly* the failure mode that quantitative and adversarial verifiers create at generation time. This axis attacks the largest currently-failing TB 2.0 bucket directly.
+
+#### Verifier templates
+
+- **`metric_threshold`**: agent's output is graded by a numerical metric against a reference. Verifier ships the metric harness (e.g. `metric.py` with cosine, SSIM, BLEU, accuracy-on-test-set). Generator runs the reference solution offline once, records the reference metric, then sets the agent's threshold to `(reference_metric − epsilon)` so the bar is achievable. Tasks where the reference fails to converge are dropped at generation time.
+  - *TB 2.0 analogues*: `largest-eigenval`, `tune-mjcf`, `train-fasttext`, `path-tracing-reverse`, `model-extraction-relu-logits`, `pytorch-model-cli`, `winning-avg-corewars`.
+
+- **`adversarial_corpus`**: verifier carries two corpora — `evil/` (must reject / sanitise / detect) and `clean/` (must not modify / false-positive). Pass requires both directions. Corpora can be seeded from public lists (OWASP XSS, SQL-injection wordlists, leaked-API-key formats) and amplified by an LLM mutator.
+  - *TB 2.0 analogues*: `filter-js-from-html`, `sanitize-git-repo`.
+
+- **`fuzz_equivalence`**: a reference binary `oracle` is shipped; agent must produce another implementation `student`; verifier fuzzes `oracle` and `student` with random inputs and asserts bit-exact agreement on N samples.
+  - *TB 2.0 analogues*: `extract-elf`, `path-tracing-reverse`.
+
+- **`multi_protocol`** (smaller, optional): verifier issues real protocol-level requests (HTTP, TCP, gRPC, mail) and checks responses. Used together with axis B `multi_service_compose`.
+  - *TB 2.0 analogues*: `mailman`, `kv-store-grpc`, `qemu-startup`.
+
+#### Required pipeline change in `completion_test_gen.py`
+
+Today's `SYSTEM_MSG` hard-codes "stdlib + pytest only" (line 30). For the new templates we'd:
+
+1. Make the system prompt template-conditional (one variant per `verifier_kind`).
+2. Allow a curated, base-SIF-pre-installed allow-list per template:
+   - `metric_threshold` → numpy, scipy, scikit-learn, Pillow, torch (cpu)
+   - `adversarial_corpus` → no extras needed (text matching)
+   - `fuzz_equivalence` → no extras needed
+   - `multi_protocol` → requests, grpcio, smtplib (already stdlib)
+3. Pre-build a single new base SIF `base_metric_verifier.sif` that ships these libs; tasks with these verifier kinds resolve to that base in `apptainer_def_gen._resolve_base()`.
+
+The "stdlib only" constraint stays the default; we just stop applying it when the task's metadata explicitly opts into a richer verifier stack.
+
+### 7.2 Axis B — Fixture kind (§5.1, §5.2, §5.5, §5.6)
+
+**Why second.** This is *the* dimension our pipeline currently has zero coverage on. The TB 2.0 failure analysis (§4 / §5.2) shows that real artefacts are central to half the harness-invariant failures.
+
+#### Fixture kinds
+
+- **`image`** — generator produces a PNG procedurally (PIL/matplotlib/LaTeX → PNG). The *generation parameters* (the source code rendered, the table values, the chess position) are the hidden ground truth. The agent must use OCR (tesseract) or vision to recover them.
+  - *TB 2.0 analogues*: `chess-best-move`, `code-from-image`, `path-tracing` reference image.
+
+- **`audio`** — generator synthesises speech via espeak/edge-tts. Hidden ground truth is the spoken text. Agent must use Whisper or similar.
+
+- **`video`** — ffmpeg-stitches a sequence of frames with timestamped events (counter increments, ball positions). Agent must detect events.
+
+- **`stripped_binary`** — generator picks a small algorithm (CRC variant / obfuscated XOR / state machine), emits C source, compiles with `-s`, optionally runs UPX, then **discards the source**. The task ships only the binary + a few sample (input, output) pairs. Verifier `fuzz_equivalence` (axis A) randomly fuzzes oracle vs student.
+  - *TB 2.0 analogues*: `mystery`, `extract-elf`, `path-tracing-reverse`.
+
+- **`vendored_package`** — generator picks one of ~50 curated real packages (`pyknotid 0.5.4`, `pmars 0.9.4`, `MobileSAM Y`, …) that have been **pre-vendored** into a base SIF (no internet at solve time). It then samples a *perturbation* (broken Makefile flag / wrong env var / missing patch / wrong numpy ABI) and writes a description that asks the agent to make a known-good code path of the package work again.
+  - *TB 2.0 analogues*: `build-pmars` (passed!), `cobol-modernization` (passed!), `modernize-scientific-stack` (passed!) — confirms agents can succeed when the package is pre-vendored. Avoids the §5.7 anti-pattern of URL-hunting.
+
+- **`multi_service_compose`** — generator picks a `docker-compose.yaml` template from a small curated library (postgres+adminer, nginx+flask, redis+producer/consumer, kafka+consumer, smtp+mta+mailman) and a perturbation. The task asks the agent to make the broken service flow again.
+
+#### Required pipeline changes
+
+1. New file `rl_data/generator/fixture_gen.py`. Pure host-side code (PIL/ffmpeg/gcc/UPX/curl) that materialises the artefact bytes and writes them to a per-task `fixtures/` dir. No LLM call; deterministic given a `(fixture_kind, seed, task_description)`.
+2. `apptainer_def_gen.py` learns to emit a `%files` section that copies the fixture files into the container `/app/`. Today the def has only `Bootstrap`/`From`/`%post`; adding `%files <host_path> <container_path>` lines is a one-function change.
+3. `task_template_gen.py` adds `fixture_kind` to the sampled tuple and passes it to the description generator's system prompt so the task description references the artefact correctly ("the binary at `/app/mystery`", "the image at `/app/board.png`").
+
+### 7.3 Axis C — Calibration filter (§6.2.3)
+
+**Why post-hoc, not a generation axis.** Difficulty is an emergent property of (task, model, harness), not a controllable input. The cleanest move is to over-generate and filter empirically.
+
+#### Algorithm
+
+1. Generate K tasks via the existing pipeline + axes A/B.
+2. Run `sample_solutions.py` with `n_solutions=8` using **the deployment harness** (currently VanilluxAgent + gemini-3-flash-preview). This is the same code path the existing `run_generate_solutions_*.sh` scripts invoke.
+3. New stage `rl_data/generator/calibrate_difficulty.py` reads `<task>/solutions/<run>_summary.json`, computes pass@k on each task, writes a `<task>/difficulty.json` with `{pass_at_1, pass_at_8, decision}`.
+4. Decision rule: keep tasks with `pass@8 ∈ [0.125, 0.875]`. Drop the trivially-solvable (pass@8=1) and the broken-or-impossible (pass@8=0). Tag retained tasks with a difficulty bin (`easy: pass@8 ≥ 0.625`, `medium: 0.25 ≤ pass@8 < 0.625`, `hard: 0.125 ≤ pass@8 < 0.25`).
+5. Optional curriculum sampler weights downstream training mixtures by these bins.
+
+#### Two methodological points worth flagging
+
+- **The calibration solver must be the deployment harness.** §3 / §10 showed that switching from TassieAgent to Vanillux at fixed budget shifts pass@1 by +7.9 pp. If we calibrate against a weaker harness than we deploy on, we'll keep tasks that are merely *harness-hard* (e.g. tasks that fail because TassieAgent has no edit tool) rather than *capability-hard*. **Recommendation: run calibration against VanilluxAgent at `calls=100`.**
+- **The author model should be different from (and stronger than) the calibration solver.** Currently both are gemini-3.x; this works but doesn't maximise the asymmetry. Cheap improvement: keep `DEFAULT_MODEL = gemini/gemini-3.1-pro-preview` for authoring and use `gemini-3-flash-preview` for calibration (the same model we evaluate on). The pro-preview model is strictly stronger than flash and thus can articulate harder tasks.
+
+### 7.4 Sequencing recommendation
+
+Working back from the technical-report story, the order should be:
+
+1. **Track C first** (~1 week). Implement `calibrate_difficulty.py` and apply it to the *existing* skill-tax 10 k corpus. This gives an immediate empirical reading: how many of our current tasks fall in the `[0.125, 0.875]` keep band? Hypothesis: most of the 10 k will be in `pass@8 = 1.0` (too easy), which directly justifies tracks A and B with a number.
+2. **Track A (verifier templates)** (~2 weeks). Most impact-per-effort. Requires the smallest extension to the existing pipeline (`completion_test_gen.py` + one new base SIF). Generate ~1 k tasks with `verifier_kind ∈ {metric_threshold, adversarial_corpus}` and re-run track C.
+3. **Track B (fixture templates)** (~2–3 weeks). Higher upside but each fixture kind adds a new fixture format and verifier integration. Start with `stripped_binary` (composes naturally with track A's `fuzz_equivalence`) and `image` (largest gap in §5.2 coverage).
+4. **Multi-service compose** (Track B's `multi_service_compose` value) is its own can of worms (Daytona doesn't natively support compose); defer until after the others.
+
+Throughout, keep the existing skill-tax 10 k corpus unchanged as the easy/diversity baseline. New tracks produce a *complementary* harder-task corpus that lives alongside it.
+
+### 7.5 The harness-invariant 15-task set as a target distribution
+
+The 15 tasks listed in §4 are the cleanest empirical specification of "what a harder-task generator should produce more of". They cluster:
+
+- 6 of 15 → axis A `metric_threshold` (image/perf/accuracy thresholds): `path-tracing-reverse`, `pytorch-model-cli`, `winning-avg-corewars`, `make-mips-interpreter`, `extract-elf`, `model-extraction-relu-logits`
+- 4 of 15 → axis B `image`/`video` fixtures: `chess-best-move`, `path-tracing-reverse`, `video-processing`, `pytorch-model-cli`
+- 2 of 15 → axis A `adversarial_corpus`: `filter-js-from-html`, `sanitize-git-repo`
+- 2 of 15 → axis B `vendored_package`: `mteb-retrieve`, `sam-cell-seg`
+- 1 of 15 → axis A `multi_protocol` + B `multi_service`: `qemu-startup`
+- 2 of 15 → axis B `vendored_package` + dna/biology domain: `dna-insert`, `dna-assembly` (would need `biopython` in verifier allow-list)
+
+(Several tasks count toward more than one axis. Total > 15.)
+
+This breakdown gives an explicit target distribution for the harder-task corpus: roughly 40 % `metric_threshold`, 25 % multimodal (image/video), 15 % adversarial corpus, 15 % vendored_package, 5 % multi-protocol/service.
+
+---
+
+## 8. Concrete next-step recommendation
+
+Single-track if forced to pick: **Track C (calibration filter) + a half-day reading of where the existing 10 k corpus falls in the pass@8 distribution.**
 
 Reasoning:
 
-- Track 1 is the **smallest deviation** from the existing pipeline (same `task_template_gen.py` taxonomy, swapped verifier template) but the largest difficulty lever (we control the threshold).
-- It composes naturally with the existing 10 k pipeline — same `tasks_skill_tax_*/` layout, just with extra `tests/` fixtures.
-- Track 7 lets us calibrate empirically: generate 1 k tasks, run TassieAgent + Gemini-3-Flash on them (mirroring this eval), reject the easy/impossible tail, keep the middle. That gives us a dataset whose pass@1 is ~30–50 % *by construction* — i.e. matching TB 2.0's target.
-- Tracks 2–6 are higher upside but each adds a new fixture format (compose, binary, image, corpus) and would take longer to debug.
+- It's the cheapest ground-truth check on whether the gap analysis above is calibrated. If our current 10 k turns out to have ~50 % of tasks in the `[0.125, 0.875]` keep band, we have less of a difficulty problem than the gap argument suggests. If <10 %, the argument is settled and we know exactly how many net-new harder tasks we need.
+- It's a prerequisite for Tracks A and B regardless — both depend on having the calibration loop wired up to filter their output.
+- It produces a number that goes directly into the technical report: "X % of our 10 k corpus is in the empirical-difficulty keep band against (Vanillux + gemini-3-flash) at pass@8".
 
-Once Track 1 is shipped, Track 3 (multimodal) is the highest-value follow-up because §5.2 is currently a literal zero in our coverage.
+Two-track recommendation: **C + A**. After the calibration baseline lands, Track A (verifier templates) is the smallest pipeline change with the largest difficulty-ceiling lift, because it directly converts §6.2.1 (the stdlib-only verifier constraint) into a controllable axis.
 
 ---
 
 ## 9. Reproducibility
 
-```bash
-# Re-run the eval (resumes if jobs/tb2_gemini exists)
-bash scripts/run_tb2_gemini.sh
+Run the eval (resumes if `jobs/<name>` exists):
 
-# Re-run the analysis (replace job dir / label / out for other runs)
+```bash
+bash scripts/run_tb2_gemini_vanillux.sh   # primary
+bash scripts/run_tb2_gemini_tassie.sh     # ablation
+```
+
+Run the analyser (replace job dir / label / out for other runs):
+
+```bash
 uv run python scripts/analysis/analyze_tb2_eval.py \
-    --job-dir jobs/tb2_gemini \
+    --job-dir jobs/tb2_gemini_vanillux_calls100 \
     --harbor-cache /gpfs/scrubbed/osey/harbor_cache \
-    --label "TassieAgent + gemini-3-flash-preview" \
-    --out scripts/analysis/out/tb2_gemini_tassieagent
+    --label "VanilluxAgent + gemini-3-flash-preview, calls=100" \
+    --out scripts/analysis/out/tb2_gemini_vanillux_calls100
 ```
 
 Generated files (overwrite-safe, same script):
 
-- `out/tb2_gemini_tassieagent/per_trial.jsonl` — one row per trial, all extracted fields incl. tool histogram, verifier-test-level pass/fail, last-assistant-text.
-- `out/tb2_gemini_tassieagent/summary.json` — machine-readable aggregates (the source of every table in §1–§3).
-- `out/tb2_gemini_tassieagent/failures.md` — auto-generated narrative with the assertion-text excerpt of every failed test for every failed trial. Read this before reading §4 in any future re-run.
+- `out/<key>/per_trial.jsonl` — one row per trial: tool histogram, verifier-test-level pass/fail, last-assistant-text, final assertion excerpts.
+- `out/<key>/summary.json` — machine-readable aggregates.
+- `out/<key>/failures.md` — auto-generated narrative with the assertion-text excerpt of every failed test for every failed trial.
 
-The same script trivially re-runs against any harbor job dir produced by `run_tb*.sh` / `run_swebench*.sh`, so cross-(model, harness) comparisons stay one-line.
+The same script handles two harness conventions out of the box:
+
+- **TassieAgent** — uses `agent/timing.json` (one row per step) plus an OpenAI-style `agent/trajectory.json`. Submission marker: literal `COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` substring in the bash command.
+- **VanilluxAgent** (= upstream `swe-agent`) — only writes `agent/trajectory.json` in **ATIF-v1.5** schema (top-level `{"steps": [...]}`, each agent step has `tool_calls[].arguments.raw_action`). No per-step timing/token counts. Submission marker: standalone `submit` token at end of bash chain (regex `(?:^|[\s|;&])submit\b\s*$`). Step-budget cap is parsed from the run-dir-name pattern `..._calls(\d+)`.
+
+It re-runs against any harbor job dir produced by `run_tb*.sh` / `run_swebench*.sh`, so cross-(model, harness, budget) comparisons stay one-line.

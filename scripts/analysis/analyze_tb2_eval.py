@@ -46,6 +46,11 @@ except ImportError:  # pragma: no cover
 
 
 SUBMIT_MARKER = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+# SWE-agent / VanilluxAgent submits by running a `submit` action; the literal
+# token appears as the final word (or alone) in the bash command. We match
+# whole-word at end-of-string or before a non-word char to avoid false hits
+# from words like "submitted" or paths containing "submit".
+_SUBMIT_RE_SWE = re.compile(r"(?:^|[\s|;&])submit\b\s*$|(?:^|[\s|;&])submit_and_validate\b")
 
 
 # ---------------------------------------------------------------------------
@@ -214,22 +219,72 @@ def _ctrf_failures(ctrf: dict | None) -> tuple[int, int, list[str], list[str]]:
     return n_tests, n_failed, failed_names, failed_excerpts
 
 
-def _final_assistant_text(trajectory: list[dict] | None) -> str:
+def _final_assistant_text(trajectory: Any) -> str:
+    """Return the last non-empty assistant text from either trajectory shape.
+
+    Supports two shapes:
+      (a) TassieAgent: list of OpenAI-style messages [{role, content, ...}, ...]
+      (b) VanilluxAgent / swe-agent ATIF-v1.5: {"steps": [{source, message, ...}, ...]}
+    """
     if not trajectory:
         return ""
-    for msg in reversed(trajectory):
-        if msg.get("role") != "assistant":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str) and content.strip():
-            return content.strip()[:800]
-        # OpenAI-style content can be a list of {type, text}.
-        if isinstance(content, list):
-            chunks = [c.get("text", "") for c in content if isinstance(c, dict)]
-            joined = "\n".join(c for c in chunks if c)
-            if joined.strip():
-                return joined.strip()[:800]
+    # ATIF: dict with "steps" list.
+    if isinstance(trajectory, dict) and isinstance(trajectory.get("steps"), list):
+        for step in reversed(trajectory["steps"]):
+            if step.get("source") != "agent":
+                continue
+            msg = step.get("message")
+            if isinstance(msg, str) and msg.strip():
+                return msg.strip()[:800]
+        return ""
+    # OpenAI-style list of messages.
+    if isinstance(trajectory, list):
+        for msg in reversed(trajectory):
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()[:800]
+            if isinstance(content, list):
+                chunks = [c.get("text", "") for c in content if isinstance(c, dict)]
+                joined = "\n".join(c for c in chunks if c)
+                if joined.strip():
+                    return joined.strip()[:800]
     return ""
+
+
+def _atif_to_steps(trajectory: dict) -> list[dict]:
+    """Project an ATIF-v1.5 trajectory into TassieAgent-style step records.
+
+    Returns a list of dicts with the same shape `agent/timing.json` uses:
+        {step, cmd, llm_s, bash_s, prompt_tokens, completion_tokens}
+
+    SWE-agent doesn't expose per-step latency or token counts in the ATIF dump,
+    so the timing/token fields are zero. The cmd is truncated to 80 chars to
+    match TassieAgent's preview convention (preserves submission detection).
+    """
+    out: list[dict] = []
+    steps = trajectory.get("steps") or []
+    for s in steps:
+        if s.get("source") != "agent":
+            continue
+        tcs = s.get("tool_calls") or []
+        if not tcs:
+            continue
+        # SWE-agent emits one tool call per step ("swe_agent_action").
+        args = tcs[0].get("arguments") or {}
+        raw = args.get("raw_action") or args.get("command") or ""
+        if not isinstance(raw, str):
+            raw = json.dumps(raw)[:200]
+        out.append({
+            "step": s.get("step_id", len(out) + 1),
+            "cmd": raw[:80],
+            "llm_s": 0.0,
+            "bash_s": 0.0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        })
+    return out
 
 
 def _build_task_index(harbor_cache: Path) -> dict[str, Path]:
@@ -308,8 +363,23 @@ def extract_trial(trial_dir: Path, task_index: dict[str, Path]) -> TrialRecord |
     verifier_s = _duration_s(result.get("verifier"))
     total_s = _duration_s({"started_at": result.get("started_at"), "finished_at": result.get("finished_at")})
 
-    # Timing.json (per-step)
-    timing = _safe_load_json(trial_dir / "agent" / "timing.json") or []
+    # Two harness layouts:
+    #   - TassieAgent : agent/timing.json (one row per step) + agent/trajectory.json (OpenAI msgs)
+    #   - VanilluxAgent (swe-agent ATIF-v1.5): only agent/trajectory.json with a "steps" list,
+    #     no separate timing.json. We synthesize step rows from the trajectory.
+    timing = _safe_load_json(trial_dir / "agent" / "timing.json")
+    trajectory = _safe_load_json(trial_dir / "agent" / "trajectory.json")
+    is_atif = isinstance(trajectory, dict) and isinstance(trajectory.get("steps"), list)
+    if not timing and is_atif:
+        timing = _atif_to_steps(trajectory)
+        # In SWE-agent / VanilluxAgent the budget is on LLM *calls*, not steps.
+        # If the run dir name encodes the cap (e.g. "..._calls100"), trust that;
+        # otherwise fall back to the configured max_steps.
+        m = re.search(r"_calls(\d+)\b", trial_dir.parent.name)
+        if m:
+            max_steps = int(m.group(1))
+    timing = timing or []
+
     n_steps = len(timing)
     hit_max_steps = (n_steps >= max_steps) and (exc_type is None)
     llm_total_s = sum(float(s.get("llm_s", 0) or 0) for s in timing)
@@ -318,12 +388,13 @@ def extract_trial(trial_dir: Path, task_index: dict[str, Path]) -> TrialRecord |
     completion_tokens_total = sum(int(s.get("completion_tokens", 0) or 0) for s in timing)
     peak_prompt_tokens = max((int(s.get("prompt_tokens", 0) or 0) for s in timing), default=0)
 
-    # Tool histogram from cmd previews (sufficient — first 80 chars of each cmd).
-    # Submission detection: the SUBMIT_MARKER fits in the 80-char cmd preview
-    # whenever the agent echoes it (e.g. `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`),
-    # so timing.json is the right source of truth. Do NOT scan trajectory.json
-    # for the marker — the system prompt itself documents the marker, which would
-    # cause every trial to be classified as "submitted".
+    # Tool histogram + submission detection from cmd previews.
+    # Two submission conventions:
+    #   - TassieAgent: literal SUBMIT_MARKER (`COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`)
+    #   - SWE-agent  : standalone `submit` token at end of bash command chain
+    # We DO NOT scan agent/trajectory.json for the TassieAgent marker because the
+    # system prompt itself documents the marker, which would false-positive every
+    # trial.
     tool_hist: collections.Counter[str] = collections.Counter()
     submitted = False
     for s in timing:
@@ -331,9 +402,9 @@ def extract_trial(trial_dir: Path, task_index: dict[str, Path]) -> TrialRecord |
         tool_hist[_bash_verb(cmd)] += 1
         if SUBMIT_MARKER in cmd:
             submitted = True
+        elif _SUBMIT_RE_SWE.search(cmd):
+            submitted = True
 
-    # Trajectory only used for final-assistant-text excerpt.
-    trajectory = _safe_load_json(trial_dir / "agent" / "trajectory.json")
     final_text = _final_assistant_text(trajectory)
 
     # Verifier
