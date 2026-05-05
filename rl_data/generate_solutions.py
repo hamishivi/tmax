@@ -19,6 +19,7 @@ from rl_data import DEFAULT_MODEL
 from rl_data.generate_tasks import _safe_write_text
 from rl_data.generator.env import _fakeroot_flags
 from rl_data.generator.sample_solutions import run_n_solutions
+from rl_data.generator.vanillux_solver import run_n_solutions_vanillux
 
 
 @dataclass
@@ -64,6 +65,13 @@ class SolutionConfig:
     sample_size: int = 0
     #: Seed for the random sample; keep fixed across runs for reproducibility.
     sample_seed: int = 0
+    #: Solution-sampling harness. ``"bash"`` (default) is the legacy
+    #: bash-tool-calling harness in :func:`sample_solutions.run_n_solutions`.
+    #: ``"vanillux"`` switches to the swe-agent-flavoured 3-tool harness
+    #: (bash + str_replace_editor + submit) in
+    #: :func:`vanillux_solver.run_n_solutions_vanillux`. The two are drop-in
+    #: compatible at the call-site level.
+    harness: str = "bash"
 
 
 class _TeeTextStream:
@@ -242,7 +250,18 @@ def process_task(task_dir: str, cfg: SolutionConfig):
             cmd_log_resolved = cmd_log_resolved.resolve()
             print(f"[{task_dir.name}] Command debug logs -> {cmd_log_resolved}")
 
-        summary = run_n_solutions(
+        # Pick the solution-sampling harness. ``bash`` (default) reproduces the
+        # legacy 1k/10k pipeline byte-for-byte; ``vanillux`` switches to the
+        # swe-agent-flavoured 3-tool harness used for v2 RL solutions.
+        if cfg.harness == "vanillux":
+            solver_fn = run_n_solutions_vanillux
+        elif cfg.harness == "bash":
+            solver_fn = run_n_solutions
+        else:
+            raise ValueError(
+                f"Unknown harness {cfg.harness!r}; expected 'bash' or 'vanillux'."
+            )
+        summary = solver_fn(
             num_solutions=cfg.num_solutions,
             container_sif_path=str(sif_path),
             initial_test_path=str(initial_test_path),
@@ -370,6 +389,19 @@ def parse_args(argv: Optional[List[str]] = None) -> SolutionConfig:
         type=int,
         default=0,
         help="Seed for --sample-size so reruns pick the same tasks (default: 0).",
+    )
+    ap.add_argument(
+        "--harness",
+        type=str,
+        default="bash",
+        choices=["bash", "vanillux"],
+        help=(
+            "Solution-sampling harness. 'bash' (default) reproduces the legacy "
+            "bash-tool-calling pipeline byte-for-byte. 'vanillux' switches to "
+            "the swe-agent-flavoured 3-tool harness (bash + str_replace_editor "
+            "+ submit) used for v2 RL solutions; matches the deployment "
+            "harness on Daytona."
+        ),
     )
 
     args = ap.parse_args(argv)

@@ -29,6 +29,11 @@ from rl_data.generator.task_template_gen import generate_templates_batch
 from rl_data.generator.initial_state_test_gen import generate_test_templates_batch as generate_initial_tests_batch
 from rl_data.generator.apptainer_def_gen import iterate_def_template_batch, save_setup_artifacts
 from rl_data.generator.completion_test_gen import generate_test_templates_batch as generate_final_tests_batch
+from rl_data.generator.fixture_gen import (
+    materialize as fixture_materialize,
+    emit_files_section,
+    NOOP_FIXTURE_KINDS,
+)
 
 
 @dataclass
@@ -49,6 +54,11 @@ class PipelineConfig:
     #: Max concurrent Apptainer build+test workers in stage 4 (def generation).
     #: Each worker uses ~1 CPU + ~4 GB RAM.  Safe default: 4; scale up with CPUs.
     def_build_workers: int = 4
+    #: Corpus kind passed to ``random_user_msg``. ``"legacy"`` (default)
+    #: produces byte-identical output to the pre-v2 pipeline; ``"sft_v2"``
+    #: and ``"rl_v2"`` enable the new verifier_kind / fixture_kind / intricate
+    #: complexity axes via the bucket-upweight sampler.
+    corpus_kind: str = "legacy"
 
 
 def _safe_write_text(path: Path, content: str) -> None:
@@ -74,6 +84,22 @@ def _build_sif(def_path: Path, sif_path: Path) -> bool:
 def _format_task_dir(base: Path, idx: int, width: int = 6) -> Path:
     suffix = uuid.uuid4().hex[:8]
     return base / f"task_{idx:0{width}d}_{suffix}"
+
+
+def _inject_files_section(def_text: str, files_section: str) -> str:
+    """Insert a ``%files`` block immediately before the first ``%post`` line.
+
+    Apptainer accepts ``%files`` anywhere before ``%post``; standard practice
+    is to put it right after the ``Bootstrap/From`` header. If the def has no
+    ``%post`` (rare, malformed) we just append the section at the end.
+    """
+    files_section = files_section.rstrip() + "\n"
+    lines = def_text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        # Match the section header even when the LLM emits leading whitespace.
+        if line.lstrip().lower().startswith("%post"):
+            return "".join(lines[:i]) + files_section + "\n" + "".join(lines[i:])
+    return def_text.rstrip() + "\n\n" + files_section
 
 
 def _save_task_bundle(
@@ -116,13 +142,17 @@ def _generate_intermediates_batch(
     """Run stages 1-3 (templates, initial tests, final tests) and return intermediates."""
 
     # 1) Task templates
-    print(f"Generating {batch_count} task templates with {cfg.max_concurrency} concurrency")
+    print(
+        f"Generating {batch_count} task templates with {cfg.max_concurrency} "
+        f"concurrency (corpus_kind={cfg.corpus_kind})"
+    )
     task_templates = generate_templates_batch(
         batch_count,
         model=cfg.model,
         temperature=cfg.task_temperature,
         max_tokens=cfg.max_tokens,
         max_concurrency=cfg.max_concurrency,
+        corpus_kind=cfg.corpus_kind,
     )
 
     if not task_templates:
@@ -141,6 +171,12 @@ def _generate_intermediates_batch(
             "scenario": t.get("scenario", ""),
             "language": t.get("language", ""),
             "anchor": t.get("anchor"),
+            # v2 axes — present on every template; legacy templates carry the
+            # legacy default values ("exact_text", "text_only", "legacy", None).
+            "verifier_kind": t.get("verifier_kind", "exact_text"),
+            "fixture_kind": t.get("fixture_kind", "text_only"),
+            "corpus_kind": t.get("corpus_kind", "legacy"),
+            "base_image": t.get("base_image"),
         }
         for t in task_templates
     ]
@@ -175,9 +211,16 @@ def _generate_intermediates_batch(
     print(f"Generated {len(init_tests)} initial tests")
 
     # 3) Final tests (batch)
+    # For v2 corpora we pass the per-task verifier_kind as the 4th tuple
+    # element so completion_test_gen can pick a template-conditional system
+    # prompt (and allow third-party imports for non-legacy verifier kinds).
     print(f"Generating {len(descriptions)} final tests with {cfg.max_concurrency} concurrency")
+    final_test_items: List[tuple] = [
+        (descriptions[i], truths[i], init_tests[i], meta[i].get("verifier_kind", "exact_text"))
+        for i in range(len(descriptions))
+    ]
     final_tests = generate_final_tests_batch(
-        list(zip(descriptions, truths, init_tests)),
+        final_test_items,
         model=cfg.model,
         temperature=cfg.test_temperature,
         max_tokens=cfg.max_tokens,
@@ -261,9 +304,41 @@ def _save_one_task(
         "scenario": m["scenario"],
         "language": m.get("language", ""),
         "anchor": m.get("anchor"),
+        # v2 axes — always present so downstream analysis can group by them
+        # uniformly across legacy and v2 corpora.
+        "verifier_kind": m.get("verifier_kind", "exact_text"),
+        "fixture_kind": m.get("fixture_kind", "text_only"),
+        "corpus_kind": m.get("corpus_kind", "legacy"),
+        # Routing hint consumed by env._resolve_runtime_sif. ``None`` keeps
+        # legacy behaviour ("use base_<domain>.sif"); v2 tasks set this to
+        # ``"intricate"``.
+        "base_image": m.get("base_image"),
         "description": desc,
         "truth": tr,
     }
+
+    # v2: materialise non-legacy fixtures on the host and inject a %files
+    # section into the def text so they are baked into the per-task SIF.
+    # No-op for legacy tasks (text_only / unknown kinds).
+    fixture_kind = m.get("fixture_kind", "text_only")
+    if fixture_kind not in NOOP_FIXTURE_KINDS:
+        # Seed the fixture generator with the task index so a re-run of the
+        # same pipeline produces byte-identical artefacts; combine with the
+        # task_dir name's uuid suffix for a stable per-task identity.
+        fixture_seed = abs(hash((idx, task_dir.name))) % (2**32)
+        fixture_pairs = fixture_materialize(
+            fixture_kind,
+            task_description=desc,
+            truth=tr,
+            dest_dir=task_dir,
+            seed=fixture_seed,
+        )
+        if fixture_pairs:
+            files_section = emit_files_section(fixture_pairs)
+            # Prepend the %files section before the existing %post — Apptainer
+            # accepts %files anywhere before %post, but standard practice is
+            # to put it immediately after the Bootstrap/From header.
+            def_text = _inject_files_section(def_text, files_section)
 
     _save_task_bundle(
         task_dir, task_obj, item["init_test"], def_text,
@@ -528,6 +603,16 @@ def parse_args(argv: Optional[List[str]] = None) -> AsyncBatchConfig:
         help="Max concurrent Apptainer build+test workers in stage 4 "
              "(each uses ~1 CPU + ~4 GB RAM; default: 4)",
     )
+    ap.add_argument(
+        "--corpus-kind", type=str, default="legacy",
+        choices=["legacy", "sft_v2", "rl_v2"],
+        help=(
+            "Corpus generation mode. 'legacy' (default) reproduces the "
+            "pre-v2 pipeline byte-for-byte. 'sft_v2' / 'rl_v2' enable the "
+            "verifier_kind / fixture_kind / intricate-complexity axes via "
+            "the bucket-upweight sampler (M=2 / M=1.5 respectively)."
+        ),
+    )
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--quiet", action="store_true")
 
@@ -546,6 +631,7 @@ def parse_args(argv: Optional[List[str]] = None) -> AsyncBatchConfig:
         batch_size=max(1, args.batch_size),
         max_concurrency=max(1, args.max_concurrency),
         def_build_workers=max(1, args.def_build_workers),
+        corpus_kind=args.corpus_kind,
     )
 
 

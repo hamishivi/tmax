@@ -569,7 +569,23 @@ TASK_COMPLEXITY: list[str] = [
     "short task (a few shell commands focused on the core task)",
     "moderate task (several commands across setup, implementation, and verification)",
     "complex task (many commands spanning multiple phases: dependency installation, code writing, configuration, building, and testing)",
+    # Intricate (v2 only). Calibrated to push the agent toward the ~40-turn
+    # Terminal-Bench 2.0 mean (vs ~10 for the legacy 10k corpus). Composes
+    # naturally with verifier_kind=metric_threshold / adversarial_corpus etc.
+    (
+        "intricate task (multi-stage workflow combining (a) environment setup or "
+        "package configuration, (b) primary implementation across multiple files "
+        "or languages, (c) iterative refinement against a quantitative or "
+        "adversarial verifier, and (d) a final integration step. "
+        "Expect 30-60 commands.)"
+    ),
 ]
+
+# Slices used by the bucket-upweight sampler when sampling for v2 corpora.
+# The first 3 entries are the legacy values (used at uniform weight by the
+# legacy corpus); the 4th is "intricate" and is the new-axis bucket.
+_LEGACY_COMPLEXITIES: list[str] = TASK_COMPLEXITY[:3]
+_INTRICATE_COMPLEXITY: str = TASK_COMPLEXITY[3]
 
 COMMAND_COMPLEXITY: list[str] = [
     "bash-only (shell built-ins, coreutils, and standard CLI tools)",
@@ -579,6 +595,93 @@ COMMAND_COMPLEXITY: list[str] = [
         "service configuration, networking, and containers)"
     ),
 ]
+
+
+# ---------------------------------------------------------------------------
+# v2 axes — Verifier kind and Fixture kind
+# ---------------------------------------------------------------------------
+# These axes are sampled in addition to the existing 7 (domain × skill_type ×
+# primitive_skills × task_complexity × command_complexity × scenario × language)
+# whenever `corpus_kind` is "sft_v2" or "rl_v2". For "legacy" (the default),
+# the new axes are forced to their legacy default values so byte-identical
+# behaviour is preserved.
+#
+# See scripts/analysis/tb2_gemini_tassieagent_eval.md §6–§7 for the
+# motivation behind each kind.
+
+VERIFIER_KINDS: list[str] = [
+    "metric_threshold",       # numerical metric vs reference (similarity / speed / accuracy)
+    "adversarial_corpus",     # evil/ corpus must reject + clean/ must preserve
+    "fuzz_equivalence",       # bit-exact agreement with a reference oracle
+    "multi_protocol",         # real protocol-level requests (HTTP/TCP/gRPC)
+    "exact_text",             # legacy default — text equality
+]
+_VERIFIER_LEGACY: str = "exact_text"
+_VERIFIER_NEW: list[str] = [v for v in VERIFIER_KINDS if v != _VERIFIER_LEGACY]
+
+FIXTURE_KINDS: list[str] = [
+    "image",                  # task ships a PNG; agent does OCR / vision
+    "audio",                  # task ships a WAV; agent does ASR
+    "video",                  # task ships an MP4; agent does event detection
+    "stripped_binary",        # task ships a stripped binary; agent does RE / fuzz-equivalence
+    "vendored_package",       # task ships a pre-vendored real package + a perturbation
+    "multi_service_compose",  # task ships multiple cooperating services (compose-style)
+    "text_only",              # legacy default — only text descriptions
+]
+_FIXTURE_LEGACY: str = "text_only"
+_FIXTURE_NEW: list[str] = [f for f in FIXTURE_KINDS if f != _FIXTURE_LEGACY]
+
+
+# ---------------------------------------------------------------------------
+# Corpus kinds and their bucket-upweight multipliers
+# ---------------------------------------------------------------------------
+
+CORPUS_KINDS: tuple[str, ...] = ("legacy", "sft_v2", "rl_v2")
+
+# Bucket-upweight multipliers per v2 corpus. M is the relative weight of the
+# new-axis bucket vs the legacy bucket. Concretely:
+#   P(any new) = M / (1 + M),  P(legacy) = 1 / (1 + M).
+# Tuned to compensate for the legacy 1k/10k corpora having 0 % new-axis
+# representation, so the combined corpus has more balanced new-vs-legacy
+# axis coverage. See plan §1 for the resulting per-axis distributions.
+_CORPUS_MULTIPLIER: dict[str, float] = {
+    "sft_v2": 2.0,
+    "rl_v2": 1.5,
+}
+
+
+def _bucket_upweight_choice(
+    new_values: list[str],
+    legacy_value: str,
+    multiplier: float,
+) -> str:
+    """Sample one value such that the *new bucket* (combined) is ``multiplier``
+    times more likely than the legacy default. New values are uniform within
+    the new bucket.
+
+    With weights ``[M/K, M/K, ..., M/K, 1]`` (K new + 1 legacy) the totals are
+    ``M + 1``, giving ``P(any new) = M/(M+1)`` and ``P(legacy) = 1/(M+1)``.
+    """
+    if not new_values:
+        return legacy_value
+    weights = [multiplier / len(new_values)] * len(new_values) + [1.0]
+    return random.choices(new_values + [legacy_value], weights=weights, k=1)[0]
+
+
+def _bucket_upweight_complexity(multiplier: float) -> str:
+    """Special-case bucket-upweight for ``TASK_COMPLEXITY``.
+
+    Here the legacy bucket has 3 values and the new bucket has 1 (``intricate``).
+    With weights ``[1/3, 1/3, 1/3, M]`` (3 legacy + 1 new) the totals are
+    ``1 + M``, giving ``P(intricate) = M/(M+1)`` and ``P(any legacy) = 1/(M+1)``,
+    each legacy value uniformly within the legacy bucket.
+    """
+    if not _LEGACY_COMPLEXITIES:
+        return _INTRICATE_COMPLEXITY
+    weights = [1.0 / len(_LEGACY_COMPLEXITIES)] * len(_LEGACY_COMPLEXITIES) + [multiplier]
+    return random.choices(
+        _LEGACY_COMPLEXITIES + [_INTRICATE_COMPLEXITY], weights=weights, k=1,
+    )[0]
 
 
 # ---------------------------------------------------------------------------
@@ -785,18 +888,159 @@ def _sample_language() -> str:
 
 
 # ---------------------------------------------------------------------------
+# v2 system-prompt fragments — injected when verifier_kind / fixture_kind
+# are not the legacy default. Each fragment is short and declarative, telling
+# the LLM *what kind of task* to build and *what its <truth> must declare*
+# so the downstream stages (apptainer_def_gen, fixture_gen, completion_test_gen)
+# can materialise the artefact and the verifier reliably.
+# ---------------------------------------------------------------------------
+
+_VERIFIER_KIND_FRAGMENTS: dict[str, str] = {
+    "metric_threshold": """\
+## Verifier kind: metric_threshold
+The agent's output will be graded by a NUMERICAL metric against a reference,
+not by exact text equality. Examples: image SSIM, audio MSE, model accuracy
+on a held-out test set, runtime speedup vs a reference implementation, output
+file size, etc.
+The <truth> block MUST declare:
+  * The *exact* metric (formula, tool, or short Python snippet that computes it).
+  * A reference / target value (a number) and a tolerance / threshold the agent
+    must meet (e.g. "SSIM >= 0.95", "speedup >= 1.3x", "accuracy >= 0.62").
+  * The exact path of the file or program the verifier should evaluate.""",
+    "adversarial_corpus": """\
+## Verifier kind: adversarial_corpus
+The agent must produce a filter / sanitiser / detector / classifier that is
+graded against TWO corpora shipped with the task: an "evil" corpus that the
+solution MUST reject (or sanitise / flag), and a "clean" corpus that the
+solution MUST preserve unchanged (or accept). Pass requires both directions.
+The <truth> block MUST declare:
+  * The exact paths of the evil/ and clean/ corpora the verifier will load.
+  * The pass criterion ("100% of evil rejected AND 100% of clean preserved",
+    or a specific pass-rate threshold per corpus).
+  * The agent's expected entry point (function signature / CLI invocation).""",
+    "fuzz_equivalence": """\
+## Verifier kind: fuzz_equivalence
+The agent must produce a program whose behaviour is BIT-EXACT equivalent to a
+reference oracle that the verifier already has access to (e.g. a stripped
+binary or a reference implementation). The verifier random-fuzzes both with
+N inputs and asserts identical outputs.
+The <truth> block MUST declare:
+  * The path of the oracle program the verifier compares against.
+  * The fuzz-input distribution (input length range, character set, etc.) and N.
+  * The agent's expected entry point (executable path + invocation).""",
+    "multi_protocol": """\
+## Verifier kind: multi_protocol
+The agent must bring up one or more network services; the verifier issues
+real protocol-level requests (HTTP / TCP / gRPC / SMTP / SSH / etc.) and
+checks the responses.
+The <truth> block MUST declare:
+  * The exact host:port the agent's service should listen on.
+  * The protocol and the request/response patterns the verifier will exercise.
+  * Any auth tokens / credentials the agent must accept.""",
+}
+
+_FIXTURE_KIND_FRAGMENTS: dict[str, str] = {
+    "image": """\
+## Fixture kind: image
+This task ships a real image artefact (PNG/JPEG) at a specific path under
+/app/. The agent typically needs OCR (tesseract is preinstalled) or basic
+vision processing to recover information from it.
+The <truth> block MUST declare:
+  * The exact path of the image (under /app/).
+  * The hidden ground truth (text / numbers / structure) the agent must recover.
+  * (Implicit) the verifier checks the agent's recovered content against this
+    ground truth, not the image itself.""",
+    "audio": """\
+## Fixture kind: audio
+This task ships a real audio artefact (WAV/MP3) at a specific path under
+/app/. The agent typically needs a transcription tool to recover the spoken
+content (whisper.cpp / ffmpeg-based pipelines).
+The <truth> block MUST declare:
+  * The exact path of the audio file.
+  * The hidden ground truth (transcript / event sequence / measurement).""",
+    "video": """\
+## Fixture kind: video
+This task ships a real video artefact (MP4) at a specific path under /app/.
+The agent typically needs frame extraction (ffmpeg is preinstalled) plus
+per-frame analysis to recover events, counts, or detections.
+The <truth> block MUST declare:
+  * The exact path of the video file.
+  * The hidden ground truth (frame ranges, counts, detections, etc.).""",
+    "stripped_binary": """\
+## Fixture kind: stripped_binary
+This task ships a stripped, possibly UPX-packed binary at a specific path
+under /app/. The agent typically reverse-engineers it (objdump, gdb, strings
+are preinstalled) or treats it as a black-box oracle (often combined with
+verifier_kind=fuzz_equivalence).
+The <truth> block MUST declare:
+  * The exact path of the binary.
+  * The high-level algorithm the binary implements (so the verifier can
+    construct test inputs / fuzz the oracle vs the agent's solution).""",
+    "vendored_package": """\
+## Fixture kind: vendored_package
+This task ships a real third-party package source pre-vendored at a specific
+path under /app/. NO INTERNET access is required at solve time. The package
+has a deliberate perturbation (broken Makefile, wrong env var, missing patch,
+etc.) that the agent must fix to get a known-good code path working.
+The <truth> block MUST declare:
+  * The package name + version + the exact path of its vendored source.
+  * The perturbation that was applied (so the verifier can construct the
+    expected post-fix state).
+  * The known-good code path the verifier exercises after the agent's fix.""",
+    "multi_service_compose": """\
+## Fixture kind: multi_service_compose
+This task involves multiple cooperating services (e.g. nginx + flask + redis,
+postfix + mailman, qemu + telnet, etc.). At solve time, a startup script
+brings up the services; the agent must reconfigure / glue them so a specific
+end-to-end protocol flow works.
+The <truth> block MUST declare:
+  * The list of services + their ports / sockets / process roles.
+  * The exact end-to-end flow the verifier will exercise.
+  * The configuration files / env vars the agent must adjust.""",
+}
+
+
+def _build_v2_axis_block(verifier_kind: str, fixture_kind: str) -> str:
+    """Return the conditional v2 instruction block, or empty string if both
+    axes are at their legacy defaults.
+    """
+    parts: list[str] = []
+    v_frag = _VERIFIER_KIND_FRAGMENTS.get(verifier_kind)
+    f_frag = _FIXTURE_KIND_FRAGMENTS.get(fixture_kind)
+    if v_frag is not None:
+        parts.append(v_frag)
+    if f_frag is not None:
+        parts.append(f_frag)
+    if not parts:
+        return ""
+    return "\n\n# v2 Axes (additional task structure)\n\n" + "\n\n".join(parts) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # System prompt builder
 # ---------------------------------------------------------------------------
 
-def build_system_prompt(domain: str) -> str:
-    """Assemble a domain-specific system prompt."""
+def build_system_prompt(
+    domain: str,
+    *,
+    verifier_kind: str = _VERIFIER_LEGACY,
+    fixture_kind: str = _FIXTURE_LEGACY,
+) -> str:
+    """Assemble a domain-specific system prompt.
+
+    When ``verifier_kind`` or ``fixture_kind`` is non-legacy, an extra v2-axis
+    block is appended that tells the LLM what kind of task to build and what
+    its ``<truth>`` block must declare. For legacy values both fragments are
+    omitted, so output is byte-identical to the pre-v2 behaviour.
+    """
     domain_label = domain.replace("_", " ").title()
     module = DOMAIN_MODULES[domain]
+    v2_block = _build_v2_axis_block(verifier_kind, fixture_kind)
 
     return f"""\
 You are an expert at creating {domain_label} tasks for AI agent training.
 
-{module}
+{module}{v2_block}
 
 Universal Task Requirements:
 - Challenging to solve: Requires domain knowledge, analytical thinking, and \
@@ -873,13 +1117,50 @@ the task.
 # Prompt assembly
 # ---------------------------------------------------------------------------
 
-def random_user_msg() -> tuple[str, str, dict]:
+def _v2_axes_user_block(verifier_kind: str, fixture_kind: str) -> str:
+    """Short user-message reminder of the v2 axes when they are non-legacy.
+
+    Re-states the verifier_kind / fixture_kind as concrete bullets so the LLM
+    cannot ignore them when sampling produced an exotic combination.
+    """
+    bullets: list[str] = []
+    if verifier_kind != _VERIFIER_LEGACY:
+        bullets.append(f"- Verifier kind: **{verifier_kind}** (see system prompt for what <truth> must declare).")
+    if fixture_kind != _FIXTURE_LEGACY:
+        bullets.append(f"- Fixture kind: **{fixture_kind}** (the task ships this artefact under /app/).")
+    if not bullets:
+        return ""
+    return "\n## v2 Axes\n" + "\n".join(bullets) + "\n"
+
+
+def random_user_msg(corpus_kind: str = "legacy") -> tuple[str, str, dict]:
     """Generate a domain-specific (system_msg, user_msg, metadata) tuple.
 
     Selects a domain, samples primitive skills, picks complexity levels,
     draws a domain-appropriate persona, optionally injects a real-software
     anchor, and samples a primary language.
+
+    Parameters
+    ----------
+    corpus_kind:
+        ``"legacy"`` (default) reproduces the pre-v2 behaviour byte-for-byte —
+        no verifier_kind / fixture_kind sampling, only the original 3
+        ``TASK_COMPLEXITY`` values.
+
+        ``"sft_v2"`` and ``"rl_v2"`` enable the v2 axes:
+          * ``verifier_kind`` and ``fixture_kind`` are sampled with the
+            bucket-upweight formula (``M=2`` for sft_v2, ``M=1.5`` for rl_v2),
+            making the new-axis bucket combined ``M`` × more likely than the
+            legacy default. New values are uniform within the new bucket.
+          * ``task_complexity`` is sampled with the same upweight, where the
+            "new bucket" is the single ``intricate`` value and the legacy
+            bucket is the original 3 (``short`` / ``moderate`` / ``complex``).
     """
+    if corpus_kind not in CORPUS_KINDS:
+        raise ValueError(
+            f"corpus_kind must be one of {CORPUS_KINDS}, got {corpus_kind!r}"
+        )
+
     domain = random.choice(list(SKILL_TAXONOMY.keys()))
     skill_types = SKILL_TAXONOMY[domain]
 
@@ -891,7 +1172,16 @@ def random_user_msg() -> tuple[str, str, dict]:
     num_skills = random.randint(3, 5)
     primitive_skills = random.sample(all_skills, min(num_skills, len(all_skills)))
 
-    task_complexity = random.choice(TASK_COMPLEXITY)
+    if corpus_kind == "legacy":
+        task_complexity = random.choice(_LEGACY_COMPLEXITIES)
+        verifier_kind = _VERIFIER_LEGACY
+        fixture_kind = _FIXTURE_LEGACY
+    else:
+        m = _CORPUS_MULTIPLIER[corpus_kind]
+        task_complexity = _bucket_upweight_complexity(m)
+        verifier_kind = _bucket_upweight_choice(_VERIFIER_NEW, _VERIFIER_LEGACY, m)
+        fixture_kind = _bucket_upweight_choice(_FIXTURE_NEW, _FIXTURE_LEGACY, m)
+
     command_complexity = random.choice(COMMAND_COMPLEXITY)
     scenario = random.choice(DOMAIN_SCENARIOS[domain])
     language = _sample_language()
@@ -901,7 +1191,9 @@ def random_user_msg() -> tuple[str, str, dict]:
     if domain_anchors and random.random() < _ANCHOR_PROBABILITY:
         anchor = random.choice(domain_anchors)
 
-    system_msg = build_system_prompt(domain)
+    system_msg = build_system_prompt(
+        domain, verifier_kind=verifier_kind, fixture_kind=fixture_kind,
+    )
 
     skills_formatted = "\n".join(f"- {s}" for s in primitive_skills)
 
@@ -911,6 +1203,8 @@ def random_user_msg() -> tuple[str, str, dict]:
             f"\n## Scenario Anchor (use as inspiration, not literally)\n"
             f"{anchor}\n"
         )
+
+    v2_block = _v2_axes_user_block(verifier_kind, fixture_kind)
 
     user_msg = (
         f"# Task Generation Request\n"
@@ -931,6 +1225,7 @@ def random_user_msg() -> tuple[str, str, dict]:
         f"## Scenario\n"
         f"{scenario}\n"
         f"{anchor_block}"
+        f"{v2_block}"
         f"\n"
         f"## Instructions\n"
         f"CREATE A NOVEL TASK that:\n"
@@ -950,6 +1245,16 @@ def random_user_msg() -> tuple[str, str, dict]:
         f"Write the task description in a way that a user might ask an AI assistant."
     )
 
+    # Tasks with any non-legacy v2 axis route to the shared "intricate" base
+    # SIF (numpy/scipy/Pillow/torch-cpu/tesseract/ffmpeg/UPX/binutils
+    # pre-installed). Legacy tasks keep using their per-domain base.
+    is_v2_task = (
+        verifier_kind != _VERIFIER_LEGACY
+        or fixture_kind != _FIXTURE_LEGACY
+        or task_complexity == _INTRICATE_COMPLEXITY
+    )
+    base_image = "intricate" if is_v2_task else None
+
     metadata = {
         "domain": domain,
         "skill_type": skill_type,
@@ -959,6 +1264,13 @@ def random_user_msg() -> tuple[str, str, dict]:
         "scenario": scenario,
         "language": language,
         "anchor": anchor,
+        # v2 axes — present on every task; legacy tasks have the legacy default.
+        "verifier_kind": verifier_kind,
+        "fixture_kind": fixture_kind,
+        "corpus_kind": corpus_kind,
+        # Routing hint consumed by env._resolve_runtime_sif at solve time.
+        # `None` (default) means "use base_<domain>.sif".
+        "base_image": base_image,
     }
     return system_msg, user_msg, metadata
 
@@ -974,17 +1286,23 @@ def generate_templates_batch(
     temperature: float = 1.0,
     max_tokens: int = 2048,
     max_concurrency: int = 128,
+    corpus_kind: str = "legacy",
 ) -> list[dict]:
     """Generate multiple task templates in one batched LLM call set.
 
     Returns a list of dicts with keys ``description``, ``truth``,
     ``domain``, ``skill_type``, ``primitive_skills``,
-    ``task_complexity``, ``command_complexity``, and ``scenario``.
+    ``task_complexity``, ``command_complexity``, ``scenario``, ``language``,
+    ``anchor``, and (always present) ``verifier_kind``, ``fixture_kind``,
+    ``corpus_kind``, ``base_image``.
+
+    Pass ``corpus_kind="sft_v2"`` or ``"rl_v2"`` to enable the v2 axes;
+    ``"legacy"`` (default) preserves byte-identical pre-v2 behaviour.
     """
     messages: list[list[dict[str, str]]] = []
     metadata_list: list[dict] = []
     for _ in range(batch_size):
-        system_msg, user_msg, metadata = random_user_msg()
+        system_msg, user_msg, metadata = random_user_msg(corpus_kind=corpus_kind)
         messages.append([
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},

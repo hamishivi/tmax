@@ -33,6 +33,13 @@ BASE_IMAGES: dict[str, Path] = {
     "scientific_computing":  CONTAINERS_DIR / "base_scientific_computing.sif",
     "data_processing":       CONTAINERS_DIR / "base_data_processing.sif",
     "system_administration": CONTAINERS_DIR / "base_system_administration.sif",
+    # v2 shared rich base — used by tasks whose task.json has
+    # ``base_image == "intricate"`` (set by task_template_gen for any task
+    # with a non-legacy verifier_kind / fixture_kind / intricate complexity).
+    # Pre-installs numpy/scipy/Pillow/torch-cpu/biopython + tesseract / ffmpeg
+    # / upx / binutils on top of the legacy software_engineering toolchain.
+    # Built from rl_data/containers/base_intricate.def.
+    "intricate":             CONTAINERS_DIR / "base_intricate.sif",
 }
 
 DEFAULT_BASE = CONTAINERS_DIR / "base_software_engineering.sif"
@@ -41,7 +48,8 @@ DOMAIN_LIST = list(BASE_IMAGES.keys())
 
 
 def _resolve_base(domain: str, base_sifs_dir: Optional[Path] = None) -> Path:
-    """Return the path to the base SIF for a domain.
+    """Return the path to the base SIF for a domain (or the special
+    ``"intricate"`` v2 base).
 
     If *base_sifs_dir* is given, look there; otherwise use ``CONTAINERS_DIR``.
     """

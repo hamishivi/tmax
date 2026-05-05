@@ -380,21 +380,37 @@ class InteractiveContainerEnvironment:
             self.instance_name = None
 
     def _resolve_runtime_sif(self) -> Optional[Path]:
-        """Decide which SIF to use: per-task SIF, or a shared base SIF from ``base_sifs_dir``."""
+        """Decide which SIF to use: per-task SIF, or a shared base SIF from ``base_sifs_dir``.
+
+        Resolution order at the base-SIF stage:
+            1. ``task.json["base_image"]`` if set (v2 tasks set this to
+               ``"intricate"`` for non-legacy verifier_kind / fixture_kind).
+            2. ``task.json["domain"]`` (the legacy resolution path).
+            3. The default ``software_engineering`` fallback baked into
+               ``parse_def_to_delta`` and ``_resolve_base``.
+        """
         if self.sif_path.exists():
             return self.sif_path
 
         if self.base_sifs_dir and self.def_path.exists():
             from rl_data.generator.apptainer_def_gen import parse_def_to_delta, _resolve_base
             task_json = self.def_path.parent / "task.json"
-            domain_hint = None
+            domain_hint: Optional[str] = None
+            base_image_hint: Optional[str] = None
             if task_json.exists():
                 try:
                     import json as _json
-                    domain_hint = _json.loads(task_json.read_text()).get("domain")
+                    _meta = _json.loads(task_json.read_text())
+                    domain_hint = _meta.get("domain")
+                    base_image_hint = _meta.get("base_image")
                 except Exception:
                     pass
-            base_domain, _ = parse_def_to_delta(self.def_path.read_text(), domain_hint=domain_hint)
+
+            # base_image_hint takes precedence over domain_hint when set —
+            # this is how v2 tasks route to base_intricate.sif without
+            # touching their domain field (which is preserved for analysis).
+            resolved_hint = base_image_hint or domain_hint
+            base_domain, _ = parse_def_to_delta(self.def_path.read_text(), domain_hint=resolved_hint)
             base_sif = _resolve_base(base_domain, base_sifs_dir=self.base_sifs_dir)
             if base_sif.exists():
                 return base_sif
