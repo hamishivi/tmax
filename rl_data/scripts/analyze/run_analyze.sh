@@ -7,7 +7,7 @@ set -euo pipefail
 #   tasks_skill_tax_20260401_10k       (legacy 10k)
 #   tasks_skill_tax_20260505_1k_legacy (latest legacy 1k re-gen)
 #   tasks_skill_tax_v2_20260505_2k     (v2 SFT, ad9d7fe — verifier × fixture × intricate)
-TASKS_DIR="/gpfs/scrubbed/osey/tmax/rl_data/output/tasks_skill_tax_v2_20260505_2k"
+TASKS_DIR="/gpfs/scrubbed/osey/tmax/rl_data/output/tasks_skill_tax_v2_20260505_2k_sft"
 
 PLOTS_DIR=""   # leave empty to default to <TASKS_DIR>/analysis
 MODEL=""       # e.g. "gemini/gemini-3-flash-preview"; leave empty to auto-discover all models

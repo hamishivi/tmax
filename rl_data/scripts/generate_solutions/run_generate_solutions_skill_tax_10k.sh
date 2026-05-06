@@ -43,7 +43,9 @@ MAX_TOKENS="${MAX_TOKENS:-65536}"
 NUM_TASKS=999999
 START_AT=0
 SOLUTION_TEMPERATURE=0.7
-COMMAND_TIMEOUT=60
+COMMAND_TIMEOUT=180          # was 60 — gives heavier compile / install commands
+                             # the headroom they need (Go, Rust, large C++,
+                             # apt installs in setup.sh).
 SHELL_INIT_TIMEOUT=240
 SHELL_INIT_ATTEMPTS=3
 BUILD_WORKERS=4              # mostly a no-op with BASE_SIFS_DIR (no per-task SIFs to build)
@@ -62,7 +64,10 @@ DISABLE_TERMINAL_LOG=0
 SAMPLE_SIZE="${SAMPLE_SIZE:-500}"
 SAMPLE_SEED="${SAMPLE_SEED:-0}"
 
-WORKERS="${WORKERS:-12}"
+WORKERS="${WORKERS:-24}"     # 24 × NUM_SOLUTIONS=8 = 192 ctr (3× CPU on 8×H200).
+                             # NOTE: vLLM is the throughput ceiling here; going
+                             # past 192 mostly queues at the server. Drop to 12
+                             # for 4-GPU allocations.
 NUM_POOL_WORKERS="${NUM_POOL_WORKERS:-16}"
 
 # ---- vLLM defaults: identical to the ET 500-task run ----

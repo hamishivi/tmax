@@ -3,9 +3,15 @@ produced by ``rl_data.generate_solutions``) into the SFT parquet format used
 by the rest of this preprocessing pipeline.
 
 This is the missing-link converter between the **rl_data** harness output
-(one `solutions/<MODEL_TAG>_summary.json` per task, each containing N
-trajectories under ``results``) and the **sft trainer** input (one parquet
-per source with ``messages / source / metadata`` columns).
+(one `solutions/<MODEL_TAG>[_<HARNESS>]_summary.json` per task, each
+containing N trajectories under ``results``) and the **sft trainer** input
+(one parquet per source with ``messages / source / metadata`` columns).
+
+The ``HARNESS`` suffix is OMITTED for the legacy bash harness (so existing
+``<MODEL_TAG>_summary.json`` files keep working unchanged) and INCLUDED for
+non-bash harnesses (currently just ``vanillux`` →
+``<MODEL_TAG>_vanillux_summary.json``). Pass ``--harness vanillux`` when
+converting trajectories from a vanillux solve run.
 
 Schema parity is critical: the parquet emitted here must match the existing
 ``tmax-sft-full-20260409`` configs (Sera / Nemotron / OpenThoughts) so the
@@ -293,16 +299,28 @@ def _row_for_result(
     }
 
 
+def _summary_basename(model_tag: str, harness: str) -> str:
+    """Mirror ``rl_data.generate_solutions._summary_basename``.
+
+    Bash keeps the legacy ``<MODEL_TAG>_summary.json`` filename; non-bash
+    harnesses get a harness suffix so they can coexist on disk with bash
+    summaries on the same task (no overwriting, no cp-r dance).
+    """
+    suffix = "" if harness == "bash" else f"_{harness}"
+    return f"{model_tag}{suffix}_summary.json"
+
+
 def _scan_tasks(
     tasks_dir: Path,
     model_tag: str,
+    harness: str = "bash",
 ) -> list[tuple[Path, Path]]:
     """Return [(task_dir, summary_path), ...] for every task with a summary
-    matching the given model tag.
+    matching the given (model_tag, harness) pair.
 
     Sorted by task_dir.name so output is deterministic across runs.
     """
-    summary_name = f"{model_tag}_summary.json"
+    summary_name = _summary_basename(model_tag, harness)
     pairs: list[tuple[Path, Path]] = []
     for child in sorted(tasks_dir.iterdir()):
         if not child.is_dir():
@@ -336,9 +354,16 @@ def convert(
     filter_success: bool = False,
     source_label: str | None = None,
     tools_json: str = _DEFAULT_TOOLS_JSON,
+    harness: str = "bash",
 ) -> dict[str, Any]:
     """Walk the trajectories under ``tasks_dir`` and write a parquet to
     ``output_dir/<name>.parquet`` plus a ``<name>.report.json`` summary.
+
+    ``harness`` selects which summary filename to look for under each
+    ``<task>/solutions/`` dir; it must match what ``generate_solutions.py``
+    was invoked with at solve time. ``"bash"`` (default) reads the legacy
+    ``<MODEL_TAG>_summary.json``; ``"vanillux"`` reads
+    ``<MODEL_TAG>_vanillux_summary.json``.
 
     Returns the report dict (also written to disk).
     """
@@ -351,10 +376,11 @@ def convert(
         # synthetic identifier so HF Datasets viewers can filter by it.
         source_label = f"tmax-rl-trajectories/{tasks_dir.name}/{canonical_model}"
 
-    pairs = _scan_tasks(tasks_dir, model_tag)
+    summary_basename = _summary_basename(model_tag, harness)
+    pairs = _scan_tasks(tasks_dir, model_tag, harness=harness)
     logger.info(
-        "Scanning %s for %s_summary.json -> %d task(s) with a summary",
-        tasks_dir, model_tag, len(pairs),
+        "Scanning %s for %s -> %d task(s) with a summary",
+        tasks_dir, summary_basename, len(pairs),
     )
 
     rows: list[dict[str, Any]] = []
@@ -452,6 +478,8 @@ def convert(
         "tasks_dir": str(tasks_dir),
         "model_tag": model_tag,
         "model_canonical": canonical_model,
+        "harness": harness,
+        "summary_basename": summary_basename,
         "source_label": source_label,
         "output_parquet": str(out_path),
         "filter_success": filter_success,
@@ -510,6 +538,16 @@ def _main() -> None:
         help="Keep only trajectories where the harness verifier returned success=True.",
     )
     p.add_argument(
+        "--harness",
+        default="bash",
+        choices=("bash", "vanillux"),
+        help="Solve-time harness used by rl_data.generate_solutions. Selects "
+             "which summary file to look for under each <task>/solutions/: "
+             "'bash' (default) -> <MODEL_TAG>_summary.json, "
+             "'vanillux' -> <MODEL_TAG>_vanillux_summary.json. Must match the "
+             "--harness passed to the solve script.",
+    )
+    p.add_argument(
         "--source-label",
         default=None,
         help="Override the auto-generated 'source' field on every row "
@@ -556,6 +594,7 @@ def _main() -> None:
         filter_success=args.filter_success,
         source_label=args.source_label,
         tools_json=tools_json,
+        harness=args.harness,
     )
     elapsed = time.time() - t0
     logger.info("Done in %.1fs.  Report: %s", elapsed, json.dumps(report, indent=2))
