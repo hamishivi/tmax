@@ -43,9 +43,11 @@ MAX_TOKENS="${MAX_TOKENS:-65536}"
 NUM_TASKS=999999
 START_AT=0
 SOLUTION_TEMPERATURE=0.7
-COMMAND_TIMEOUT=180          # was 60 — gives heavier compile / install commands
-                             # the headroom they need (Go, Rust, large C++,
-                             # apt installs in setup.sh).
+COMMAND_TIMEOUT=600          # was 180 — heavy compile / install / setup.sh
+                             # commands (apt-install, large Go/Rust/C++ builds,
+                             # numpy/Pillow wheel pulls) commonly exceed 180s
+                             # under disk + network contention. 600s drops the
+                             # timeout-recovery overhead substantially.
 SHELL_INIT_TIMEOUT=240
 SHELL_INIT_ATTEMPTS=3
 BUILD_WORKERS=4              # mostly a no-op with BASE_SIFS_DIR (no per-task SIFs to build)

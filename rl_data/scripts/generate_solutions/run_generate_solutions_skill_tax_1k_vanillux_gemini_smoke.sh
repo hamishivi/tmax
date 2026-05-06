@@ -89,9 +89,11 @@ MAX_TOKENS="${MAX_TOKENS:-65536}"
 NUM_TASKS=999999
 START_AT=0
 SOLUTION_TEMPERATURE=0.7
-COMMAND_TIMEOUT=180           # was 60 — v2 tasks need more headroom for package
-                              # installs, vendored_package builds, multi_service
-                              # boot, image/audio toolchain init.
+COMMAND_TIMEOUT=600           # was 180 — v2 setup.sh (apt + pip + large
+                              # builds) routinely exceeds 180s under disk/
+                              # network contention from 8 parallel solutions
+                              # per task. 600s drops timeout-recovery
+                              # overhead substantially.
 SHELL_INIT_TIMEOUT=240
 SHELL_INIT_ATTEMPTS=3
 # BUILD_WORKERS only matters when missing base SIFs need to be built. With

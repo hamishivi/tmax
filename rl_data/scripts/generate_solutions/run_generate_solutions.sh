@@ -20,7 +20,9 @@ START_AT=0
 WORKERS=10                   # parallel tasks (each runs NUM_SOLUTIONS agent loops)
 NUM_POOL_WORKERS=128        # parallel LLM calls within each turn
 SOLUTION_TEMPERATURE=0.7
-COMMAND_TIMEOUT=30          # per-command timeout in seconds inside containers
+COMMAND_TIMEOUT=600         # per-command timeout in seconds inside containers
+                            # (was 30 — too aggressive once v2 corpus tasks
+                            # with apt/pip-heavy setup.sh joined the mix)
 # First shell prompt: under WORKERS×NUM_SOLUTIONS concurrent Apptainers, raise if you see "Shell init timed out"
 SHELL_INIT_TIMEOUT=120
 SHELL_INIT_ATTEMPTS=3

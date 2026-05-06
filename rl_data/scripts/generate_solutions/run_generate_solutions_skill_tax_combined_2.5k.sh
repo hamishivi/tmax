@@ -118,9 +118,12 @@ MAX_TOKENS="${MAX_TOKENS:-4096}"
 NUM_TASKS="${NUM_TASKS:-999999}"     # cap on tasks processed (sharding hook)
 START_AT="${START_AT:-0}"            # skip first N tasks (sharding hook)
 SOLUTION_TEMPERATURE=0.7
-COMMAND_TIMEOUT=180          # was 60 — v2 tasks need more headroom for package
-                             # installs, vendored_package builds, multi_service
-                             # boot, image/audio toolchain init.
+COMMAND_TIMEOUT=600          # was 180 — observed 26% of commands timing out
+                             # at 180s, driven by v2 setup.sh (apt-install +
+                             # pip-install of heavy deps) running 8× in
+                             # parallel and contending on apt's global lock /
+                             # disk. 600s catches realistic worst-case while
+                             # still aborting truly-stuck commands.
 SHELL_INIT_TIMEOUT=240
 SHELL_INIT_ATTEMPTS=3
 BUILD_WORKERS=4              # mostly a no-op with BASE_SIFS_DIR (no per-task SIFs to build)
@@ -176,6 +179,28 @@ COMPARISON_DIR="$PROJECT_ROOT/rl_data/scripts/comparison"
 
 cd "$PROJECT_ROOT"
 mkdir -p logs
+
+# ---- Pre-flight: dangling-symlink check ----
+# Combined corpora are SYMLINK-VIEWS over their source dirs (legacy 1k +
+# v2 2k). A rename of either source dir leaves dangling symlinks here that
+# generate_solutions silently filters out (is_dir() returns False on
+# dangling links), making the run process FEWER tasks than NUM_TASKS
+# suggests. Aborting here saves ~5 min of vLLM init + GPU allocation
+# burn before the run discovers it has nothing useful to do.
+if [[ -d "$TASKS_DIR" ]]; then
+  _broken=$(find "$TASKS_DIR" -maxdepth 1 -type l ! -exec test -e {} \; -print 2>/dev/null | wc -l)
+  if (( _broken > 0 )); then
+    echo "ERROR: $_broken dangling task_* symlink(s) in $TASKS_DIR." >&2
+    echo "       A source corpus dir was likely renamed/moved after the combine." >&2
+    echo "       Fix: re-run combine with --force pointing at the new source path:" >&2
+    echo "           uv run python -m rl_data.scripts.combine.combine_corpora \\" >&2
+    echo "               --v2-dir <new-v2-path> --legacy-dir <legacy-path> \\" >&2
+    echo "               --out-dir $TASKS_DIR --total <N> --seed 0 --force" >&2
+    echo "       OR restore the original source dir name." >&2
+    echo "       Inspect dangling links: find $TASKS_DIR -maxdepth 1 -type l ! -exec test -e {} \\; -print | head" >&2
+    exit 2
+  fi
+fi
 
 # In-job vLLM bring-up.  No-op unless LAUNCH_VLLM=1.  Helper auto-detects
 # the Qwen3.5+ arch family (matches `qwen3.[5-9]` case-insensitive, so it

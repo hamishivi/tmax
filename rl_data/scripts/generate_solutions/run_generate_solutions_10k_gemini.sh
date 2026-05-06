@@ -38,7 +38,7 @@ MAX_TOKENS=65536             # LLM context window for the agent
 NUM_TASKS=999999             # processes all task_* dirs in TASKS_DIR
 START_AT=0                   # skip first N tasks (useful for resuming a partial run)
 SOLUTION_TEMPERATURE=0.7     # LLM sampling temperature for solutions
-COMMAND_TIMEOUT=60           # per-command timeout (seconds) inside containers;
+COMMAND_TIMEOUT=600          # per-command timeout (seconds) inside containers;
                              # bumped from 30 — C/Rust/Go compile commands can take 10-30s
 SHELL_INIT_TIMEOUT=240       # seconds to wait for Apptainer shell to initialise;
                              # higher than default (120) due to many concurrent containers
