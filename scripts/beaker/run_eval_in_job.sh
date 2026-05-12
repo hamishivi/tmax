@@ -151,6 +151,27 @@ if "test_stdout_path.chmod(0o666)" not in text:
     )
     verifier.write_text(text)
     print("patched verifier.py")
+
+# Make agent_dir / verifier_dir / artifacts_dir world-writable on the host so
+# user-namespaced container writes (anything that doesn't go through a
+# pre-touched harbor file: SWE-agent's *.traj, swe-agent.txt, etc.) don't
+# silently fail with permission-denied on the bind mount.
+paths_py = hdir / "models/trial/paths.py"
+text = paths_py.read_text()
+if "agent_dir.chmod(0o777)" not in text:
+    text = text.replace(
+        "self.agent_dir.mkdir(parents=True, exist_ok=True)\n"
+        "        self.verifier_dir.mkdir(parents=True, exist_ok=True)\n"
+        "        self.artifacts_dir.mkdir(parents=True, exist_ok=True)",
+        "self.agent_dir.mkdir(parents=True, exist_ok=True)\n"
+        "        self.verifier_dir.mkdir(parents=True, exist_ok=True)\n"
+        "        self.artifacts_dir.mkdir(parents=True, exist_ok=True)\n"
+        "        self.agent_dir.chmod(0o777)\n"
+        "        self.verifier_dir.chmod(0o777)\n"
+        "        self.artifacts_dir.chmod(0o777)",
+    )
+    paths_py.write_text(text)
+    print("patched paths.py")
 PY
 
 # --- 4. Bring podman service up (uses scripts/setup_podman_harbor.sh) -------
