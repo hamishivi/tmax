@@ -291,6 +291,12 @@ fi
 : "${N_ATTEMPTS:=1}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
 export OPENAI_API_BASE="http://localhost:$VLLM_PORT/v1"
+# Harbor's SWE-agent adapter copies OPENAI_BASE_URL (litellm convention) —
+# not OPENAI_API_BASE — into the container, and only then does it pass
+# --agent.model.api_base=... to sweagent. Without this, litellm in the
+# container falls back to https://api.openai.com and every trial exits
+# with NotFoundError: Hosted_vllmException on step 1.
+export OPENAI_BASE_URL="http://localhost:$VLLM_PORT/v1"
 
 HARBOR_CMD=( uv run harbor run
              --dataset "$DATASET"
