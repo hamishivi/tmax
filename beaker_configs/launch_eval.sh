@@ -46,7 +46,7 @@ JOB_NAME=""
 RESULTS_DIR=""
 CLUSTER="ai2/saturn"
 BUDGET=""
-PRIORITY="high"
+PRIORITY="urgent"
 BEAKER_WORKSPACE="${BEAKER_WORKSPACE:-ai2/tmax}"
 BEAKER_IMAGE="hamishivi/hamishivi-interactive"
 REPO_GIT_URL=""
@@ -79,7 +79,7 @@ Options:
                          (default: /results; persisted by Gantry)
   --cluster CLUSTER      beaker cluster (default: ai2/saturn)
   --budget BUDGET        beaker budget (default: omitted; uses workspace default)
-  --priority PRI         beaker priority (default: high)
+  --priority PRI         beaker priority (default: urgent)
   --workspace WS         beaker workspace (default: \$BEAKER_WORKSPACE or ai2/tmax)
   --image IMAGE          beaker image (default: $BEAKER_IMAGE)
   --repo-url URL         git URL of tmax (default: current 'origin' remote)
