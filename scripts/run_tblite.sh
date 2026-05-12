@@ -23,6 +23,7 @@ MAX_STEPS="${MAX_STEPS:-50}"
 N_ATTEMPTS="${N_ATTEMPTS:-3}"
 JOB_NAME="${JOB_NAME:-tblite}"
 JOB_DIR="jobs/${JOB_NAME}"
+export OPENAI_BASE_URL="http://${VLLM_HOST}:${VLLM_PORT}/v1"
 
 if [ -d "$JOB_DIR" ]; then
     echo "Resuming job from $JOB_DIR"
@@ -32,7 +33,7 @@ if [ -d "$JOB_DIR" ]; then
 else
     uv run harbor run \
         --dataset openthoughts-tblite@2.0 \
-        --agent-import-path TassieAgent:TassieAgent \
+        --agent-import-path VanilluxAgent:VanilluxAgent \
         --model "hosted_vllm/${MODEL_NAME}" \
         --env daytona \
         --n-concurrent "$N_CONCURRENT" \

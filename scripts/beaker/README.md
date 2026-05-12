@@ -78,7 +78,10 @@ A single task running:
 8. Runs `uv run harbor run --env docker --agent-import-path
    $AGENT_IMPORT_PATH --model hosted_vllm/$SERVED_MODEL_NAME --dataset
    $DATASET --agent-kwarg api_base=http://localhost:$VLLM_PORT/v1`.
-9. Copies `jobs/$JOB_NAME/` to `$RESULTS_DIR` on weka.
+9. Runs `scripts/compute_stats.py jobs/$JOB_NAME` and writes the output to
+   `jobs/$JOB_NAME/stats.txt` plus structured metrics to
+   `jobs/$JOB_NAME/metrics.json`.
+10. Copies `jobs/$JOB_NAME/` to `$RESULTS_DIR` on weka.
 
 ## Flags
 
@@ -143,6 +146,11 @@ After the job ends successfully:
 
 - Aggregate: `/weka/.../tmax-eval/<job-name>/jobs/<job-name>/result.json` —
   reward distribution + exception stats.
+- Stats summary: `/weka/.../tmax-eval/<job-name>/jobs/<job-name>/stats.txt` —
+  mean reward, standard deviation, SEM, and pass@k.
+- Metrics JSON: `/weka/.../tmax-eval/<job-name>/metrics.json` and
+  `/weka/.../tmax-eval/<job-name>/jobs/<job-name>/metrics.json` — structured
+  mean reward, standard deviation, SEM, run scores, pass@k, and per-task stats.
 - Per-trial: `/weka/.../tmax-eval/<job-name>/jobs/<job-name>/<task>__<rand>/`
   with `agent/oracle.txt`, `verifier/test-stdout.txt`, `verifier/reward.txt`,
   `exception.txt`, `trial.log`.

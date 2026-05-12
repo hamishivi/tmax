@@ -343,18 +343,48 @@ PY
 ) &
 PROGRESS_PID=$!
 
+set +e
 "${HARBOR_CMD[@]}"
 HARBOR_RC=$?
+set -e
 
 kill "$PROGRESS_PID" 2>/dev/null || true
 wait "$PROGRESS_PID" 2>/dev/null || true
 
-# --- 7. Persist results to /weka --------------------------------------------
+# --- 7. Compute aggregate stats ---------------------------------------------
+JOB_DIR="jobs/$JOB_NAME"
+if [ -d "$JOB_DIR" ]; then
+    STATS_LOG="$JOB_DIR/stats.txt"
+    METRICS_JSON="$JOB_DIR/metrics.json"
+    log "computing stats: scripts/compute_stats.py $JOB_DIR"
+    set +e
+    uv run python scripts/compute_stats.py "$JOB_DIR" --json-output "$METRICS_JSON" 2>&1 | tee "$STATS_LOG"
+    STATS_RC=${PIPESTATUS[0]}
+    set -e
+    if [ "$STATS_RC" -ne 0 ]; then
+        log "compute_stats.py exited with $STATS_RC; preserving harbor exit code $HARBOR_RC"
+    else
+        log "stats written to $STATS_LOG"
+        log "metrics written to $METRICS_JSON"
+    fi
+else
+    log "job directory $JOB_DIR not found; skipping compute_stats.py"
+fi
+
+# --- 8. Persist results to /weka --------------------------------------------
 if [ -n "${RESULTS_DIR:-}" ]; then
-    log "copying jobs/$JOB_NAME -> $RESULTS_DIR/"
-    mkdir -p "$RESULTS_DIR"
-    cp -r "jobs/$JOB_NAME" "$RESULTS_DIR/"
-    log "results available at $RESULTS_DIR/$JOB_NAME"
+    if [ -d "$JOB_DIR" ]; then
+        log "copying $JOB_DIR -> $RESULTS_DIR/"
+        mkdir -p "$RESULTS_DIR"
+        cp -r "$JOB_DIR" "$RESULTS_DIR/"
+        log "results available at $RESULTS_DIR/$JOB_NAME"
+        if [ -f "$JOB_DIR/metrics.json" ]; then
+            cp "$JOB_DIR/metrics.json" "$RESULTS_DIR/metrics.json"
+            log "metrics available at $RESULTS_DIR/metrics.json"
+        fi
+    else
+        log "job directory $JOB_DIR not found; skipping result copy"
+    fi
 fi
 
 exit "$HARBOR_RC"
