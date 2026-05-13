@@ -309,7 +309,7 @@ hermes` for Qwen2.5/Qwen3 (the launcher enables this by default).
 
 ```bash
 uv pip install scikit-learn scipy
-uv pip install vllm            # only if running a local server
+uv pip install vllm==0.19.1    # only if running a local server
 ```
 
 scipy powers Mann-Whitney U + chi-squared; scikit-learn powers TF-IDF + KMeans

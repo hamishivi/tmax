@@ -14,10 +14,10 @@
 #   MAX_LEN          Max model len.  Default: 32768
 #   GPU_UTIL         GPU memory utilisation.  Default: 0.90
 #   DTYPE            Default: bfloat16
+#   VLLM_VERSION     vLLM package version for uvx. Default: 0.19.1
 #   TOOL_CALL_PARSER Optional --tool-call-parser value (hermes for Qwen2.5).
 #                    Set empty to disable.  Default: hermes
 #
-# Assumes `uv pip install vllm` has run previously in this env.
 # For larger models, run under Slurm and request the appropriate GPUs.
 
 set -euo pipefail
@@ -29,6 +29,7 @@ TP="${TP:-1}"
 MAX_LEN="${MAX_LEN:-32768}"
 GPU_UTIL="${GPU_UTIL:-0.90}"
 DTYPE="${DTYPE:-bfloat16}"
+VLLM_VERSION="${VLLM_VERSION:-0.19.1}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-hermes}"
 
 echo "=== vLLM ==="
@@ -37,6 +38,7 @@ echo "  bind         : $HOST:$PORT"
 echo "  tp           : $TP"
 echo "  max_model_len: $MAX_LEN"
 echo "  dtype        : $DTYPE"
+echo "  vllm version : $VLLM_VERSION"
 echo "  parser       : ${TOOL_CALL_PARSER:-<none>}"
 echo
 echo "In your solve script, set:"
@@ -49,8 +51,7 @@ if [[ -n "$TOOL_CALL_PARSER" ]]; then
   EXTRA+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER")
 fi
 
-exec uv run python -m vllm.entrypoints.openai.api_server \
-    --model "$MODEL" \
+exec uvx --from "vllm==${VLLM_VERSION}" vllm serve "$MODEL" \
     --host "$HOST" --port "$PORT" \
     --tensor-parallel-size "$TP" \
     --max-model-len "$MAX_LEN" \

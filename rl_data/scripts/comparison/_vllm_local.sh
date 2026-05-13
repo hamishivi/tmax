@@ -51,9 +51,7 @@
 #   VLLM_VERSION           Pinned vLLM release to invoke via
 #                          `uvx --from vllm==$VLLM_VERSION vllm serve`.
 #                          Default 0.19.1 (a known-good wheel for
-#                          py3.13/cuda12.9).  Set "" to opt out of the pin
-#                          and accept the risk of a from-source rebuild
-#                          on a future vllm release.
+#                          py3.13/cuda12.9).
 #   VLLM_NIGHTLY           1 to ignore VLLM_VERSION and resolve vllm from
 #                          the nightly wheel index (https://wheels.vllm.ai/nightly).
 #                          Use this only when you specifically need a
@@ -338,7 +336,7 @@ PYEOF
 
   # ------------------------------------------------------------------
   # Pin the vLLM version that has a pre-built wheel for our toolchain.
-  # Without a pin, `uvx vllm serve` tracks the latest release; brand-new
+  # Without a pin, uvx tracks the latest release; brand-new
   # releases (we got bit by 0.20.0 on 2026-04-28) often don't ship a wheel
   # for python 3.13 / cuda 12.9 yet, in which case uv transparently *builds
   # vllm from source*, which routinely takes 15+ min and silently aborts.
@@ -348,12 +346,11 @@ PYEOF
   # into the nightly wheel index when you specifically need a bleeding-edge
   # main-branch feature.  Override either via env:
   #   VLLM_VERSION=0.19.1     -- explicit pin (default)
-  #   VLLM_VERSION=""         -- unpinned, latest stable
   #   VLLM_NIGHTLY=1          -- use vllm.ai nightly index (opt-in)
   # ------------------------------------------------------------------
   local nightly="${VLLM_NIGHTLY:-0}"
 
-  local vllm_version="${VLLM_VERSION-0.19.1}"
+  local vllm_version="${VLLM_VERSION:-0.19.1}"
   local cmd
   if [[ "$nightly" == "1" ]]; then
     # Use vLLM's nightly wheel index.  Don't pin a version (let uv pick the
@@ -363,10 +360,8 @@ PYEOF
          --prerelease=allow
          --from "vllm" vllm serve "$_VLLM_MODEL")
     vllm_version="<nightly>"
-  elif [[ -n "$vllm_version" ]]; then
-    cmd=(uvx --from "vllm==${vllm_version}" vllm serve "$_VLLM_MODEL")
   else
-    cmd=(uvx vllm serve "$_VLLM_MODEL")
+    cmd=(uvx --from "vllm==${vllm_version}" vllm serve "$_VLLM_MODEL")
   fi
   cmd+=(--host "$_VLLM_HOST"
         --port "$_VLLM_PORT"
