@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=rl-gen-sol-tt
-#SBATCH --output=logs/gen_sol_tt_%j.out
-#SBATCH --error=logs/gen_sol_tt_%j.err
+#SBATCH --job-name=rl-gen-sol-r2e
+#SBATCH --output=logs/gen_sol_r2e_%j.out
+#SBATCH --error=logs/gen_sol_r2e_%j.err
 #SBATCH --time=48:00:00
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:4
@@ -9,43 +9,44 @@
 #SBATCH --mem=480G
 
 # ╔═══════════════════════════════════════════════════════════════════════╗
-# ║  Run our solution-generation harness on the (converted) TerminalTraj  ║
-# ║  (m-a-p/TerminalTraj-5k-instances) dataset under the VANILLUX        ║
-# ║  harness, using the uniform comparison config (NUM_SOLUTIONS=8,      ║
-# ║  MAX_ACTIONS=64, COMMAND_TIMEOUT=600, SAMPLE_SIZE=250, fixed         ║
-# ║  SAMPLE_SEED=0).                                                      ║
+# ║  Run our solution-generation harness on the (converted) R2E Gym       ║
+# ║  (hamishivi/agent-task-r2e-gym) dataset under the VANILLUX harness,   ║
+# ║  using the uniform comparison config (NUM_SOLUTIONS=8, MAX_ACTIONS=64,║
+# ║  COMMAND_TIMEOUT=600, SAMPLE_SIZE=250, fixed SAMPLE_SEED=0).          ║
 # ║                                                                        ║
 # ║  Output: per-task                                                      ║
 # ║    <task>/solutions/<MODEL_TAG>_vanillux_summary.json                  ║
 # ║                                                                        ║
-# ║  Prerequisite: run rl_data/scripts/comparison/run_ingest_terminaltraj.sh
-# ║  once to populate TASKS_DIR (downloads + extracts the 13 MB tarball). ║
+# ║  Prerequisite: run rl_data/scripts/comparison/run_ingest_r2e_gym.sh   ║
+# ║  once to extract 8,101 tasks into TASKS_DIR (downloads + extracts the ║
+# ║  14 MB task-data.tar.gz).                                              ║
 # ║                                                                        ║
-# ║  WRINKLES SPECIFIC TO TERMINALTRAJ:                                   ║
+# ║  WRINKLES SPECIFIC TO R2E GYM:                                        ║
 # ║                                                                        ║
-# ║  1. Every task has a UNIQUE Docker Hub image (yizhilll/tb_container- ║
-# ║     <md5>:tmux_asciinema_v2) -- 5,660 distinct ~400 MB images. We     ║
-# ║     cannot prebuild a shared base SIF like we do for TermiGen; each  ║
-# ║     per-task SIF starts from its own FROM layer.                     ║
+# ║  1. Every task has a UNIQUE Docker Hub image                           ║
+# ║     (namanjain12/<repo>_final:<commit>) -- 8,101 distinct images,    ║
+# ║     ~400-800 MB compressed each. We cannot prebuild a shared base    ║
+# ║     SIF; each per-task SIF starts from its own FROM layer.           ║
 # ║                                                                        ║
-# ║  2. The base images span many distros (Debian/Ubuntu/Fedora/Alpine/ ║
-# ║     ...). Some have old glibc that is INCOMPATIBLE with Apptainer's  ║
-# ║     bundled `fakeroot` binary (e.g. Fedora 27 -> /.singularity.d/    ║
-# ║     libs/faked: GLIBC_2.33 not found). We therefore run the SIF      ║
-# ║     builds with `--ignore-fakeroot-command` so Apptainer falls back  ║
-# ║     to its root-mapped-namespace implementation instead. Since       ║
-# ║     generate_solutions.build_sif() does NOT pass that flag today, we ║
-# ║     PRE-BUILD the per-task SIFs here (with the flag) before handing  ║
-# ║     off to the harness, which then skips the build because the       ║
-# ║     container.sif file already exists.                                ║
+# ║  2. R2E images bake the repo at the buggy commit at /testbed, with   ║
+# ║     a project-local virtualenv at /testbed/.venv. The instruction    ║
+# ║     itself tells the agent to ``cd /testbed && source .venv/bin/     ║
+# ║     activate``; the harness lands the agent in /home/user (writable  ║
+# ║     tmpfs) per the standard convention, and the agent navigates.     ║
 # ║                                                                        ║
-# ║  3. The base images lack pytest. The adapter has already injected a  ║
-# ║     robust pytest-bootstrap %post (tries pip3 -> apt-get/dnf/apk ->  ║
-# ║     get-pip.py), so the SIFs we build here ship with pytest baked   ║
-# ║     in and `apptainer exec <sif> pytest ...` just works.             ║
+# ║  3. The adapter has already injected a robust pytest-bootstrap       ║
+# ║     %post (the same one TerminalTraj uses) so the SIFs ship with a   ║
+# ║     pytest on global PATH -- the harness's `pytest pytest_final_    ║
+# ║     state.py` invocation runs OUTSIDE /testbed/.venv and needs that. ║
 # ║                                                                        ║
-# ║  4. DISK: 5,660 SIFs × ~500 MB ≈ 2.8 TB. SAMPLE_SIZE=250 (the new    ║
-# ║     uniform-comparison default) caps this to ~125 GB.                 ║
+# ║  4. Some R2E base images may have old glibc incompatible with        ║
+# ║     Apptainer's bundled fakeroot. We pre-build with                  ║
+# ║     --ignore-fakeroot-command (as TerminalTraj does); the harness's  ║
+# ║     own build step then short-circuits because the SIF already       ║
+# ║     exists.                                                            ║
+# ║                                                                        ║
+# ║  5. DISK: 8,101 SIFs × ~600 MB ≈ 4.9 TB. SAMPLE_SIZE=250 (uniform    ║
+# ║     comparison default) caps this to ~150 GB.                         ║
 # ╚═══════════════════════════════════════════════════════════════════════╝
 
 set -euo pipefail
@@ -55,10 +56,8 @@ set -euo pipefail
 # already-`source ~/.tmax_secrets`'d interactive shell, the sbatch job
 # inherits a stripped login env that does NOT have GEMINI_API_KEY set,
 # which causes generate_solutions to silently fall back to anonymous /
-# unauthenticated requests (= 100% LLM-call failures, no summaries
-# written, 0 useful work done over the entire 48h wall-time). Sourcing
-# the secrets file here is idempotent and is a no-op for shells that
-# have already sourced it.
+# unauthenticated requests (= 100% LLM-call failures over the entire wall
+# time). Sourcing the secrets file here is idempotent.
 if [[ -f "$HOME/.tmax_secrets" ]]; then
   # shellcheck disable=SC1091
   source "$HOME/.tmax_secrets"
@@ -67,27 +66,27 @@ fi
 export GEMINI_API_KEY
 
 # ---- Parameters (edit here) ----
-TASKS_DIR="rl_data/output/tasks_terminaltraj"
+TASKS_DIR="rl_data/output/tasks_r2e_gym"
 # Override via env. Examples:
 #   API model:   MODEL="gemini/gemini-3-flash-preview"
 #   Local vLLM:  MODEL="hosted_vllm/Qwen/Qwen2.5-Coder-7B-Instruct" \
 #                HOSTED_VLLM_API_BASE="http://localhost:8000/v1"
 MODEL="${MODEL:-gemini/gemini-3-flash-preview}"
-# Solution-sampling harness. See run_generate_solutions_et.sh for the 0515
-# rebase rationale; every comparison baseline is now vanillux by default.
+# Solution-sampling harness. Every comparison baseline is vanillux by default
+# under the 0515 rebase (see run_generate_solutions_et.sh header).
 HARNESS="${HARNESS:-vanillux}"
-# 8 attempts/task = pass@1/4/8 in one run. Uniform across all 5 datasets.
+# 8 attempts/task = pass@1/4/8 in one run. Uniform across all baselines.
 NUM_SOLUTIONS="${NUM_SOLUTIONS:-8}"
 # 64 = vanillux convention; the mini-swe-agent prompts need the larger budget.
 MAX_ACTIONS="${MAX_ACTIONS:-64}"
-# MAX_TOKENS is the per-turn generation cap.  Gemini default 65536; auto-capped
+# MAX_TOKENS is the per-turn generation cap. Gemini default 65536; auto-capped
 # to VLLM_MAX_LEN-safety_margin when LAUNCH_VLLM=1 (see _vllm_wait_ready_local).
 MAX_TOKENS="${MAX_TOKENS:-65536}"
 NUM_TASKS=999999
 START_AT=0
 SOLUTION_TEMPERATURE=0.7
-# 600s matches the vanillux reference script (was 60 pre-0515; insufficient
-# under 8-way parallelism on these heterogeneous base images).
+# 600s matches the vanillux reference: R2E tasks involve a real pytest suite
+# over a real repo (sympy/pandas/...), which can be heavy under parallelism.
 COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-600}"
 SHELL_INIT_TIMEOUT=240
 SHELL_INIT_ATTEMPTS=3
@@ -97,19 +96,19 @@ FORCE_RERUN=0
 LOG_COMMANDS=0
 DISABLE_TERMINAL_LOG=0
 
-# Cost-bounded subsample: 250 tasks (uniform across all 5 datasets, down from
-# 500 in the pre-0515 TT-only run). Fixed seed=0 so the same 250 TT tasks are
-# picked on every rerun.  Disk budget: 250 × ~500MB SIFs ≈ 125 GB.
+# Cost-bounded subsample: 250 tasks (uniform across all baselines). Fixed
+# seed=0 so the same 250 R2E tasks are picked on every rerun. Disk budget:
+# 250 × ~600 MB SIFs ≈ 150 GB.
 SAMPLE_SIZE="${SAMPLE_SIZE:-250}"
 SAMPLE_SEED="${SAMPLE_SEED:-0}"
 
-# WORKERS = concurrent TASKS processed at once.  NUM_POOL_WORKERS = concurrent
-# solutions/env operations within a single task.  Both env-overridable.
+# WORKERS = concurrent TASKS processed at once. NUM_POOL_WORKERS = concurrent
+# solutions/env operations within a single task. Both env-overridable.
 WORKERS="${WORKERS:-12}"
 NUM_POOL_WORKERS="${NUM_POOL_WORKERS:-16}"
 
 # Pre-build phase: how many SIFs to build in parallel. Each build pulls a
-# ~400 MB Docker image, so mostly I/O-bound. 4-8 workers is the sweet spot;
+# ~600 MB Docker image, so mostly I/O-bound. 4-8 workers is the sweet spot;
 # higher values saturate the shared apptainer cache on GPFS and the link.
 PREBUILD_WORKERS="${PREBUILD_WORKERS:-4}"
 PREBUILD_RETRIES="${PREBUILD_RETRIES:-2}"
@@ -123,17 +122,16 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$PROJECT_ROOT"
 mkdir -p logs
 
-# In-job vLLM bring-up. No-op unless LAUNCH_VLLM=1. See run_generate_solutions_et.sh
-# header for the rationale; we kick it off pre-prebuild so weight loading
-# overlaps with the (slow) per-task SIF prebuild, then block on readiness
-# right before the solver call.
+# In-job vLLM bring-up. No-op unless LAUNCH_VLLM=1. We kick it off pre-prebuild
+# so weight loading overlaps with the (slow) per-task SIF prebuild, then block
+# on readiness right before the solver call.
 # shellcheck source=./_vllm_local.sh
 source "$SCRIPT_DIR/_vllm_local.sh"
 _vllm_start_local
 
-# Docker Hub creds are OPTIONAL for TerminalTraj because every image is
-# PUBLIC on Docker Hub. We still pass them through if set so anonymous
-# pull rate limits (100 pulls/6h/IP) don't bite mid-run.
+# Docker Hub creds are OPTIONAL for R2E Gym because every namanjain12 image is
+# PUBLIC on Docker Hub. We still pass them through if set so anonymous pull
+# rate limits (100 pulls/6h/IP) don't bite mid-run.
 export APPTAINER_DOCKER_USERNAME="${APPTAINER_DOCKER_USERNAME:-}"
 export APPTAINER_DOCKER_PASSWORD="${APPTAINER_DOCKER_PASSWORD:-}"
 if [[ -z "$APPTAINER_DOCKER_USERNAME" ]]; then
@@ -153,16 +151,14 @@ export APPTAINER_CACHEDIR="/gpfs/projects/h2lab/osey/apptainer_cache"
 export APPTAINER_TMPDIR="/tmp/apptainer_tmp"
 mkdir -p "$APPTAINER_TMPDIR"
 
-# Some TerminalTraj base images ship a bundled
-# /.singularity.d/libs/fakeroot whose embedded glibc is incompatible with
-# the host (Fedora 27, some Alpine variants, etc.), so solve-time
+# Some R2E base images may ship a bundled /.singularity.d/libs/fakeroot
+# whose embedded glibc is incompatible with the host (mirrors the
+# TerminalTraj Fedora-27 failure mode), so solve-time
 # `apptainer instance start --fakeroot` and `apptainer exec --fakeroot`
-# crash with: FATAL: exec /.singularity.d/libs/fakeroot failed.
-# Setting this env var makes the harness add --ignore-fakeroot-command to
-# every fakeroot invocation, falling back to the user-namespace fakeroot
-# emulation that we already used during the prebuild phase.
-# (This was the root cause of 158/500 tasks failing with "Failed to
-# initialize environment" on the first gemini run.)
+# crash. Setting this env var makes the harness add
+# --ignore-fakeroot-command to every fakeroot invocation, falling back to
+# user-namespace fakeroot emulation that we already use during the
+# prebuild phase.
 export APPTAINER_IGNORE_FAKEROOT_COMMAND="${APPTAINER_IGNORE_FAKEROOT_COMMAND:-1}"
 
 # Keep apptainer instance logs off GPFS; heal dangling symlinks left behind
@@ -173,17 +169,17 @@ if [ ! -L "$HOME/.apptainer/instances" ]; then
   ln -s /tmp/apptainer_instances "$HOME/.apptainer/instances"
 fi
 
-# ---- TerminalTraj pre-build phase ---------------------------------------
+# ---- R2E Gym pre-build phase --------------------------------------------
 # The harness's build_sif() in rl_data/generate_solutions.py does not pass
-# --ignore-fakeroot-command, which some TT images (old glibc) require. We
-# resolve this by pre-building the per-task SIFs HERE with the flag; the
-# harness's pre-build then detects the existing container.sif and skips
-# its own build step.
+# --ignore-fakeroot-command, which some R2E images (old glibc) may require.
+# We resolve this by pre-building the per-task SIFs HERE with the flag; the
+# harness's pre-build then detects the existing container.sif and skips its
+# own build step.
 #
 # Compute the list of tasks we're about to solve, matching exactly what
 # generate_solutions.py will pick (same seed + size + start/num slicing).
-echo "=== TerminalTraj pre-build: computing task list ==="
-mapfile -t TT_TASKS < <(
+echo "=== R2E Gym pre-build: computing task list ==="
+mapfile -t R2E_TASKS < <(
   uv run python - <<PYEOF
 import random
 from pathlib import Path
@@ -196,7 +192,7 @@ num_tasks = $NUM_TASKS
 
 all_task_dirs = sorted(
     str(p) for p in tasks_dir.iterdir()
-    if p.is_dir() and p.name.startswith("tt_task_")
+    if p.is_dir() and p.name.startswith("r2e_")
 )
 if sample_size and sample_size > 0 and sample_size < len(all_task_dirs):
     rng = random.Random(sample_seed)
@@ -209,17 +205,17 @@ print("\n".join(window))
 PYEOF
 )
 
-TT_N="${#TT_TASKS[@]}"
-echo "=== TerminalTraj: ${TT_N} tasks selected (sample_size=${SAMPLE_SIZE}, seed=${SAMPLE_SEED}) ==="
+R2E_N="${#R2E_TASKS[@]}"
+echo "=== R2E Gym: ${R2E_N} tasks selected (sample_size=${SAMPLE_SIZE}, seed=${SAMPLE_SEED}) ==="
 
-if [ "$TT_N" = "0" ]; then
-  echo "ERROR: no TT tasks selected -- did you run run_ingest_terminaltraj.sh first?" >&2
+if [ "$R2E_N" = "0" ]; then
+  echo "ERROR: no R2E tasks selected -- did you run run_ingest_r2e_gym.sh first?" >&2
   exit 1
 fi
 
 # Build one SIF. Exits 0 on success, non-zero on failure (but never with
 # `set -e` propagation so one bad task doesn't abort the whole pre-build).
-tt_build_one() {
+r2e_build_one() {
   local task_dir="$1"
   local sif="${task_dir}/container.sif"
   local def="${task_dir}/container.def"
@@ -246,25 +242,25 @@ tt_build_one() {
   echo "  FAIL  ${tag} -- see ${task_dir}/.prebuild.log" >&2
   return 1
 }
-export -f tt_build_one
+export -f r2e_build_one
 export PREBUILD_RETRIES FORCE_RERUN
 
-echo "=== TerminalTraj pre-build: ${TT_N} SIF(s), workers=${PREBUILD_WORKERS} ==="
-TT_BUILD_LIST="$(mktemp)"
-trap 'rm -f "$TT_BUILD_LIST"' EXIT
-printf '%s\n' "${TT_TASKS[@]}" > "$TT_BUILD_LIST"
+echo "=== R2E Gym pre-build: ${R2E_N} SIF(s), workers=${PREBUILD_WORKERS} ==="
+R2E_BUILD_LIST="$(mktemp)"
+trap 'rm -f "$R2E_BUILD_LIST"' EXIT
+printf '%s\n' "${R2E_TASKS[@]}" > "$R2E_BUILD_LIST"
 
 # xargs -P parallelises; we tolerate individual failures because one bad
 # task shouldn't block the other N-1 builds. The harness will mark the
 # still-no-container.sif tasks as failed in the solution phase anyway.
-xargs -a "$TT_BUILD_LIST" -I{} -P "$PREBUILD_WORKERS" \
-  bash -c 'tt_build_one "$@"' _ {} || true
+xargs -a "$R2E_BUILD_LIST" -I{} -P "$PREBUILD_WORKERS" \
+  bash -c 'r2e_build_one "$@"' _ {} || true
 
 _BUILT=0
-for td in "${TT_TASKS[@]}"; do
+for td in "${R2E_TASKS[@]}"; do
   [ -f "${td}/container.sif" ] && _BUILT=$((_BUILT + 1))
 done
-echo "=== TerminalTraj pre-build done: ${_BUILT}/${TT_N} SIFs ready ==="
+echo "=== R2E Gym pre-build done: ${_BUILT}/${R2E_N} SIFs ready ==="
 
 # ---- Solution phase -----------------------------------------------------
 _vllm_wait_ready_local
@@ -293,7 +289,7 @@ if [[ "${DISABLE_TERMINAL_LOG:-0}" != "1" ]]; then
   EXTRA_ARGS+=(--terminal-log "$TL")
 fi
 
-echo "=== TerminalTraj comparison run: MODEL=${MODEL}, HARNESS=${HARNESS}, WORKERS=${WORKERS}, NUM_SOLUTIONS=${NUM_SOLUTIONS}, SAMPLE_SIZE=${SAMPLE_SIZE} ==="
+echo "=== R2E Gym comparison run: MODEL=${MODEL}, HARNESS=${HARNESS}, WORKERS=${WORKERS}, NUM_SOLUTIONS=${NUM_SOLUTIONS}, SAMPLE_SIZE=${SAMPLE_SIZE} ==="
 echo "=== Concurrent containers: $(( WORKERS * NUM_SOLUTIONS )) ==="
 
 uv run python -m rl_data.generate_solutions \

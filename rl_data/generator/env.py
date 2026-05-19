@@ -456,6 +456,8 @@ class InteractiveContainerEnvironment:
         copy_cmd = [
             "apptainer", "exec",
             *_fakeroot_flags(), "--userns", "--writable-tmpfs", "--cleanenv",
+            # See _start_instance for the --no-home rationale (R2E Gym bug).
+            "--no-home",
             "--bind", f"{dest}:{inner_mount}",
             str(sif_for_materialize),
             "/bin/sh", "-c", f"cp -a /home/user/. {inner_mount}/",
@@ -491,6 +493,8 @@ class InteractiveContainerEnvironment:
         exec_cmd = [
             "apptainer", "exec",
             *_fakeroot_flags(), "--userns", "--writable-tmpfs", "--cleanenv",
+            # See _start_instance for the --no-home rationale (R2E Gym bug).
+            "--no-home",
             "--pwd", "/home/user",
             "--bind", f"{self._writable_home_path}:/home/user",
             "--bind", f"{self.temp_dir}:{self.temp_dir}",
@@ -563,6 +567,23 @@ class InteractiveContainerEnvironment:
             *_fakeroot_flags(),
             "--userns",
             "--writable-tmpfs",
+            # Suppress Apptainer's default $HOME auto-mount. Under --fakeroot
+            # the host user (UID `osey`) is mapped to UID 0 inside the
+            # container, so Apptainer's "mount $HOME -> $HOME" default ends
+            # up bind-mounting /gpfs/home/osey over /root, hiding whatever
+            # the base image stored there. Most adapters did not notice
+            # because their images keep nothing important under /root, but
+            # R2E Gym (hamishivi/agent-task-r2e-gym) bakes its uv-managed
+            # Python at /root/.local/share/uv/python/cpython-3.10.16/...,
+            # which /testbed/.venv/bin/python3 follows transitively. Once
+            # /root is shadowed, every `pytest` invocation through the venv
+            # fails with `bad interpreter: /testbed/.venv/bin/python3:
+            # No such file or directory`, the harness's final-state pytest
+            # wrapper crashes before reaching the per-task verifier, and the
+            # task is recorded as a failure. The harness already explicitly
+            # bind-mounts a writable /home/user from the host, so suppressing
+            # the implicit $HOME mount is safe across every adapter.
+            "--no-home",
             "--bind", f"{self.temp_dir}:{self.temp_dir}",
             "--bind", f"{self._writable_home_path}:/home/user",
             "--cleanenv",

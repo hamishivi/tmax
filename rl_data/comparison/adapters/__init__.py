@@ -433,4 +433,5 @@ from rl_data.comparison.adapters import (  # noqa: E402, F401
     openthoughts_agent_rl,
     termigen,
     terminaltraj,
+    r2e_gym,
 )

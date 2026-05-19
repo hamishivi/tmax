@@ -283,11 +283,19 @@ def classify_tasks_dir(
     logger.info("taxonomy: dispatching %d LLM calls via %s (max_concurrency=%d)",
                 len(batched), model, max_concurrency)
 
+    # NOTE: 256 was enough for non-thinking models (the JSON payload itself
+    # is ~250 chars / ~80 tokens). Reasoning models such as
+    # ``gemini-3-flash-preview`` consume the budget on hidden thinking
+    # tokens FIRST, so 256 truncates the final JSON mid-string ->
+    # ``finish_reason == "length"`` and the response is unparseable.
+    # 2048 was empirically sufficient: same task that finished at 80 chars
+    # with mt=512 returns a complete 236-char JSON at mt=2048 with
+    # ``finish_reason == "stop"``.
     responses = chat_completion_batch(
         batched,
         model=model,
         temperature=temperature,
-        max_tokens=256,
+        max_tokens=2048,
         max_concurrency=max_concurrency,
         show_progress=True,
     )

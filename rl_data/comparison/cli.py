@@ -70,6 +70,7 @@ _DISPLAY_NAMES = {
     "openthoughts_agent_rl": "OpenThoughts-Agent-v1-RL",
     "termigen": "TermiGen",
     "terminaltraj": "TerminalTraj",
+    "r2e_gym": "R2E-Gym",
 }
 
 
