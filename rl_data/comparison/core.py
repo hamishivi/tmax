@@ -315,7 +315,15 @@ def grouped_bar(
                 )
 
     ax.set_xticks(x)
-    ax.set_xticklabels(categories, rotation=30, ha="right")
+    # Render bucket keys as human-readable labels (``data_science`` ->
+    # ``Data science``) instead of dumping the canonical snake_case keys.
+    # ``pretty_label`` is imported lazily to avoid a styles<->core import
+    # cycle should styles ever grow a core-dependent helper.
+    from rl_data.comparison.styles import pretty_label as _pretty_label
+    ax.set_xticklabels(
+        [_pretty_label(c) for c in categories],
+        rotation=30, ha="right",
+    )
     ax.set_ylabel(ylabel)
     ax.set_title(title, fontweight="bold")
     if ylim is not None:

@@ -47,7 +47,10 @@ ET_TASKS_DIR="${ET_TASKS_DIR:-rl_data/output/tasks_endless_terminals}"
 OT_TASKS_DIR="${OT_TASKS_DIR:-rl_data/output/tasks_openthoughts_agent_rl}"
 TG_TASKS_DIR="${TG_TASKS_DIR:-rl_data/output/tasks_termigen}"
 TT_TASKS_DIR="${TT_TASKS_DIR:-rl_data/output/tasks_terminaltraj}"
-R2E_TASKS_DIR="${R2E_TASKS_DIR:-rl_data/output/tasks_r2e_gym}"
+# R2E-Gym is intentionally OFF by default for the v2 (post-0517) writeup; the
+# HF dataset was rebuilt mid-flight and the re-solve hasn't completed. Re-enable
+# by passing ``R2E_TASKS_DIR=rl_data/output/tasks_r2e_gym``.
+R2E_TASKS_DIR="${R2E_TASKS_DIR-}"
 COMPARE_OUT_DIR="${COMPARE_OUT_DIR:-rl_data/output/comparison_vanillux_0515}"
 MODEL="${MODEL:-gemini/gemini-3-flash-preview}"
 HARNESS="${HARNESS:-vanillux}"
@@ -148,7 +151,7 @@ if [[ "${SKIP_COMPARE:-0}" != "1" ]]; then
   if [[ -d "$TT_TASKS_DIR" ]]; then
     BASELINE_ARGS+=(--baseline "terminaltraj:$TT_TASKS_DIR")
   fi
-  if [[ -d "$R2E_TASKS_DIR" ]]; then
+  if [[ -n "$R2E_TASKS_DIR" && -d "$R2E_TASKS_DIR" ]]; then
     BASELINE_ARGS+=(--baseline "r2e_gym:$R2E_TASKS_DIR")
   fi
 

@@ -61,10 +61,13 @@ from rl_data.comparison.core import (
     write_csv,
 )
 from rl_data.comparison.styles import (
+    PassAtKOverlayStyle,
     StackedCompositionStyle,
+    default_pass_at_k_overlay_style,
     default_stacked_style,
     is_dark_color,
     palette_colors,
+    pretty_label,
 )
 from rl_data.analyze import _PRICING, _estimate_cost
 
@@ -192,26 +195,73 @@ def module_difficulty(ctx: RunContext) -> Dict[str, Any]:
 
     if curves:
         ks = sorted(ks_union)
-        fig, ax = plt.subplots(figsize=(7, 4.5))
-        rows: List[Dict[str, Any]] = []
-        for spec in ctx.specs:
-            c = curves.get(spec.name)
-            if not c:
-                continue
-            ys = [c.get(k, float("nan")) for k in ks]
-            ax.plot(ks, ys, "o-", color=spec.color, label=spec.display_name, linewidth=2)
-            for k, y in zip(ks, ys):
-                rows.append({"dataset": spec.name, "k": k, "mean_pass_at_k": y})
-        ax.set_xlabel("k")
-        ax.set_ylabel("mean pass@k")
-        ax.set_ylim(0, 1.05)
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-        ax.set_title("Pass@k curves", fontweight="bold")
-        save_fig_with_data(
-            fig, rows, ctx.appendix_dir / "difficulty_pass_at_k_overlay",
-            fieldnames=["dataset", "k", "mean_pass_at_k"],
-        )
+        # Pull dataset colours from the same palette family as the stacked
+        # composition figure so the pass@k overlay reads as part of the same
+        # figure suite in the writeup. We allocate one palette slot per
+        # *plotted* spec (not every spec — some may have no curve), to keep
+        # neighbouring lines on visually distinct hues even when a dataset
+        # drops out (e.g. when R2E-Gym is excluded).
+        style = default_pass_at_k_overlay_style()
+        plotted_specs = [s for s in ctx.specs if curves.get(s.name)]
+        line_colors = palette_colors(style.palette_name, max(len(plotted_specs), 1))
+
+        rc_overrides = {
+            "text.usetex": style.use_tex,
+            "font.family": style.font_family,
+            "font.serif": list(style.font_serif),
+            "font.size": style.font_size,
+            "axes.titlesize": style.title_size,
+            "axes.labelsize": style.axes_label_size,
+            "xtick.labelsize": style.tick_size,
+            "ytick.labelsize": style.tick_size,
+            "legend.fontsize": style.legend_size,
+            "axes.spines.top": style.show_top_right_spines,
+            "axes.spines.right": style.show_top_right_spines,
+        }
+
+        with plt.rc_context(rc_overrides):
+            fig, ax = plt.subplots(figsize=style.figsize)
+            rows: List[Dict[str, Any]] = []
+            for color, spec in zip(line_colors, plotted_specs):
+                c = curves[spec.name]
+                ys = [c.get(k, float("nan")) for k in ks]
+                ax.plot(
+                    ks, ys, "o-",
+                    color=color,
+                    label=spec.display_name,
+                    linewidth=style.line_width,
+                    markersize=style.marker_size,
+                    markerfacecolor=color,
+                    markeredgecolor=style.marker_edge_color,
+                    markeredgewidth=style.marker_edge_width,
+                )
+                for k, y in zip(ks, ys):
+                    rows.append({"dataset": spec.name, "k": k, "mean_pass_at_k": y})
+
+            ax.set_xticks(ks)
+            ax.set_xlabel(style.xlabel)
+            ax.set_ylabel(style.ylabel)
+            ax.set_ylim(*style.ylim)
+            if style.grid:
+                ax.grid(True, alpha=style.grid_alpha, linestyle=style.grid_linestyle)
+            ax.tick_params(axis="both", which="both", length=0)
+            for spine_name in ("left", "bottom"):
+                ax.spines[spine_name].set_color(style.spine_color)
+                ax.spines[spine_name].set_linewidth(style.spine_linewidth)
+            ax.set_title(
+                style.title, pad=style.title_pad,
+                fontweight=style.title_weight, loc=style.title_loc,
+            )
+            ax.legend(
+                loc=style.legend_loc, frameon=style.legend_frameon,
+                ncol=style.legend_ncol, title=style.legend_title,
+            )
+            fig.tight_layout()
+            save_fig_with_data(
+                fig, rows, ctx.appendix_dir / "difficulty_pass_at_k_overlay",
+                fieldnames=["dataset", "k", "mean_pass_at_k"],
+                dpi=style.dpi, also_pdf=style.save_pdf,
+            )
 
     # ---- APPENDIX: turn CDF ---------------------------------------------
     fig, ax = plt.subplots(figsize=(7, 4.5))
@@ -585,7 +635,10 @@ def _render_ridgeline(
         ax.grid(False)
 
     axes[-1].set_xticks(x)
-    axes[-1].set_xticklabels(order, rotation=30, ha="right", fontsize=9)
+    axes[-1].set_xticklabels(
+        [pretty_label(b) for b in order],
+        rotation=30, ha="right", fontsize=9,
+    )
     axes[-1].set_xlabel(xlabel)
     axes[0].set_title(title, fontweight="bold", loc="left")
 
@@ -631,7 +684,7 @@ def _render_radar(
         ax.fill(angles, y, color=spec.color, alpha=0.18)
 
     ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(order, fontsize=9)
+    ax.set_xticklabels([pretty_label(b) for b in order], fontsize=9)
     ax.tick_params(axis="y", labelsize=8, colors="#888")
     ax.set_title(title, fontweight="bold", pad=20)
     ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.1), fontsize=9)
@@ -720,10 +773,14 @@ def _render_stacked_composition(
         for j, bucket in enumerate(order):
             seg = np.array([values[s.name][bucket] for s in specs], dtype=float)
             color = colors[j]
+            # ``bucket`` is the canonical key (e.g. ``software_engineering``);
+            # we keep it as the matplotlib label internally so legend handle
+            # de-duplication still works, but render the human-readable form
+            # in the actual legend draw below via ``pretty_label``.
             bars = ax.bar(
                 x, seg, width=style.bar_width, bottom=bottoms,
                 color=color, edgecolor=style.bar_edge_color,
-                linewidth=style.bar_edge_linewidth, label=bucket,
+                linewidth=style.bar_edge_linewidth, label=pretty_label(bucket),
             )
             if style.annotate_segments:
                 text_color = (

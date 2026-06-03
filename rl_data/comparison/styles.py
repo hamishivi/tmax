@@ -257,6 +257,104 @@ def default_stacked_style(**overrides) -> StackedCompositionStyle:
     return style
 
 
+# ---------------------------------------------------------------------------
+# PassAtKOverlayStyle — pass@k curves matched to the stacked-composition look
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PassAtKOverlayStyle:
+    """Typography + palette knobs for the pass@k overlay plot.
+
+    Mirrors :class:`StackedCompositionStyle`'s typographic intent (DejaVu
+    Serif, no top/right spines, bold centered title, light gray spines) but
+    has its own layout knobs (line/marker sizing, legend placement) suited
+    to a multi-line overlay rather than a stacked bar.  Dataset colours
+    are pulled from the same palette family as the stacked figure so the
+    two read as a coordinated pair in a paper.
+    """
+
+    font_family: str = "serif"
+    font_serif: Sequence[str] = field(default_factory=lambda: ["DejaVu Serif"])
+    font_size: float = 14.0
+    title_size: float = 20.0
+    axes_label_size: float = 15.0
+    tick_size: float = 13.0
+    legend_size: float = 12.0
+    use_tex: bool = False
+
+    figsize: Tuple[float, float] = (8.0, 5.5)
+    show_top_right_spines: bool = False
+    spine_color: str = "#808080"
+    spine_linewidth: float = 1.25
+    grid: bool = True
+    grid_alpha: float = 0.25
+    grid_linestyle: str = "--"
+
+    palette_name: str = "anthropic_book"
+    line_width: float = 2.4
+    marker_size: float = 7.0
+    marker_edge_color: str = "white"
+    marker_edge_width: float = 1.0
+
+    title: str = "Pass@k curves"
+    title_pad: float = 16.0
+    title_weight: str = "bold"
+    title_loc: str = "center"
+    xlabel: str = "k"
+    ylabel: str = "Mean pass@k"
+    ylim: Tuple[float, float] = (0.0, 1.05)
+
+    legend_loc: str = "lower right"
+    legend_frameon: bool = False
+    legend_ncol: int = 1
+    legend_title: Optional[str] = None
+
+    dpi: int = 200
+    save_pdf: bool = True
+
+
+def default_pass_at_k_overlay_style(**overrides) -> PassAtKOverlayStyle:
+    """Return a :class:`PassAtKOverlayStyle`, applying any field overrides."""
+    style = PassAtKOverlayStyle()
+    for k, v in overrides.items():
+        if not hasattr(style, k):
+            raise AttributeError(
+                f"PassAtKOverlayStyle has no field {k!r}; "
+                f"check rl_data/comparison/styles.py for the canonical list."
+            )
+        setattr(style, k, v)
+    return style
+
+
+# ---------------------------------------------------------------------------
+# Label prettifier — shared across figures
+# ---------------------------------------------------------------------------
+
+
+def pretty_label(s: str) -> str:
+    """Turn a canonical bucket key into a human-readable legend label.
+
+    Rules (matches the writeup convention):
+
+    * Underscores become spaces (``software_engineering`` -> ``software
+      engineering``).
+    * Ensure the first character is upper-case (``software engineering`` ->
+      ``Software engineering``).
+    * Existing internal capitalisation is preserved, so labels that are
+      already Title-Cased in the source vocab (``Data Processing``,
+      ``Multi-Language``) are left alone.  This is important because the
+      skill-type vocab is already Title Case while domain keys are not.
+
+    Non-string inputs are returned unchanged via ``str()`` coercion so the
+    helper is safe to call on any axis label.
+    """
+    out = str(s).replace("_", " ")
+    if out and out[0].islower():
+        out = out[0].upper() + out[1:]
+    return out
+
+
 __all__ = [
     "PALETTES",
     "list_palettes",
@@ -265,4 +363,7 @@ __all__ = [
     "is_dark_color",
     "StackedCompositionStyle",
     "default_stacked_style",
+    "PassAtKOverlayStyle",
+    "default_pass_at_k_overlay_style",
+    "pretty_label",
 ]

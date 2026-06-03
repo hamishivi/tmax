@@ -49,6 +49,7 @@ from rl_data.comparison.modules import (
     module_realism,
     module_verifier,
 )
+from rl_data.comparison.styles import pretty_label
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +64,16 @@ ALL_MODULES = {
 
 
 # Pretty display names per stable adapter name.
+#
+# These names are user-facing only (legends, summary tables, axis ticks).
+# The internal adapter / directory names (``skill_tax``, ``openthoughts_agent_rl``)
+# stay unchanged so existing artefacts (task dirs, summary files, CSVs that key
+# off ``dataset`` columns) keep working without a migration.
 _DISPLAY_NAMES = {
-    "skill_tax": "Skill-Tax (ours)",
+    "skill_tax": "TMaxx (ours)",
     "endless_terminals": "Endless-Terminals",
     "openthoughts_tb": "OpenThoughts-TB",
-    "openthoughts_agent_rl": "OpenThoughts-Agent-v1-RL",
+    "openthoughts_agent_rl": "OpenThoughts-Agent",
     "termigen": "TermiGen",
     "terminaltraj": "TerminalTraj",
     "r2e_gym": "R2E-Gym",
@@ -310,7 +316,7 @@ def _write_summary_table(report: Dict[str, Any], specs: List[DatasetSpec],
             for b in buckets:
                 vals = {n: (pct.get(n, {}) or {}).get(b, 0.0) for n in names}
                 _csv(f"composition_{field_key}", b, vals)
-                L.append("| " + b + " | " +
+                L.append("| " + pretty_label(b) + " | " +
                          " | ".join(f"{vals[n]:.1f}%" for n in names) + " |")
             if p_ref:
                 L.append("\nChi-squared p-values vs "
