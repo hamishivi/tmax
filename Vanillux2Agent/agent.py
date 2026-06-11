@@ -48,6 +48,8 @@ ABORT_EXCEPTIONS = (
 
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 2.0
+LLM_TIMEOUT_SECONDS = 5 * 60 * 60
+LLM_OUTER_TIMEOUT_BUFFER_SECONDS = 30
 _STATE_DIR = "/tmp/.vanillux2"
 _COMPOSE_PROVIDER_RE = re.compile(
     r"\x1b\[4m>>>> Executing external compose provider "
@@ -76,7 +78,7 @@ class Vanillux2Agent(BaseAgent):
         model_name: str | None = None,
         max_steps: int = 64,
         temperature: float = 0.7,
-        top_p: float = 0.95,
+        top_p: float | None = 0.95,
         max_tokens: int = 16384,
         cost_limit: float = 0.0,
         api_base: str | None = None,
@@ -239,14 +241,29 @@ class Vanillux2Agent(BaseAgent):
         )
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                return await litellm.acompletion(
-                    model=model,
-                    messages=messages,
-                    tools=TOOL_SCHEMAS,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    max_tokens=self.max_tokens,
-                    api_base=api_base,
+                llm_timeout = LLM_TIMEOUT_SECONDS
+                completion_kwargs: dict[str, Any] = {
+                    "model": model,
+                    "messages": messages,
+                    "tools": TOOL_SCHEMAS,
+                    "max_tokens": self.max_tokens,
+                    "api_base": api_base,
+                    "timeout": llm_timeout,
+                    "request_timeout": llm_timeout,
+                    "num_retries": 0,
+                }
+                if self.temperature is not None:
+                    completion_kwargs["temperature"] = self.temperature
+                if self.top_p is not None and not (
+                    model.startswith("anthropic/") and self.temperature is not None
+                ):
+                    completion_kwargs["top_p"] = self.top_p
+                return await asyncio.wait_for(
+                    asyncio.to_thread(
+                        litellm.completion,
+                        **completion_kwargs,
+                    ),
+                    timeout=llm_timeout + LLM_OUTER_TIMEOUT_BUFFER_SECONDS,
                 )
             except ABORT_EXCEPTIONS:
                 raise
