@@ -352,16 +352,21 @@ PYEOF
 
   local vllm_version="${VLLM_VERSION:-0.19.1}"
   local cmd
+  # Pin fastapi < 0.137: 0.137 changed the router internals and breaks
+  # prometheus-fastapi-instrumentator (mounted by vLLM on every route), making
+  # the API server 500 on every request including /v1/models.
+  # See vllm-project/vllm#45596 and #45597.
   if [[ "$nightly" == "1" ]]; then
     # Use vLLM's nightly wheel index.  Don't pin a version (let uv pick the
     # latest available).  Also force --prerelease=allow so uv accepts
     # `0.21.0.dev123+...` style nightly versions.
     cmd=(uvx --extra-index-url "https://wheels.vllm.ai/nightly"
          --prerelease=allow
+         --with "fastapi<0.137"
          --from "vllm" vllm serve "$_VLLM_MODEL")
     vllm_version="<nightly>"
   else
-    cmd=(uvx --from "vllm==${vllm_version}" vllm serve "$_VLLM_MODEL")
+    cmd=(uvx --with "fastapi<0.137" --from "vllm==${vllm_version}" vllm serve "$_VLLM_MODEL")
   fi
   cmd+=(--host "$_VLLM_HOST"
         --port "$_VLLM_PORT"

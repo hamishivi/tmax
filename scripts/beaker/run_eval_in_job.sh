@@ -7,6 +7,7 @@
 #   MODEL_PATH               HF model path or weka path (required)
 #   MODEL_REVISION           HF revision/branch (default: main)
 #   SERVED_MODEL_NAME        --served-model-name for vLLM (required)
+#   HARBOR_MODEL_NAME        optional model name passed to harbor
 #   VLLM_VERSION             vLLM package version for uvx (default: 0.19.1)
 #   VLLM_TOOL_CALL_PARSER    vLLM tool parser (default: hermes)
 #   VLLM_LANGUAGE_MODEL_ONLY pass --language_model_only to vLLM when set to 1
@@ -15,9 +16,15 @@
 #   DP_SIZE                  --data-parallel-size (default: 1)
 #   MAX_MODEL_LEN            optional --max-model-len
 #   DATASET                  harbor dataset, e.g. terminal-bench@2.0
+#   HARBOR_ENV               harbor environment backend (default: docker)
 #   AGENT_IMPORT_PATH        e.g. VanilluxAgent:VanilluxAgent
+#   EXTRA_UV_PIP_INSTALLS    optional space-separated packages to uv pip install
+#   EXTRA_AGENT_KWARGS       optional newline-separated harbor --agent-kwarg values
+#   EXTRA_AGENT_ENVS         optional newline-separated harbor --agent-env values
+#   HOSTED_VLLM_MODEL_INFO   optional JSON model_info for Harbor agents
 #   N_CONCURRENT             default 8
 #   N_ATTEMPTS               default 1
+#   N_TASKS                  optional harbor --n-tasks limit
 #   JOB_NAME                 harbor job name
 #   RESULTS_DIR              /weka path to copy jobs/$JOB_NAME into
 #   REPO_GIT_URL, REPO_GIT_REF
@@ -102,6 +109,15 @@ if ! command -v uv >/dev/null 2>&1; then
     export PATH="$HOME/.local/bin:$PATH"
 fi
 uv sync
+if [ "${HARBOR_ENV:-docker}" = "daytona" ]; then
+    log "installing harbor daytona extra"
+    uv pip install 'harbor[daytona]'
+fi
+if [ -n "${EXTRA_UV_PIP_INSTALLS:-}" ]; then
+    log "installing extra packages: ${EXTRA_UV_PIP_INSTALLS}"
+    # shellcheck disable=SC2086
+    uv pip install ${EXTRA_UV_PIP_INSTALLS}
+fi
 
 log "patching harbor for podman compat"
 uv run python - <<'PY'
@@ -187,6 +203,121 @@ if '["down", "--rmi", "all", "--volumes", "--remove-orphans"]' in text:
     )
     docker_py.write_text(text)
     print("patched docker.py: dropped --rmi all from compose down")
+
+# Let launch_eval pass Mini SWE config overrides without replacing the entire
+# mini-swe-agent YAML. Passing a bare config_file with only agent.step_limit
+# replaces required templates, so use the CLI's dotted override form instead.
+mini_swe_py = hdir / "agents/installed/mini_swe_agent.py"
+text = mini_swe_py.read_text()
+if "self._step_limit = step_limit" not in text:
+    text = text.replace(
+        "        config_file: str | None = None,\n"
+        "        *args,\n",
+        "        config_file: str | None = None,\n"
+        "        step_limit: int | None = None,\n"
+        "        *args,\n",
+    )
+    text = text.replace(
+        "        self._reasoning_effort = reasoning_effort\n"
+        "        self._config_yaml: str | None = None\n",
+        "        self._reasoning_effort = reasoning_effort\n"
+        "        self._step_limit = step_limit\n"
+        "        self._config_yaml: str | None = None\n",
+    )
+    text = text.replace(
+        "        if self._reasoning_effort:\n"
+        "            config_flags += f\"-c model.model_kwargs.extra_body.reasoning_effort={shlex.quote(self._reasoning_effort)} \"\n",
+        "        if self._reasoning_effort:\n"
+        "            config_flags += f\"-c model.model_kwargs.extra_body.reasoning_effort={shlex.quote(self._reasoning_effort)} \"\n"
+        "        if self._step_limit is not None:\n"
+        "            config_flags += f\"-c agent.step_limit={int(self._step_limit)} \"\n",
+    )
+    mini_swe_py.write_text(text)
+    print("patched mini_swe_agent.py: added step_limit override")
+
+# The mini-swe-agent CLI treats any `-c ...` as the complete config spec list;
+# a dotted-only override like `-c agent.step_limit=64` does not layer on top of
+# the packaged `mini.yaml`. Build a full config from the installed `mini.yaml`
+# inside the task container whenever step_limit is requested.
+text = mini_swe_py.read_text()
+if "MSWEA_FULL_CONFIG_EOF_" not in text:
+    text = text.replace(
+        "        if self._reasoning_effort:\n"
+        "            config_flags += f\"-c model.model_kwargs.extra_body.reasoning_effort={shlex.quote(self._reasoning_effort)} \"\n"
+        "        if self._step_limit is not None:\n"
+        "            config_flags += f\"-c agent.step_limit={int(self._step_limit)} \"\n",
+        "        if self._reasoning_effort:\n"
+        "            config_flags += f\"-c model.model_kwargs.extra_body.reasoning_effort={shlex.quote(self._reasoning_effort)} \"\n"
+        "        if self._step_limit is not None:\n"
+        "            config_path = \"/tmp/mswea-config/step-limit.yaml\"\n"
+        "            write_config_cmd = (\n"
+        "                \"mkdir -p /tmp/mswea-config\\n\"\n"
+        "                \". \\\"$HOME/.local/bin/env\\\"\\n\"\n"
+        "                \"MSWEA_BIN=$(readlink -f $(command -v mini-swe-agent))\\n\"\n"
+        "                \"MSWEA_PY=$(dirname \\\"$MSWEA_BIN\\\")/python\\n\"\n"
+        "                \"\\\"$MSWEA_PY\\\" - <<'MSWEA_FULL_CONFIG_EOF'\\n\"\n"
+        "                \"import importlib.util, pathlib, yaml\\n\"\n"
+        "                \"spec = importlib.util.find_spec('minisweagent')\\n\"\n"
+        "                \"base = pathlib.Path(spec.origin).parent / 'config' / 'mini.yaml'\\n\"\n"
+        "                \"cfg = yaml.safe_load(base.read_text())\\n\"\n"
+        "                f\"cfg.setdefault('agent', {{}})['step_limit'] = {int(self._step_limit)}\\n\"\n"
+        "                \"pathlib.Path('/tmp/mswea-config/step-limit.yaml').write_text(yaml.safe_dump(cfg, sort_keys=False))\\n\"\n"
+        "                \"MSWEA_FULL_CONFIG_EOF\\n\"\n"
+        "            )\n"
+        "            await self.exec_as_agent(environment, command=write_config_cmd, env=env)\n"
+        "            config_flags += f\"-c {config_path} \"\n",
+    )
+    mini_swe_py.write_text(text)
+    print("patched mini_swe_agent.py: materialize full step_limit config")
+
+# OpenHands' setup currently chains package installation with
+# `python -m openhands.core.main --version`. The latter can fail independently
+# of installation and Harbor truncates the useful tail, so do a lightweight
+# import/version probe instead and let the actual run command surface runtime
+# issues.
+openhands_py = hdir / "agents/installed/openhands.py"
+text = openhands_py.read_text()
+old = 'f"{install_cmd} && "\n                "/opt/openhands-venv/bin/python -m openhands.core.main --version"'
+new = 'f"{install_cmd} && "\n                "/opt/openhands-venv/bin/python -c \\"import openhands; print(getattr(openhands, \\\\\\"__version__\\\\\\", \\\\\\"openhands-installed\\\\\\"))\\""'
+if old in text and "openhands-installed" not in text:
+    text = text.replace(old, new)
+    openhands_py.write_text(text)
+    print("patched openhands.py: use import-based install check")
+
+text = openhands_py.read_text()
+if "uv pip install openhands " not in text:
+    text = text.replace(
+        'install_cmd = "uv pip install openhands-ai"',
+        'install_cmd = "uv pip install openhands "',
+    )
+    openhands_py.write_text(text)
+    print("patched openhands.py: install openhands CLI package")
+
+text = openhands_py.read_text()
+if '"--headless",' not in text:
+    text = text.replace(
+        '"/opt/openhands-venv/bin/python -m openhands.core.main",',
+        '"/opt/openhands-venv/bin/openhands",',
+    )
+    text = text.replace(
+        '            f"--task={escaped_instruction}",',
+        '            "--headless",\n'
+        '            f"-t={escaped_instruction}",',
+    )
+    openhands_py.write_text(text)
+    print("patched openhands.py: use headless CLI entrypoint")
+
+text = openhands_py.read_text()
+if '"--override-with-envs",' not in text:
+    text = text.replace(
+        '            "--headless",\n'
+        '            f"-t={escaped_instruction}",',
+        '            "--headless",\n'
+        '            "--override-with-envs",\n'
+        '            f"-t={escaped_instruction}",',
+    )
+    openhands_py.write_text(text)
+    print("patched openhands.py: apply env settings in headless mode")
 PY
 
 # --- 4. Bring podman service up (uses scripts/setup_podman_harbor.sh) -------
@@ -242,11 +373,18 @@ fi
 : "${DP_SIZE:=1}"
 VLLM_LOG=/tmp/vllm.log
 VLLM_LOG_TAIL_LINES="${VLLM_LOG_TAIL_LINES:-300}"
-VLLM_CMD=( uvx "vllm==${VLLM_VERSION}" serve "$MODEL_PATH"
+# Pin fastapi < 0.137: fastapi 0.137 changed the router internals and breaks
+# prometheus-fastapi-instrumentator (which vLLM mounts on every route), so the
+# API server 500s on every request including /v1/models — the readiness probe
+# below then never passes and the job is killed after 30 min.
+# See vllm-project/vllm#45596 and #45597.
+VLLM_CMD=( uvx --with "fastapi<0.137"
+           "vllm==${VLLM_VERSION}" serve "$MODEL_PATH"
            --revision "$MODEL_REVISION"
            --tokenizer-revision "$MODEL_REVISION"
            --served-model-name "$SERVED_MODEL_NAME"
            --enable-auto-tool-choice
+           --enable-prefix-caching
            --tool-call-parser "$VLLM_TOOL_CALL_PARSER"
            --port "$VLLM_PORT"
            --gpu-memory-utilization 0.85
@@ -302,15 +440,56 @@ export OPENAI_API_BASE="http://localhost:$VLLM_PORT/v1"
 # with NotFoundError: Hosted_vllmException on step 1.
 export OPENAI_BASE_URL="http://localhost:$VLLM_PORT/v1"
 
+if [ -z "${HOSTED_VLLM_MODEL_INFO:-}" ]; then
+    MODEL_INFO_MAX_INPUT_TOKENS="${MAX_MODEL_LEN:-40960}"
+    HOSTED_VLLM_MODEL_INFO="$(python3 - <<PY
+import json
+
+print(json.dumps({
+    "max_input_tokens": int("$MODEL_INFO_MAX_INPUT_TOKENS"),
+    "max_output_tokens": 8192,
+    "input_cost_per_token": 0.0,
+    "output_cost_per_token": 0.0,
+}, separators=(",", ":")))
+PY
+)"
+fi
+: "${HARBOR_MODEL_NAME:=hosted_vllm/$SERVED_MODEL_NAME}"
+
 HARBOR_CMD=( uv run harbor run
              --dataset "$DATASET"
-             --agent-import-path "$AGENT_IMPORT_PATH"
-             --model "hosted_vllm/$SERVED_MODEL_NAME"
-             --env docker
+             --model "$HARBOR_MODEL_NAME"
+             --env "${HARBOR_ENV:-docker}"
              --n-concurrent "$N_CONCURRENT"
              --agent-kwarg "api_base=http://localhost:$VLLM_PORT/v1"
              --job-name "$JOB_NAME"
              -k "$N_ATTEMPTS" )
+if [ -n "${N_TASKS:-}" ]; then
+    HARBOR_CMD+=( --n-tasks "$N_TASKS" )
+fi
+if [[ "$HARBOR_MODEL_NAME" == hosted_vllm/* ]]; then
+    HARBOR_CMD+=( --agent-kwarg "model_info=$HOSTED_VLLM_MODEL_INFO" )
+fi
+if [ -n "${EXTRA_AGENT_KWARGS:-}" ]; then
+    while IFS= read -r agent_kwarg; do
+        [ -n "$agent_kwarg" ] || continue
+        HARBOR_CMD+=( --agent-kwarg "$agent_kwarg" )
+    done <<< "$EXTRA_AGENT_KWARGS"
+fi
+if [ -n "${EXTRA_AGENT_ENVS:-}" ]; then
+    while IFS= read -r agent_env; do
+        [ -n "$agent_env" ] || continue
+        if [[ "$agent_env" == *=* ]]; then
+            export "$agent_env"
+        fi
+        HARBOR_CMD+=( --agent-env "$agent_env" )
+    done <<< "$EXTRA_AGENT_ENVS"
+fi
+if [[ "$AGENT_IMPORT_PATH" == *:* ]]; then
+    HARBOR_CMD+=( --agent-import-path "$AGENT_IMPORT_PATH" )
+else
+    HARBOR_CMD+=( --agent "$AGENT_IMPORT_PATH" )
+fi
 log "running harbor: ${HARBOR_CMD[*]}"
 
 # Background progress reporter — harbor's built-in progress bar uses ANSI
@@ -359,6 +538,12 @@ wait "$PROGRESS_PID" 2>/dev/null || true
 
 # --- 7. Compute aggregate stats ---------------------------------------------
 JOB_DIR="jobs/$JOB_NAME"
+if [ -f "$VLLM_LOG" ]; then
+    log "preserving vllm log in $JOB_DIR"
+    mkdir -p "$JOB_DIR"
+    cp "$VLLM_LOG" "$JOB_DIR/vllm.log" || true
+    tail -"$VLLM_LOG_TAIL_LINES" "$VLLM_LOG" >"$JOB_DIR/vllm.tail.txt" 2>/dev/null || true
+fi
 if [ -d "$JOB_DIR" ]; then
     STATS_LOG="$JOB_DIR/stats.txt"
     METRICS_JSON="$JOB_DIR/metrics.json"

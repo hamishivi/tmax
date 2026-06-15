@@ -110,8 +110,12 @@ elif [ -z "$DP_SIZE" ]; then
     DP_SIZE=$((GPU_COUNT / TP_SIZE))
 fi
 
-# Build the vllm command
-VLLM_CMD="uvx vllm==${VLLM_VERSION} serve ${MODEL_PATH}"
+# Build the vllm command.
+# Pin fastapi < 0.137: 0.137 changed the router internals and breaks
+# prometheus-fastapi-instrumentator (mounted by vLLM on every route), making the
+# API server 500 on every request including /v1/models.
+# See vllm-project/vllm#45596 and #45597.
+VLLM_CMD="uvx --with 'fastapi<0.137' vllm==${VLLM_VERSION} serve ${MODEL_PATH}"
 VLLM_CMD+=" --revision ${REVISION}"
 VLLM_CMD+=" --tokenizer-revision ${REVISION}"
 VLLM_CMD+=" --served-model-name ${SERVED_MODEL_NAME}"

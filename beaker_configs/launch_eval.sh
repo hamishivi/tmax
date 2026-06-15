@@ -32,6 +32,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # --- defaults ----------------------------------------------------------------
 REVISION="main"
 SERVED_MODEL_NAME=""
+HARBOR_MODEL_NAME=""
 GPU_COUNT=8
 TP_SIZE=""
 DP_SIZE=""
@@ -41,19 +42,26 @@ VLLM_TOOL_CALL_PARSER="hermes"
 VLLM_LANGUAGE_MODEL_ONLY=0
 MAX_MODEL_LEN=""
 DATASET="terminal-bench@2.0"
+HARBOR_ENV="docker"
 AGENT_IMPORT_PATH="VanilluxAgent:VanilluxAgent"
 N_CONCURRENT=8
 N_ATTEMPTS=1
+N_TASKS=""
 JOB_NAME=""
 RESULTS_DIR=""
 CLUSTER="ai2/saturn"
 BUDGET=""
 PRIORITY="urgent"
 BEAKER_WORKSPACE="${BEAKER_WORKSPACE:-ai2/tmax}"
-BEAKER_IMAGE="hamishivi/hamishivi-interactive"
+BEAKER_IMAGE="${BEAKER_IMAGE:-hamishivi/tmax-eval-interactive}"
+BEAKER_DOCKER_IMAGE="${BEAKER_DOCKER_IMAGE:-}"
 REPO_GIT_URL=""
 REPO_GIT_REF=""
 BEAKER_SCRIPTS_DATASET=""
+EXTRA_UV_PIP_INSTALLS=""
+EXTRA_AGENT_KWARGS=""
+EXTRA_AGENT_ENVS=""
+HOSTED_VLLM_MODEL_INFO=""
 
 usage() {
     cat <<EOF
@@ -66,6 +74,8 @@ Required:
 Options:
   --revision REV         HF revision/branch (default: main)
   --name NAME            served-model-name (default: basename of model_path)
+  --harbor-model-name NAME
+                        model name passed to harbor (default: hosted_vllm/<served-name>)
   --gpus N               GPUs (default: 8)
   --tp N                 tensor-parallel-size (default: GPU_COUNT)
   --dp N                 data-parallel-size (default: 1)
@@ -76,9 +86,11 @@ Options:
   --max-model-len LEN    pass --max-model-len to vllm
   --dataset DS           harbor dataset (default: terminal-bench@2.0; also
                          valid: openthoughts-tblite@2.0)
-  --agent IMPORT_PATH    harbor --agent-import-path (default: VanilluxAgent:VanilluxAgent)
+  --harbor-env ENV       harbor environment backend (default: docker)
+  --agent AGENT          harbor agent import path or named agent (default: VanilluxAgent:VanilluxAgent)
   --n-concurrent N       harbor --n-concurrent (default: 8)
   --n-attempts N         harbor -k (default: 1)
+  --n-tasks N            harbor --n-tasks limit
   --job-name NAME        harbor --job-name (default: <served-name>-<dataset>)
   --results-dir DIR      where to copy the harbor jobs/ output
                          (default: /results; persisted by Gantry)
@@ -86,12 +98,19 @@ Options:
   --budget BUDGET        beaker budget (default: omitted; uses workspace default)
   --priority PRI         beaker priority (default: urgent)
   --workspace WS         beaker workspace (default: \$BEAKER_WORKSPACE or ai2/tmax)
-  --image IMAGE          beaker image (default: $BEAKER_IMAGE)
+  --image IMAGE          beaker image name or ID (clears default --docker-image)
+  --docker-image IMAGE   public Docker image (default: $BEAKER_DOCKER_IMAGE)
   --beaker-scripts-dataset DS
                          existing Beaker dataset to mount at /uploaded-beaker-scripts
                          (default: upload local scripts/beaker)
   --repo-url URL         git URL of tmax (default: current 'origin' remote)
   --repo-ref REF         git SHA/branch of tmax (default: current HEAD SHA)
+  --extra-uv-pip-install SPEC
+                        extra package spec(s) to uv pip install in the job
+  --agent-kwarg KV       extra harbor --agent-kwarg value (can be repeated)
+  --agent-env KV         extra harbor --agent-env value (can be repeated)
+  --hosted-vllm-model-info JSON
+                        Harbor model_info JSON for hosted_vllm agents
 EOF
     exit 1
 }
@@ -103,6 +122,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --revision)        REVISION="$2"; shift 2 ;;
         --name)            SERVED_MODEL_NAME="$2"; shift 2 ;;
+        --harbor-model-name) HARBOR_MODEL_NAME="$2"; shift 2 ;;
         --gpus)            GPU_COUNT="$2"; shift 2 ;;
         --tp)              TP_SIZE="$2"; shift 2 ;;
         --dp)              DP_SIZE="$2"; shift 2 ;;
@@ -112,19 +132,26 @@ while [ $# -gt 0 ]; do
         --language-model-only|--language_model_only) VLLM_LANGUAGE_MODEL_ONLY=1; shift ;;
         --max-model-len)   MAX_MODEL_LEN="$2"; shift 2 ;;
         --dataset)         DATASET="$2"; shift 2 ;;
+        --harbor-env)      HARBOR_ENV="$2"; shift 2 ;;
         --agent)           AGENT_IMPORT_PATH="$2"; shift 2 ;;
         --n-concurrent)    N_CONCURRENT="$2"; shift 2 ;;
         --n-attempts)      N_ATTEMPTS="$2"; shift 2 ;;
+        --n-tasks)         N_TASKS="$2"; shift 2 ;;
         --job-name)        JOB_NAME="$2"; shift 2 ;;
         --results-dir)     RESULTS_DIR="$2"; shift 2 ;;
         --cluster)         CLUSTER="$2"; shift 2 ;;
         --budget)          BUDGET="$2"; shift 2 ;;
         --priority)        PRIORITY="$2"; shift 2 ;;
         --workspace)       BEAKER_WORKSPACE="$2"; shift 2 ;;
-        --image)           BEAKER_IMAGE="$2"; shift 2 ;;
+        --image)           BEAKER_IMAGE="$2"; BEAKER_DOCKER_IMAGE=""; shift 2 ;;
+        --docker-image)    BEAKER_DOCKER_IMAGE="$2"; BEAKER_IMAGE=""; shift 2 ;;
         --beaker-scripts-dataset) BEAKER_SCRIPTS_DATASET="$2"; shift 2 ;;
         --repo-url)        REPO_GIT_URL="$2"; shift 2 ;;
         --repo-ref)        REPO_GIT_REF="$2"; shift 2 ;;
+        --extra-uv-pip-install) EXTRA_UV_PIP_INSTALLS="$2"; shift 2 ;;
+        --agent-kwarg)     EXTRA_AGENT_KWARGS+="${EXTRA_AGENT_KWARGS:+$'\n'}$2"; shift 2 ;;
+        --agent-env)       EXTRA_AGENT_ENVS+="${EXTRA_AGENT_ENVS:+$'\n'}$2"; shift 2 ;;
+        --hosted-vllm-model-info) HOSTED_VLLM_MODEL_INFO="$2"; shift 2 ;;
         -h|--help)         usage ;;
         *) echo "unknown option: $1"; usage ;;
     esac
@@ -149,14 +176,22 @@ cat <<EOF
 === Launching tmax eval on Beaker ===
   Model:        ${MODEL_PATH}@${REVISION}
   Served name:  ${SERVED_MODEL_NAME}
+  Harbor model: ${HARBOR_MODEL_NAME:-hosted_vllm/${SERVED_MODEL_NAME}}
   vLLM version: ${VLLM_VERSION}
   Tool parser:  ${VLLM_TOOL_CALL_PARSER}
   LM only:      ${VLLM_LANGUAGE_MODEL_ONLY}
   GPUs:         ${GPU_COUNT} (TP=${TP_SIZE}, DP=${DP_SIZE})
   Dataset:      ${DATASET}
+  Harbor env:   ${HARBOR_ENV}
   Agent:        ${AGENT_IMPORT_PATH}
+  Agent kwargs: ${EXTRA_AGENT_KWARGS:-<none>}
+  Agent envs:   ${EXTRA_AGENT_ENVS:-<none>}
+  Extra pip:    ${EXTRA_UV_PIP_INSTALLS:-<none>}
+  N tasks:      ${N_TASKS:-<all>}
+  Model info:   ${HOSTED_VLLM_MODEL_INFO:-<auto>}
   Job name:     ${JOB_NAME}
   Results dir:  ${RESULTS_DIR}
+  Image:        ${BEAKER_IMAGE:+beaker:${BEAKER_IMAGE}}${BEAKER_DOCKER_IMAGE:+docker:${BEAKER_DOCKER_IMAGE}}
   Repo ref:     ${REPO_GIT_REF}
   Gantry:       ${BEAKER_NAME}  cluster=${CLUSTER}  workspace=${BEAKER_WORKSPACE}
 EOF
@@ -180,13 +215,14 @@ GANTRY_CMD=(
     --cluster "$CLUSTER"
     --gpus "$GPU_COUNT"
     --priority "$PRIORITY"
-    --beaker-image "$BEAKER_IMAGE"
     --weka "oe-adapt-default:/weka/oe-adapt-default"
     --env-secret HF_TOKEN
     --env-secret "DOCKER_PAT=${DOCKER_PAT_SECRET:-hamishivi_DOCKER_PAT}"
+    --env-secret "DAYTONA_API_KEY=${DAYTONA_API_KEY_SECRET:-hamishivi_DAYTONA_API_KEY}"
     --env "MODEL_PATH=${MODEL_PATH}"
     --env "MODEL_REVISION=${REVISION}"
     --env "SERVED_MODEL_NAME=${SERVED_MODEL_NAME}"
+    --env "HARBOR_MODEL_NAME=${HARBOR_MODEL_NAME}"
     --env "VLLM_VERSION=${VLLM_VERSION}"
     --env "VLLM_TOOL_CALL_PARSER=${VLLM_TOOL_CALL_PARSER}"
     --env "VLLM_LANGUAGE_MODEL_ONLY=${VLLM_LANGUAGE_MODEL_ONLY}"
@@ -195,9 +231,15 @@ GANTRY_CMD=(
     --env "DP_SIZE=${DP_SIZE}"
     --env "MAX_MODEL_LEN=${MAX_MODEL_LEN}"
     --env "DATASET=${DATASET}"
+    --env "HARBOR_ENV=${HARBOR_ENV}"
     --env "AGENT_IMPORT_PATH=${AGENT_IMPORT_PATH}"
+    --env "EXTRA_AGENT_KWARGS=${EXTRA_AGENT_KWARGS}"
+    --env "EXTRA_AGENT_ENVS=${EXTRA_AGENT_ENVS}"
+    --env "EXTRA_UV_PIP_INSTALLS=${EXTRA_UV_PIP_INSTALLS}"
+    --env "HOSTED_VLLM_MODEL_INFO=${HOSTED_VLLM_MODEL_INFO}"
     --env "N_CONCURRENT=${N_CONCURRENT}"
     --env "N_ATTEMPTS=${N_ATTEMPTS}"
+    --env "N_TASKS=${N_TASKS}"
     --env "JOB_NAME=${JOB_NAME}"
     --env BEAKER_ALLOW_SUBCONTAINERS=1
     --env BEAKER_SKIP_DOCKER_SOCKET=1
@@ -205,6 +247,15 @@ GANTRY_CMD=(
     --propagate-failure
     --no-python
 )
+
+if [ -n "$BEAKER_IMAGE" ]; then
+    GANTRY_CMD+=(--beaker-image "$BEAKER_IMAGE")
+elif [ -n "$BEAKER_DOCKER_IMAGE" ]; then
+    GANTRY_CMD+=(--docker-image "$BEAKER_DOCKER_IMAGE")
+else
+    echo "error: either --image or --docker-image must be set" >&2
+    exit 1
+fi
 
 if [ -n "$BEAKER_SCRIPTS_DATASET" ]; then
     GANTRY_CMD+=(--dataset "${BEAKER_SCRIPTS_DATASET}:/uploaded-beaker-scripts")
