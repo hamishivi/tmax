@@ -28,7 +28,7 @@ runs is now a clean **prompt-richness + budget** comparison rather than a
 confounded prompt+tool+budget comparison. Both harnesses share the same
 underlying sandbox (Apptainer instance, shared SIF), the same OpenAI-style
 tool-calling format, and the same trajectory schema, so analysis across
-harnesses (``analyze_tb2_eval.py``, SFT preprocessing) works unchanged.
+harnesses works unchanged.
 
 Why this is dramatically simpler than the previous sweagent-CLI approach:
 

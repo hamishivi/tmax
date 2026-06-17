@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Launch a vLLM server on Beaker for TassieAgent eval.
+# Launch a vLLM server on Beaker for Vanillux2Agent eval.
 #
 # Usage:
 #   ./beaker_configs/launch_vllm.sh <model_path> [options]

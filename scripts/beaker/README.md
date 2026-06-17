@@ -21,7 +21,7 @@ bottom if you're curious.
     --dataset terminal-bench@2.0
 ```
 
-Submits a single 8-GPU task. By default it uses `VanilluxAgent` against
+Submits a single 8-GPU task. By default it uses `Vanillux2Agent` against
 `terminal-bench@2.0`. Results land at:
 
 ```
@@ -102,7 +102,7 @@ read).
 | `--port PORT` | `8008` | vLLM port. |
 | `--max-model-len LEN` | unset | Pass to `vllm serve --max-model-len`. |
 | `--dataset DS` | `terminal-bench@2.0` | Also valid: `openthoughts-tblite@2.0`, `terminal-bench-pro@1.0`, `terminal-bench-sample@2.0`. |
-| `--agent IMPORT_PATH` | `VanilluxAgent:VanilluxAgent` | `module:Class` form. |
+| `--agent IMPORT_PATH` | `Vanillux2Agent:Vanillux2Agent` | `module:Class` form. |
 | `--n-concurrent N` | `8` | Parallel trials. |
 | `--n-attempts N` | `1` | Passed as `-k`. |
 | `--job-name NAME` | `<served-name>-<dataset-slug>` | Harbor job name. Also the subdir under `RESULTS_DIR`. |

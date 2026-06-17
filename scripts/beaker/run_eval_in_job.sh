@@ -17,7 +17,7 @@
 #   MAX_MODEL_LEN            optional --max-model-len
 #   DATASET                  harbor dataset, e.g. terminal-bench@2.0
 #   HARBOR_ENV               harbor environment backend (default: docker)
-#   AGENT_IMPORT_PATH        e.g. VanilluxAgent:VanilluxAgent
+#   AGENT_IMPORT_PATH        e.g. Vanillux2Agent:Vanillux2Agent
 #   EXTRA_UV_PIP_INSTALLS    optional space-separated packages to uv pip install
 #   EXTRA_AGENT_KWARGS       optional newline-separated harbor --agent-kwarg values
 #   EXTRA_AGENT_ENVS         optional newline-separated harbor --agent-env values

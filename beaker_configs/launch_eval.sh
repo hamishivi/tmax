@@ -43,7 +43,7 @@ VLLM_LANGUAGE_MODEL_ONLY=0
 MAX_MODEL_LEN=""
 DATASET="terminal-bench@2.0"
 HARBOR_ENV="docker"
-AGENT_IMPORT_PATH="VanilluxAgent:VanilluxAgent"
+AGENT_IMPORT_PATH="Vanillux2Agent:Vanillux2Agent"
 N_CONCURRENT=8
 N_ATTEMPTS=1
 N_TASKS=""
@@ -97,7 +97,7 @@ Options:
   --dataset DS           harbor dataset (default: terminal-bench@2.0; also
                          valid: openthoughts-tblite@2.0)
   --harbor-env ENV       harbor environment backend (default: docker)
-  --agent AGENT          harbor agent import path or named agent (default: VanilluxAgent:VanilluxAgent)
+  --agent AGENT          harbor agent import path or named agent (default: Vanillux2Agent:Vanillux2Agent)
   --n-concurrent N       harbor --n-concurrent (default: 8)
   --n-attempts N         harbor -k (default: 1)
   --n-tasks N            harbor --n-tasks limit

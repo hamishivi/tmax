@@ -607,8 +607,8 @@ COMMAND_COMPLEXITY: list[str] = [
 # the new axes are forced to their legacy default values so byte-identical
 # behaviour is preserved.
 #
-# See scripts/analysis/tb2_gemini_tassieagent_eval.md §6–§7 for the
-# motivation behind each kind.
+# The verifier/fixture kinds below add graded difficulty beyond the legacy
+# exact_text default.
 
 VERIFIER_KINDS: list[str] = [
     "metric_threshold",       # numerical metric vs reference (similarity / speed / accuracy)
