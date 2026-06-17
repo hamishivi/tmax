@@ -25,15 +25,15 @@ fi
 source scripts/docker/docker_login.sh
 
 uv run python open_instruct/grpo_fast.py \
-    --dataset_mixer_list allenai/TMax-15K 1.0 \
+    --dataset_mixer_list hamishivi/agent-task-openthoughts 1.0 \
     --dataset_mixer_list_splits train \
     --max_prompt_token_length 2048 \
-    --per_turn_max_tokens 1024 \
-    --response_length 8192 \
-    --pack_length 16384 \
+    --per_turn_max_tokens 8192 \
+    --response_length 16384 \
+    --pack_length 19000 \
     --per_device_train_batch_size 1 \
     --num_unique_prompts_rollout 1 \
-    --num_samples_per_prompt_rollout 4 \
+    --num_samples_per_prompt_rollout 8 \
     --async_steps 4 \
     --model_name_or_path hamishivi/Qwen3.5-2B \
     --temperature 1.0 \
@@ -60,13 +60,13 @@ uv run python open_instruct/grpo_fast.py \
     --save_traces \
     --save_trainer_logprobs true \
     --tools swerl_vanillux_sandbox \
-    --tool_configs '{"task_data_hf_repo": "allenai/TMax-15K", "test_timeout": 120, "image": "python:3.12-slim"}' \
-    --pool_size 512 \
+    --tool_configs '{"task_data_hf_repo": "hamishivi/agent-task-openthoughts", "test_timeout": 120, "image": "python:3.12-slim"}' \
+    --pool_size 16 \
     --max_steps 64 \
     --verification_reward 1.0 \
     --tool_parser_type vllm_qwen3_xml \
     --system_prompt_override_file scripts/train/debug/envs/swerl_vanillux_sandbox_system_prompt.txt \
-    --active_sampling \
+    --filter_zero_std_samples false \
     --backend_timeout 1200 \
     --vllm_gdn_prefill_backend triton \
     --checkpoint_state_freq 10 \
