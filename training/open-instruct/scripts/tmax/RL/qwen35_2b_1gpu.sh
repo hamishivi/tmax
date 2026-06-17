@@ -16,7 +16,7 @@ export SWERL_SANDBOX_TIMING_LOG_THRESHOLD_S=1.0
 # Auth with dockerhub
 export DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:-hamishi740}"
 # replace with your own dockerhub PAT
-export DOCKER_PAT=$(beaker secret read hamishi740_DOCKER_PAT --workspace ai2/olmo-instruct)
+export DOCKER_PAT=$(beaker secret read hamishivi_DOCKER_PAT --workspace ai2/olmo-instruct)
 if [ -z "$DOCKER_PAT" ]; then
     echo "ERROR: DOCKER_PAT is not set"
     exit 1

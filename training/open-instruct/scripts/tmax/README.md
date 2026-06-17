@@ -6,6 +6,23 @@ I recommend starting with the 1 GPU RL debug script (`qwen35_2b_1gpu.sh`), and t
 
 **important**: For people at ai2, you should run in beaker session with `BEAKER_ALLOW_SUBCONTAINERS=1` and `BEAKER_SKIP_DOCKER_SOCKET=1` set to avoid using beaker's own docker instance, which is not allowed.
 
+### Podman setup
+
+Before running the script, you should install podman and crun by running the following command.
+If you already have podman and crun installed, you can skip this step.
+
+```bash
+bash scripts/docker/setup_podman.sh
+```
+
+This will install podman and crun in the image. Then start the podman service by running the following command:
+```bash
+podman system service --time=0 unix:///tmp/podman.sock
+```
+
+
+
+
 ## Scripts here
 
 Scripts are split into two folders by training stage:
