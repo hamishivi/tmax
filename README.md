@@ -15,11 +15,14 @@
 
 ---
 
+Tmax is our project around training simple, powerful terminal using agents. This codebase covers data generation, training, and evaluation.
+We use this to train our 'tmax' series of models, with strong performance as shown below! Please refer to our [paper](https://arxiv.org/abs/xxx) for more details.
+
+
 <p align="center">
   <img src="scripts/plot/output/teaser_terminal_bench.png" alt="Tmax" width="640">
 </p>
 
-Tmax is our project around training simple, powerful terminal using agents. This codebase covers data generation, training, and evaluation. Please refer to our [paper](https://arxiv.org/abs/xxx) for more details.
 
 Below, we give a quick overview of the codebase and how to use it.
 
