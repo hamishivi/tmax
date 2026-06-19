@@ -166,9 +166,10 @@ successful (pass) trajectories form the SFT corpus used to warm-start RL.
 ## Evaluating on the published Harbor dataset
 
 The full 15k corpus is published on the [Harbor](https://www.harborframework.com/docs/datasets)
-registry as **`tmax/TMax-15K-Harbor`** (public). Each task ships as a
-self-contained Harbor environment with a programmatic verifier, so you can
-evaluate any agent/model on it without regenerating anything.
+registry as **[`tmax/TMax-15K-Harbor`](https://hub.harborframework.com/datasets/tmax/TMax-15K-Harbor/latest)**
+(public). Each task ships as a self-contained Harbor environment with a
+programmatic verifier, so you can evaluate any agent/model on it without
+regenerating anything.
 
 Evaluate an agent on the dataset with `harbor run -d` ([run docs](https://www.harborframework.com/docs/datasets)):
 
