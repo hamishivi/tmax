@@ -142,3 +142,15 @@ Feel free to swap out daytona for your sandboxing backend of choice.
 ## Licensing
 
 This codebase is licensed under Apache 2.0 as given in [LICENSE](LICENSE).
+
+# Citation
+
+If you use this codebase or models in your research, please cite our paper:
+
+```bibtex
+@misc{ivison2026tmax,
+  title={{TMAX}: A Simple Recipe for Terminal Agents},
+  author={Ivison, Hamish and Yin, Junjie Oscar and Shao, Rulin and Xiao, Teng and Lambert, Nathan and Hajishirzi, Hannaneh},
+  year={2026},
+}
+```
