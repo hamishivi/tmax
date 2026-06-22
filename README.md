@@ -68,8 +68,12 @@ TASKS_DIR=rl_data/output/tasks_smoke \
     bash rl_data/scripts/analyze/run_analyze.sh
 ```
 
-See [`rl_data/README.md`](rl_data/README.md) for the full pipeline, corpus
-kinds, and SFT warm-start details.
+[`rl_data/README.md`](rl_data/README.md) is the entry point for the data side
+of the project: it walks through the compositional sampler (the orthogonal
+axes that define a task), the four-stage pipeline
+(`generate_tasks → generate_solutions → analyze → upload_to_hf`), the corpus
+kinds (`legacy` / `sft_v2` / `rl_v2`), the SFT warm-start set, and how to
+evaluate on our published Harbor dataset. Start there for anything data-related.
 
 ### Train a model
 
@@ -130,6 +134,30 @@ uv run harbor run \
 
 Feel free to swap out daytona for your sandboxing backend of choice.
 
+## Task data on Harbor
+
+We also ship the full **15k** task corpus in [Harbor](https://www.harborframework.com/docs/datasets)
+format so you can run it out of the box. It's published on the Harbor registry as
+**[`tmax/TMax-15K-Harbor`](https://hub.harborframework.com/datasets/tmax/TMax-15K-Harbor/latest)**
+(public): the legacy 10k self-contained tasks plus 5k newer *intricate*
+multi-modal tasks. Every task ships as a self-contained Harbor environment with
+a programmatic verifier, so you can evaluate any agent/model on it directly — no
+need to regenerate or build anything from `rl_data/`.
+
+```bash
+# evaluate an agent on a 10-task subset using the Daytona cloud sandbox
+# (no local Docker required — swap `--env daytona` for `--env docker` to build locally)
+export DAYTONA_API_KEY='xxx'
+uv run harbor run -d "tmax/TMax-15K-Harbor@latest" \
+    --agent terminus-2 --model "<model>" \
+    --env daytona -l 10
+```
+
+Drop `-l` to run the full set, or use `-i`/`-x` to include/exclude tasks by name.
+Per-task rewards and agent/verifier logs land under `jobs/<job-name>/`. See
+[`rl_data/README.md`](rl_data/README.md#evaluating-on-the-published-harbor-dataset)
+for the full set of run options.
+
 ## Requirements
 
 - **[`uv`](https://github.com/astral-sh/uv)** for dependency management (deps pinned in `pyproject.toml` / `uv.lock`).
@@ -138,6 +166,9 @@ Feel free to swap out daytona for your sandboxing backend of choice.
 - (for data generation) **`apptainer`** on PATH for building and running task containers.
 - (for training) A **Dockerhub login** and personal access token (PAT). In particular, you probably need a business account to pull images from Dockerhub at large scale.
 - **`HF_TOKEN`** for the Hugging Face upload stage and for pulling gated models.
+- (to evaluate on the published `tmax/TMax-15K-Harbor` dataset) a model API key
+  for your chosen agent plus a container runtime — Docker locally, or
+  `DAYTONA_API_KEY` for the Daytona sandbox on Docker-less hosts.
 
 ## Licensing
 
