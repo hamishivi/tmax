@@ -829,6 +829,7 @@ class PolicyTrainerRayProcess(RayProcess):
             dppo_divergence_type=self.args.dppo_divergence_type,
             dppo_divergence_threshold=self.args.dppo_divergence_threshold,
             tvpo_truncation_cap=self.args.tvpo_truncation_cap,
+            drpo_divergence_threshold=self.args.drpo_divergence_threshold,
             loss_denominator=loss_denominator_mode,
             rollout_sample_ids=rollout_sample_ids,
             sequence_process_group=self._sp_group,
@@ -1366,6 +1367,7 @@ class PolicyTrainerRayProcess(RayProcess):
                         config=self.args,
                         tis_weights=combined_tis_BT,
                         policy_freeze_mask=tvpo_mask_BT,
+                        behavior_logprobs=old_logprob_BT,
                     )
 
                     per_token_loss_BT = pg_loss_max_BT + self.args.beta * kl_BT

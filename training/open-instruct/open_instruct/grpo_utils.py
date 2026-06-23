@@ -63,6 +63,7 @@ class GRPOLossType(enum.StrEnum):
     cispo = "cispo"
     dppo = "dppo"
     tvpo = "tvpo"
+    drpo = "drpo"
 
 
 class DPPODivergenceType(enum.StrEnum):
@@ -99,7 +100,7 @@ class GRPOExperimentConfig(
     lm_head_fp32: bool = False
     """Whether to keep the final LM head projection in fp32 for both HF training and vLLM rollout models."""
     use_liger_grpo_loss: bool = False
-    """Whether to use the tiled lm-head GRPO loss path. Supports DAPO, CISPO, DPPO, and TVPO."""
+    """Whether to use the tiled lm-head GRPO loss path. Supports DAPO, CISPO, DPPO, TVPO, and DRPO."""
     liger_grpo_loss_chunk_size: int = 1
     """Number of lm-head loss tiles to use in the tiled GRPO loss path."""
     liger_grpo_loss_compile: bool = True
@@ -155,7 +156,8 @@ class GRPOExperimentConfig(
     """Whether to load and use a reference policy for KL penalty calculation."""
     loss_fn: GRPOLossType = GRPOLossType.dapo
     """Which policy-loss function to use: 'dapo', 'cispo', 'dppo'
-    (https://arxiv.org/abs/2602.04879), or 'tvpo' (prompt-level TV trust region)."""
+    (https://arxiv.org/abs/2602.04879), 'tvpo' (prompt-level TV trust region),
+    or 'drpo' (https://arxiv.org/abs/2606.09821, smooth Binary-TV regularizer)."""
     dppo_divergence_type: DPPODivergenceType = DPPODivergenceType.tv
     """For DPPO: which divergence to use to define the trust region ('tv' or 'kl').
 
@@ -192,6 +194,23 @@ class GRPOExperimentConfig(
     A large cap (default 20) is recommended because the trust region is enforced
     by the TVPO mask, not by this cap; the cap only protects against numerical
     blow-ups in extreme ratios. Only used when ``loss_fn=tvpo``.
+    """
+    drpo_divergence_threshold: float = 12.5
+    """For DRPO: the trust-region threshold δ in the smooth Binary-TV regularizer
+    (https://arxiv.org/abs/2606.09821).
+
+    DRPO replaces DPPO's hard mask with an advantage-weighted quadratic penalty on
+    the sampled token's absolute probability shift (Eq. 8):
+
+        L_DRPO = E[Σ_t r_t·A_t − (|A_t| / 2δ)·μ(y_t|s_t)·(r_t − 1)²],
+
+    where ``r_t = π_θ(y_t|s_t) / μ_θ'(y_t|s_t)`` and μ_θ' is the rollout policy.
+    This induces a per-token gradient weight ``w_t = 1 − sign(A_t·(r_t−1))·|π−μ|/δ``
+    bounded in ``[1 − 1/δ, 1 + 1/δ]``, attenuating diverging updates and providing a
+    corrective signal beyond the trust-region boundary ``|π − μ| ≤ δ``.
+
+    The DRPO paper uses δ=12.5 (Sec. 4); Appendix D.5 shows performance is robust
+    down to δ=2.5. Only used when ``loss_fn=drpo``.
     """
     record_entropy: bool = False
     """whether to record the entropy of the policy during training. Uses extra memory."""
@@ -312,10 +331,16 @@ class GRPOExperimentConfig(
                 "use_vllm_logprobs sets old_logprobs to vLLM logprobs, making importance sampling pointless."
             )
         if self.use_liger_grpo_loss:
-            if self.loss_fn not in (GRPOLossType.dapo, GRPOLossType.cispo, GRPOLossType.dppo, GRPOLossType.tvpo):
+            if self.loss_fn not in (
+                GRPOLossType.dapo,
+                GRPOLossType.cispo,
+                GRPOLossType.dppo,
+                GRPOLossType.tvpo,
+                GRPOLossType.drpo,
+            ):
                 raise ValueError(
                     "`use_liger_grpo_loss` currently only supports `loss_fn=dapo`, `loss_fn=cispo`, "
-                    "`loss_fn=dppo`, or `loss_fn=tvpo`."
+                    "`loss_fn=dppo`, `loss_fn=tvpo`, or `loss_fn=drpo`."
                 )
             if self.record_entropy:
                 raise ValueError("`use_liger_grpo_loss` does not support `record_entropy=True`.")
@@ -357,6 +382,23 @@ class GRPOExperimentConfig(
                     "computed against the rollout policy μ_θ'. "
                     "Pass `--use_vllm_logprobs True --truncated_importance_sampling_ratio_cap 0` "
                     "alongside `--loss_fn tvpo`."
+                )
+        if self.loss_fn == GRPOLossType.drpo:
+            if self.drpo_divergence_threshold <= 0.0:
+                raise ValueError(
+                    f"DRPO requires `drpo_divergence_threshold` > 0 (got {self.drpo_divergence_threshold})."
+                )
+            # Like DPPO, DRPO's Binary-TV regularizer is anchored on the rollout
+            # policy μ_θ' (the (r_t − 1) and μ(y_t|s_t) terms in Eq. 8 are measured
+            # against the behavior policy), so the cached `old_logprob` must be the
+            # vLLM logprobs.
+            if not self.use_vllm_logprobs:
+                raise ValueError(
+                    "DRPO requires `use_vllm_logprobs=True` so the importance ratio and the "
+                    "behavior probability μ(y_t|s_t) are computed against the rollout policy μ_θ' "
+                    "(https://arxiv.org/abs/2606.09821). "
+                    "Pass `--use_vllm_logprobs True --truncated_importance_sampling_ratio_cap 0` "
+                    "alongside `--loss_fn drpo`."
                 )
         if self.use_value_model:
             if self.value_loss_coef < 0.0:
@@ -834,6 +876,7 @@ def compute_grpo_loss(
     config: GRPOExperimentConfig,
     tis_weights: torch.Tensor | None = None,
     policy_freeze_mask: torch.Tensor | None = None,
+    behavior_logprobs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if config.loss_fn == GRPOLossType.dapo:
         pg_losses = -advantages * ratio
@@ -860,6 +903,23 @@ def compute_grpo_loss(
         # the trust region.
         truncated_ratio = torch.clamp(ratio, max=config.tvpo_truncation_cap).detach()
         pg_losses = -advantages * truncated_ratio * new_logprobs
+        pg_losses2 = pg_losses
+    elif config.loss_fn == GRPOLossType.drpo:
+        # DRPO (https://arxiv.org/abs/2606.09821). A smooth advantage-weighted
+        # Binary-TV regularizer that replaces DPPO's hard mask. The caller is
+        # responsible for computing ``ratio`` as π_θ / μ_θ' (rollout/behavior
+        # policy); ``behavior_logprobs`` supplies log μ_θ' so we can recover the
+        # behavior probability μ(y_t|s_t) that scales the quadratic penalty.
+        # Eq. 8 (negated for minimization):
+        #   pg = −A·r + (|A| / 2δ)·μ·(r − 1)².
+        # μ is detached (constant during the update), so autograd through r
+        # reproduces the bounded gradient weight w_t in Eq. 9/10.
+        if behavior_logprobs is None:
+            raise ValueError("DRPO requires `behavior_logprobs` (log μ_θ') to be passed to compute_grpo_loss.")
+        mu = torch.exp(behavior_logprobs.clamp(min=-30.0, max=0.0)).detach()
+        delta = config.drpo_divergence_threshold
+        regularizer = (advantages.abs() / (2.0 * delta)) * mu * (ratio - 1.0) ** 2
+        pg_losses = -advantages * ratio + regularizer
         pg_losses2 = pg_losses
     else:
         raise ValueError(f"Invalid loss function: {config.loss_fn}")
@@ -889,7 +949,7 @@ def compute_grpo_loss(
 
 
 class TiledGRPOLMHeadLoss(torch.autograd.Function):
-    """Tiled DAPO/CISPO/DPPO/TVPO lm-head loss that avoids materializing full logits.
+    """Tiled DAPO/CISPO/DPPO/TVPO/DRPO lm-head loss that avoids materializing full logits.
 
     This follows DeepSpeed's ``TiledFusedLogitsLoss`` pattern: the lm-head
     projection and scalar loss are recomputed per tile in ``forward`` and
@@ -921,6 +981,7 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         dppo_divergence_type: str,
         dppo_divergence_threshold: float,
         tvpo_truncation_cap: float,
+        drpo_divergence_threshold: float,
         sequence_loss: bool,
         rollout_sample_ids: torch.Tensor,
         has_rollout_sample_ids: bool,
@@ -1037,6 +1098,18 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
                     truncated_ratio = torch.clamp(ratio, max=tvpo_truncation_cap).detach()
                     pg_losses = -advantage_shards[shard_idx] * truncated_ratio * new_logprobs
                     pg_losses2 = pg_losses
+                elif loss_type == GRPOLossType.drpo:
+                    # DRPO (https://arxiv.org/abs/2606.09821): smooth advantage-weighted
+                    # Binary-TV regularizer. μ_θ' = exp(old_logprobs) is detached, so
+                    # autograd through r reproduces the bounded weight in Eq. 9/10.
+                    mu = torch.exp(old_logprob_shards[shard_idx].clamp(min=-30.0, max=0.0)).detach()
+                    regularizer = (
+                        (advantage_shards[shard_idx].abs() / (2.0 * drpo_divergence_threshold))
+                        * mu
+                        * (ratio - 1.0) ** 2
+                    )
+                    pg_losses = -advantage_shards[shard_idx] * ratio + regularizer
+                    pg_losses2 = pg_losses
                 else:
                     raise ValueError(f"`tiled_grpo_lm_head_loss` does not support loss_fn={loss_type}.")
                 if has_policy_freeze_mask:
@@ -1094,7 +1167,7 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         grad = grads[0]
         if isinstance(grad, torch.Tensor):
             x_grad = x_grad * grad.to(dtype=x_grad.dtype)
-        return (None, x_grad, *([None] * 25))
+        return (None, x_grad, *([None] * 26))
 
 
 def tiled_grpo_lm_head_loss(
@@ -1115,6 +1188,7 @@ def tiled_grpo_lm_head_loss(
     dppo_divergence_type: str | DPPODivergenceType = DPPODivergenceType.tv,
     dppo_divergence_threshold: float = 0.1,
     tvpo_truncation_cap: float = 20.0,
+    drpo_divergence_threshold: float = 12.5,
     loss_denominator: str = "token",
     rollout_sample_ids: torch.Tensor | None = None,
     sequence_process_group: dist.ProcessGroup | None = None,
@@ -1155,6 +1229,7 @@ def tiled_grpo_lm_head_loss(
         dppo_divergence_type,
         dppo_divergence_threshold,
         tvpo_truncation_cap,
+        drpo_divergence_threshold,
         loss_denominator == "sequence",
         rollout_sample_ids,
         has_rollout_sample_ids,
