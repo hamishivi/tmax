@@ -248,6 +248,15 @@ TEST_SH = textwrap.dedent("""\
 
     mkdir -p /logs/verifier
 
+    # Some verifiers import `requests` (allow-listed for multi_protocol
+    # verifier kinds). It ships in base_intricate.sif at solve time but is not
+    # guaranteed in every published prebuilt image, so ensure it is importable
+    # before grading. No-op when already present; falls through harmlessly
+    # (the verifier then fails as before) if the install cannot run.
+    if ! python3 -c "import requests" >/dev/null 2>&1; then
+        pip3 install --quiet --no-input requests >/dev/null 2>&1 || true
+    fi
+
     cd /tests
     python3 -m pytest test_final_state.py -v 2>&1 | tee /logs/verifier/test-stdout.txt
     TEST_EXIT=${PIPESTATUS[0]}

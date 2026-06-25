@@ -58,6 +58,14 @@ cat << 'TEST_EOF' > /tmp/test_final_state.py
 {test_final_state}
 TEST_EOF
 
+# Some verifiers import `requests` (allow-listed for multi_protocol verifier
+# kinds). It ships in base_intricate.sif at solve time but is not guaranteed in
+# every published prebuilt image, so ensure it is importable before grading.
+# No-op when already present; falls through harmlessly if it cannot install.
+if ! python3 -c "import requests" >/dev/null 2>&1; then
+    pip3 install --quiet --no-input requests >/dev/null 2>&1 || true
+fi
+
 if python3 -m pytest /tmp/test_final_state.py -x --tb=short 2>&1; then
     echo "1" > /logs/verifier/reward.txt
 else
