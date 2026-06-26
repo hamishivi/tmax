@@ -194,6 +194,14 @@ def _parse_post(container_def: str) -> tuple[str, str]:
     return base_image, "\n".join(post_commands).strip()
 
 
+# Verifier dependency baked into every task image. Some multi_protocol verifiers
+# import `requests`; it was provided by base_intricate.sif at solve time but is
+# not part of the per-task container.def, so the published prebuilt image must
+# add it. Emitted as the final layer, after the task %post has installed pip, so
+# it is a fast no-op for tasks that already pull it in.
+_BAKE_REQUESTS = "RUN pip3 install --no-cache-dir requests"
+
+
 def container_def_to_dockerfile(
     container_def: str, *, split_pkg_layers: bool = False
 ) -> tuple[str, str]:
@@ -212,6 +220,7 @@ def container_def_to_dockerfile(
             f"ENV DEBIAN_FRONTEND=noninteractive\n"
             f"COPY setup.sh /tmp/setup.sh\n"
             f"RUN bash /tmp/setup.sh && rm -f /tmp/setup.sh\n"
+            f"{_BAKE_REQUESTS}\n"
         ), post_script
 
     apt_pkgs, pip_pkgs, residual = split_package_installs(post_script)
@@ -241,6 +250,7 @@ def container_def_to_dockerfile(
     if residual:
         lines.append("COPY setup.sh /tmp/setup.sh")
         lines.append("RUN bash /tmp/setup.sh && rm -f /tmp/setup.sh")
+    lines.append(_BAKE_REQUESTS)
     dockerfile = "\n".join(lines) + "\n"
     return dockerfile, residual
 

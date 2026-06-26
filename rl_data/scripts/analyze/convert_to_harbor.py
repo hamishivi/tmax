@@ -184,6 +184,13 @@ def generate_dockerfile(
         lines.append("COPY post_install.sh /tmp/post_install.sh")
         lines.append("RUN bash /tmp/post_install.sh && rm /tmp/post_install.sh")
 
+    # 4. Bake the allow-listed verifier dependency `requests` into every image.
+    #    Some multi_protocol verifiers import it; it was provided by
+    #    base_intricate.sif at solve time but is not part of a legacy task's
+    #    per-task container.def. Runs last, after the base/%post layers have
+    #    installed pip, so it is a fast no-op when already present.
+    lines.append("RUN pip3 install --no-cache-dir requests")
+
     lines.append("")
     return "\n".join(lines)
 
