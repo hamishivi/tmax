@@ -778,6 +778,7 @@ class PolicyTrainerRayProcess(RayProcess):
         old_logprobs: torch.Tensor,
         ref_logprobs: torch.Tensor | None,
         policy_mask: torch.Tensor | None,
+        kl_mask: torch.Tensor | None,
         policy_freeze_mask: torch.Tensor | None,
         loss_denominator: float,
         loss_denominator_mode: str,
@@ -816,6 +817,7 @@ class PolicyTrainerRayProcess(RayProcess):
             selected_token_ids=selected_token_ids,
             response_mask=response_mask,
             policy_mask=policy_mask,
+            kl_mask=kl_mask,
             advantages=advantages,
             old_logprobs=old_logprobs,
             ref_logprobs=ref_logprobs,
@@ -1066,6 +1068,8 @@ class PolicyTrainerRayProcess(RayProcess):
             self.args.tis_mask_lower > 0.0
             or self.args.tis_mask_upper > 0.0
             or self.args.sequence_tis_mask_log_ratio_threshold > 0.0
+            or self.args.sequence_tis_mask_lower > 0.0
+            or self.args.sequence_tis_mask_upper > 0.0
         )
         tis_mask_kept_tokens = torch.zeros((), device=device)
         tis_mask_total_tokens = torch.zeros((), device=device)
@@ -1145,14 +1149,14 @@ class PolicyTrainerRayProcess(RayProcess):
                             sequence_tis_mask_BT = grpo_utils.compute_sequence_tis_mask(
                                 debug_logprobs_BT,
                                 vllm_logprobs_BT,
-                                advantages_BT,
                                 response_mask_BT,
                                 self.args.sequence_tis_mask_log_ratio_threshold,
-                                self.args.sequence_tis_mask_negative_advantages_only,
                                 data_BT.rollout_sample_ids[i][:, 1:]
                                 if data_BT.rollout_sample_ids is not None
                                 else None,
                                 self._sp_group,
+                                self.args.sequence_tis_mask_lower,
+                                self.args.sequence_tis_mask_upper,
                             )
                             self._record_vllm_local_logprob_debug(
                                 debug_logprobs_BT, vllm_logprobs_BT, response_mask_BT
@@ -1209,6 +1213,7 @@ class PolicyTrainerRayProcess(RayProcess):
                             old_logprobs=old_logprob_BT,
                             ref_logprobs=ref_logprobs_BT[i] if self.args.load_ref_policy else None,
                             policy_mask=combined_tis_BT,
+                            kl_mask=sequence_tis_mask_BT,
                             policy_freeze_mask=tvpo_policy_freeze_mask_BT,
                             loss_denominator=loss_denominator,
                             loss_denominator_mode=self.args.loss_denominator,
@@ -1298,12 +1303,12 @@ class PolicyTrainerRayProcess(RayProcess):
                     sequence_tis_mask_BT = grpo_utils.compute_sequence_tis_mask(
                         new_logprobs_BT,
                         vllm_logprobs_BT,
-                        advantages_BT,
                         response_mask_BT,
                         self.args.sequence_tis_mask_log_ratio_threshold,
-                        self.args.sequence_tis_mask_negative_advantages_only,
                         data_BT.rollout_sample_ids[i][:, 1:] if data_BT.rollout_sample_ids is not None else None,
                         self._sp_group,
+                        self.args.sequence_tis_mask_lower,
+                        self.args.sequence_tis_mask_upper,
                     )
                     if self.args.loss_fn == grpo_utils.GRPOLossType.dppo:
                         dppo_mask_BT, _ = grpo_utils.compute_dppo_mask(
@@ -1366,6 +1371,7 @@ class PolicyTrainerRayProcess(RayProcess):
                         config=self.args,
                         tis_weights=combined_tis_BT,
                         policy_freeze_mask=tvpo_mask_BT,
+                        kl_mask=sequence_tis_mask_BT,
                     )
 
                     per_token_loss_BT = pg_loss_max_BT + self.args.beta * kl_BT

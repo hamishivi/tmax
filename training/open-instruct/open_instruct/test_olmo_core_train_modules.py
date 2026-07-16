@@ -225,7 +225,7 @@ class TestTiledGRPOLMHeadLoss(unittest.TestCase):
         torch.testing.assert_close(lm_head_tiled.weight.grad, lm_head_dense.weight.grad)
         torch.testing.assert_close(lm_head_tiled.bias.grad, lm_head_dense.bias.grad)
 
-    def test_matches_dense_cispo_loss_and_grads_with_policy_mask(self):
+    def test_matches_dense_cispo_loss_and_grads_with_policy_and_kl_masks(self):
         torch.manual_seed(7)
         batch_size, seq_len, hidden_size, vocab_size = 2, 5, 4, 11
         lm_head_dense = torch.nn.Linear(hidden_size, vocab_size)
@@ -254,6 +254,7 @@ class TestTiledGRPOLMHeadLoss(unittest.TestCase):
             ref_logprobs=ref_logprobs,
             config=_make_grpo_config(beta=beta, clip_higher=clip_higher, loss_fn=grpo_utils.GRPOLossType.cispo),
             tis_weights=policy_mask,
+            kl_mask=policy_mask,
         )
         dense_loss = ((pg_loss + beta * kl) * response_mask).sum() / response_mask.sum() * loss_scale
         dense_loss.backward()
@@ -264,6 +265,7 @@ class TestTiledGRPOLMHeadLoss(unittest.TestCase):
             selected_token_ids=selected_token_ids,
             response_mask=response_mask,
             policy_mask=policy_mask,
+            kl_mask=policy_mask,
             advantages=advantages,
             old_logprobs=old_logprobs,
             ref_logprobs=ref_logprobs,
@@ -592,6 +594,80 @@ class TestComputeTISMask(unittest.TestCase):
         torch.testing.assert_close(mask, expected)
 
 
+class TestComputeSequenceTISMask(unittest.TestCase):
+    def test_aggregation_does_not_clamp_token_log_ratios(self):
+        # The raw mean log-ratio is (20 - 10) / 2 = 5, so this sequence is
+        # above the upper bound. Clamping each token to [-10, 10] would instead
+        # produce a mean of 0 and incorrectly retain it.
+        vllm_logprobs = torch.full((1, 2), -30.0)
+        new_logprobs = vllm_logprobs + torch.tensor([[20.0, -10.0]])
+        response_mask = torch.ones_like(new_logprobs, dtype=torch.bool)
+
+        mask = grpo_utils.compute_sequence_tis_mask(
+            new_logprobs,
+            vllm_logprobs,
+            response_mask,
+            log_ratio_threshold=0.0,
+            ratio_upper_bound=2.0,
+        )
+
+        torch.testing.assert_close(mask, torch.zeros_like(new_logprobs))
+
+    def test_direct_geometric_mean_bounds_mask_both_sides(self):
+        # Each row is constant, so its geometric mean is 0.998, 0.999, 1.0,
+        # 1.001, and 1.002 respectively.
+        ratios = torch.tensor([[0.998], [0.999], [1.0], [1.001], [1.002]])
+        vllm_logprobs = torch.full_like(ratios, -3.0)
+        new_logprobs = vllm_logprobs + torch.log(ratios)
+        response_mask = torch.ones_like(ratios, dtype=torch.bool)
+
+        mask = grpo_utils.compute_sequence_tis_mask(
+            new_logprobs,
+            vllm_logprobs,
+            response_mask,
+            log_ratio_threshold=0.0,
+            ratio_lower_bound=0.999,
+            ratio_upper_bound=1.001,
+        )
+
+        expected = torch.tensor([[0.0], [1.0], [1.0], [1.0], [0.0]])
+        torch.testing.assert_close(mask, expected)
+
+    def test_uses_geometric_mean_of_current_over_rollout_ratio_and_broadcasts(self):
+        ratios = torch.tensor([[2.0, 8.0], [0.25, 1.0]])
+        vllm_logprobs = torch.full_like(ratios, -3.0)
+        new_logprobs = vllm_logprobs + torch.log(ratios)
+        response_mask = torch.ones_like(ratios, dtype=torch.bool)
+
+        mask = grpo_utils.compute_sequence_tis_mask(
+            new_logprobs,
+            vllm_logprobs,
+            response_mask,
+            log_ratio_threshold=torch.log(torch.tensor(2.0)).item(),
+        )
+
+        # Geometric means are 4.0 and 0.5, respectively. The sequence-level
+        # decision is broadcast to both response tokens in each row.
+        expected = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
+        torch.testing.assert_close(mask, expected)
+
+    def test_legacy_threshold_masks_all_out_of_range_sequences(self):
+        ratios = torch.tensor([[4.0, 4.0], [4.0, 4.0]])
+        vllm_logprobs = torch.full_like(ratios, -3.0)
+        new_logprobs = vllm_logprobs + torch.log(ratios)
+        response_mask = torch.ones_like(ratios, dtype=torch.bool)
+
+        mask = grpo_utils.compute_sequence_tis_mask(
+            new_logprobs,
+            vllm_logprobs,
+            response_mask,
+            log_ratio_threshold=torch.log(torch.tensor(2.0)).item(),
+        )
+
+        expected = torch.zeros_like(ratios)
+        torch.testing.assert_close(mask, expected)
+
+
 class TestComputeGRPOLoss(unittest.TestCase):
     @parameterized.expand([("dapo", grpo_utils.GRPOLossType.dapo), ("cispo", grpo_utils.GRPOLossType.cispo)])
     def test_output_shapes(self, _name, loss_type):
@@ -690,6 +766,29 @@ class TestComputeGRPOLoss(unittest.TestCase):
 
         torch.testing.assert_close(pg_tis, pg_no_tis * 2.0)
         torch.testing.assert_close(pg2_tis, pg2_no_tis * 2.0)
+
+    def test_sequence_mask_removes_policy_and_kl_gradients(self):
+        config = _make_grpo_config(beta=0.5)
+        new_logprobs = torch.tensor([[-1.0, -2.0]], requires_grad=True)
+        old_logprobs = torch.tensor([[-1.5, -1.5]])
+        ratio = torch.exp(new_logprobs - old_logprobs)
+        advantages = torch.ones_like(new_logprobs)
+        ref_logprobs = torch.tensor([[-2.0, -2.0]])
+        sequence_mask = torch.zeros_like(new_logprobs)
+
+        _, _, pg_loss, kl = grpo_utils.compute_grpo_loss(
+            new_logprobs=new_logprobs,
+            ratio=ratio,
+            advantages=advantages,
+            ref_logprobs=ref_logprobs,
+            config=config,
+            tis_weights=sequence_mask,
+            kl_mask=sequence_mask,
+        )
+        loss = (pg_loss + config.beta * kl).sum()
+        loss.backward()
+
+        torch.testing.assert_close(new_logprobs.grad, torch.zeros_like(new_logprobs))
 
     def test_sequence_weighted_mean_averages_rows_equally(self):
         per_token_loss = torch.tensor([[1.0, 2.0, 100.0], [4.0, 6.0, 8.0]])

@@ -129,13 +129,24 @@ class GRPOExperimentConfig(
     Set to 0 to disable the upper side of the mask.
     """
     sequence_tis_mask_log_ratio_threshold: float = 0.0
-    """Sequence-level threshold δ for avg log(π_rollout / π_θ).
+    """Sequence-level threshold δ for avg log(π_θ / π_rollout).
 
-    When >0, whole response samples whose average log-ratio exceeds this threshold
-    are multiplied by 0 in the pg loss.
+    This is log of the geometric-mean token ratio. When >0, whole response samples
+    whose geometric-mean ratio exceeds exp(δ) are masked. This legacy option
+    cannot be combined with sequence_tis_mask_lower or sequence_tis_mask_upper.
     """
-    sequence_tis_mask_negative_advantages_only: bool = True
-    """Only apply the sequence-level ratio mask to samples with negative mean advantage."""
+    sequence_tis_mask_lower: float = 0.0
+    """Lower bound for the geometric-mean sequence ratio.
+
+    When >0, whole responses with ρ_geo below this bound are masked. Set to 0
+    to disable the lower bound.
+    """
+    sequence_tis_mask_upper: float = 0.0
+    """Upper bound for the geometric-mean sequence ratio.
+
+    When >0, whole responses with ρ_geo above this bound are masked. Set to 0
+    to disable the upper bound.
+    """
     kl_estimator: Literal[0, 1, 2, 3] = 2
     """the KL estimator to use"""
     loss_denominator: str = "token"
@@ -382,6 +393,27 @@ class GRPOExperimentConfig(
                 "sequence_tis_mask_log_ratio_threshold must be ≥ 0 "
                 f"(got {self.sequence_tis_mask_log_ratio_threshold=}). Use 0 to disable."
             )
+        if self.sequence_tis_mask_lower < 0.0 or self.sequence_tis_mask_upper < 0.0:
+            raise ValueError(
+                "sequence_tis_mask_lower and sequence_tis_mask_upper must be ≥ 0 "
+                f"(got {self.sequence_tis_mask_lower=}, {self.sequence_tis_mask_upper=}). Use 0 to disable."
+            )
+        if (
+            self.sequence_tis_mask_lower > 0.0
+            and self.sequence_tis_mask_upper > 0.0
+            and self.sequence_tis_mask_lower >= self.sequence_tis_mask_upper
+        ):
+            raise ValueError(
+                "sequence_tis_mask_lower must be less than sequence_tis_mask_upper when both are enabled, "
+                f"got {self.sequence_tis_mask_lower=} and {self.sequence_tis_mask_upper=}."
+            )
+        if self.sequence_tis_mask_log_ratio_threshold > 0.0 and (
+            self.sequence_tis_mask_lower > 0.0 or self.sequence_tis_mask_upper > 0.0
+        ):
+            raise ValueError(
+                "sequence_tis_mask_log_ratio_threshold cannot be combined with sequence_tis_mask_lower "
+                "or sequence_tis_mask_upper. Use either the legacy log threshold or the direct ratio bounds."
+            )
         if self.loss_denominator not in ("token", "sequence") and float(self.loss_denominator) <= 0:
             raise ValueError(
                 "loss_denominator must be 'token', 'sequence', or a valid float greater than 0, "
@@ -521,15 +553,20 @@ def compute_tis_mask(
 def compute_sequence_tis_mask(
     new_logprobs: torch.Tensor,
     vllm_logprobs: torch.Tensor,
-    advantages: torch.Tensor,
     response_mask: torch.Tensor,
     log_ratio_threshold: float,
-    negative_advantages_only: bool = True,
     rollout_sample_ids: torch.Tensor | None = None,
     sequence_process_group: dist.ProcessGroup | None = None,
+    ratio_lower_bound: float = 0.0,
+    ratio_upper_bound: float = 0.0,
 ) -> torch.Tensor | None:
-    """Whole-sequence gate: mask when mean log(π_rollout / π_θ) exceeds δ."""
-    if log_ratio_threshold <= 0.0:
+    """Gate a whole sequence using the geometric mean of ρ_t = π_θ / π_rollout.
+
+    The aggregation is evaluated in log space for numerical stability:
+    ``log(ρ_geo) = mean_t(log(ρ_t))``. The returned decision is broadcast to
+    every valid response token in the sequence.
+    """
+    if log_ratio_threshold <= 0.0 and ratio_lower_bound <= 0.0 and ratio_upper_bound <= 0.0:
         return None
     with torch.no_grad():
         if rollout_sample_ids is not None:
@@ -552,28 +589,25 @@ def compute_sequence_tis_mask(
 
         counts = torch.zeros(int(local_max.item()) + 1, dtype=torch.float32, device=response_mask.device)
 
-        log_ratio = (vllm_logprobs - new_logprobs).clamp(-10.0, 10.0)
+        log_ratio = new_logprobs - vllm_logprobs
         log_ratio = torch.where(valid, log_ratio, torch.zeros_like(log_ratio))
-        advantage_values = torch.where(valid, advantages, torch.zeros_like(advantages))
-
         flat_ids = sequence_ids[valid].long()
         log_ratio_sums = torch.zeros_like(counts)
-        advantage_sums = torch.zeros_like(counts)
         if flat_ids.numel() > 0:
             counts.scatter_add_(0, flat_ids, torch.ones_like(flat_ids, dtype=torch.float32))
             log_ratio_sums.scatter_add_(0, flat_ids, log_ratio[valid].float())
-            advantage_sums.scatter_add_(0, flat_ids, advantage_values[valid].float())
         if sequence_process_group is not None:
             dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=sequence_process_group)
             dist.all_reduce(log_ratio_sums, op=dist.ReduceOp.SUM, group=sequence_process_group)
-            dist.all_reduce(advantage_sums, op=dist.ReduceOp.SUM, group=sequence_process_group)
 
         avg_log_ratio = log_ratio_sums / counts.clamp_min(1.0)
-        mean_advantage = advantage_sums / counts.clamp_min(1.0)
-        sequence_should_mask = avg_log_ratio > log_ratio_threshold
-        if negative_advantages_only:
-            sequence_should_mask = sequence_should_mask & (mean_advantage < 0.0)
-
+        sequence_should_mask = torch.zeros_like(avg_log_ratio, dtype=torch.bool)
+        if log_ratio_threshold > 0.0:
+            sequence_should_mask |= avg_log_ratio > log_ratio_threshold
+        if ratio_lower_bound > 0.0:
+            sequence_should_mask |= avg_log_ratio < math.log(ratio_lower_bound)
+        if ratio_upper_bound > 0.0:
+            sequence_should_mask |= avg_log_ratio > math.log(ratio_upper_bound)
         keep_by_sequence = (~sequence_should_mask).to(dtype=new_logprobs.dtype)
         mask = torch.zeros(response_mask.shape, dtype=new_logprobs.dtype, device=response_mask.device)
         mask[valid] = keep_by_sequence[flat_ids]
@@ -834,6 +868,7 @@ def compute_grpo_loss(
     config: GRPOExperimentConfig,
     tis_weights: torch.Tensor | None = None,
     policy_freeze_mask: torch.Tensor | None = None,
+    kl_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if config.loss_fn == GRPOLossType.dapo:
         pg_losses = -advantages * ratio
@@ -885,6 +920,9 @@ def compute_grpo_loss(
     else:
         kl = torch.zeros_like(pg_loss_max)
 
+    if kl_mask is not None:
+        kl = kl * kl_mask
+
     return pg_losses, pg_losses2, pg_loss_max, kl
 
 
@@ -907,6 +945,8 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         response_mask: torch.Tensor,
         policy_mask: torch.Tensor,
         has_policy_mask: bool,
+        kl_mask: torch.Tensor,
+        has_kl_mask: bool,
         policy_freeze_mask: torch.Tensor,
         has_policy_freeze_mask: bool,
         advantages: torch.Tensor,
@@ -937,6 +977,8 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
             raise ValueError("response_mask must match hidden_states batch/sequence dimensions")
         if has_policy_mask and policy_mask.shape != hidden_states.shape[:2]:
             raise ValueError("policy_mask must match hidden_states batch/sequence dimensions")
+        if has_kl_mask and kl_mask.shape != hidden_states.shape[:2]:
+            raise ValueError("kl_mask must match hidden_states batch/sequence dimensions")
         if has_policy_freeze_mask and policy_freeze_mask.shape != hidden_states.shape[:2]:
             raise ValueError("policy_freeze_mask must match hidden_states batch/sequence dimensions")
         if shards < 1:
@@ -955,6 +997,8 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         old_logprobs = old_logprobs.reshape(-1)
         if has_policy_mask:
             policy_mask = policy_mask.reshape(-1)
+        if has_kl_mask:
+            kl_mask = kl_mask.reshape(-1)
         if has_policy_freeze_mask:
             policy_freeze_mask = policy_freeze_mask.reshape(-1)
         if has_ref_logprobs:
@@ -980,6 +1024,7 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         advantage_shards = list(torch.chunk(advantages, chunks=shards, dim=0))
         old_logprob_shards = list(torch.chunk(old_logprobs, chunks=shards, dim=0))
         policy_mask_shards = list(torch.chunk(policy_mask, chunks=shards, dim=0)) if has_policy_mask else []
+        kl_mask_shards = list(torch.chunk(kl_mask, chunks=shards, dim=0)) if has_kl_mask else []
         policy_freeze_mask_shards = (
             list(torch.chunk(policy_freeze_mask, chunks=shards, dim=0)) if has_policy_freeze_mask else []
         )
@@ -1056,6 +1101,8 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
                 else:
                     kl = torch.zeros_like(pg_loss)
                     kl_all = torch.zeros(4, *pg_loss.shape, dtype=pg_loss.dtype, device=pg_loss.device)
+                if has_kl_mask:
+                    kl = kl * kl_mask_shards[shard_idx].to(dtype=kl.dtype)
 
                 shard_mask = mask_shards[shard_idx].to(dtype=pg_loss.dtype)
                 per_token_loss = pg_loss + beta * kl
@@ -1094,7 +1141,7 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         grad = grads[0]
         if isinstance(grad, torch.Tensor):
             x_grad = x_grad * grad.to(dtype=x_grad.dtype)
-        return (None, x_grad, *([None] * 25))
+        return (None, x_grad, *([None] * 27))
 
 
 def tiled_grpo_lm_head_loss(
@@ -1119,6 +1166,7 @@ def tiled_grpo_lm_head_loss(
     rollout_sample_ids: torch.Tensor | None = None,
     sequence_process_group: dist.ProcessGroup | None = None,
     policy_mask: torch.Tensor | None = None,
+    kl_mask: torch.Tensor | None = None,
     policy_freeze_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     has_ref_logprobs = ref_logprobs is not None
@@ -1127,6 +1175,9 @@ def tiled_grpo_lm_head_loss(
     has_policy_mask = policy_mask is not None
     if policy_mask is None:
         policy_mask = torch.empty(0, dtype=response_mask.dtype, device=response_mask.device)
+    has_kl_mask = kl_mask is not None
+    if kl_mask is None:
+        kl_mask = torch.empty(0, dtype=response_mask.dtype, device=response_mask.device)
     has_policy_freeze_mask = policy_freeze_mask is not None
     if policy_freeze_mask is None:
         policy_freeze_mask = torch.empty(0, dtype=response_mask.dtype, device=response_mask.device)
@@ -1141,6 +1192,8 @@ def tiled_grpo_lm_head_loss(
         response_mask,
         policy_mask,
         has_policy_mask,
+        kl_mask,
+        has_kl_mask,
         policy_freeze_mask,
         has_policy_freeze_mask,
         advantages,
