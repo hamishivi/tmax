@@ -603,15 +603,14 @@ class TestComputeSequenceTISMask(unittest.TestCase):
         new_logprobs = vllm_logprobs + torch.tensor([[20.0, -10.0]])
         response_mask = torch.ones_like(new_logprobs, dtype=torch.bool)
 
-        mask = grpo_utils.compute_sequence_tis_mask(
-            new_logprobs,
-            vllm_logprobs,
-            response_mask,
-            log_ratio_threshold=0.0,
-            ratio_upper_bound=2.0,
+        mask, lower_masked, upper_masked, total = grpo_utils.compute_sequence_tis_mask(
+            new_logprobs, vllm_logprobs, response_mask, ratio_upper_bound=2.0
         )
 
         torch.testing.assert_close(mask, torch.zeros_like(new_logprobs))
+        torch.testing.assert_close(lower_masked, torch.tensor(0.0))
+        torch.testing.assert_close(upper_masked, torch.tensor(1.0))
+        torch.testing.assert_close(total, torch.tensor(1.0))
 
     def test_direct_geometric_mean_bounds_mask_both_sides(self):
         # Each row is constant, so its geometric mean is 0.998, 0.999, 1.0,
@@ -621,17 +620,15 @@ class TestComputeSequenceTISMask(unittest.TestCase):
         new_logprobs = vllm_logprobs + torch.log(ratios)
         response_mask = torch.ones_like(ratios, dtype=torch.bool)
 
-        mask = grpo_utils.compute_sequence_tis_mask(
-            new_logprobs,
-            vllm_logprobs,
-            response_mask,
-            log_ratio_threshold=0.0,
-            ratio_lower_bound=0.999,
-            ratio_upper_bound=1.001,
+        mask, lower_masked, upper_masked, total = grpo_utils.compute_sequence_tis_mask(
+            new_logprobs, vllm_logprobs, response_mask, ratio_lower_bound=0.999, ratio_upper_bound=1.001
         )
 
         expected = torch.tensor([[0.0], [1.0], [1.0], [1.0], [0.0]])
         torch.testing.assert_close(mask, expected)
+        torch.testing.assert_close(lower_masked, torch.tensor(1.0))
+        torch.testing.assert_close(upper_masked, torch.tensor(1.0))
+        torch.testing.assert_close(total, torch.tensor(5.0))
 
     def test_uses_geometric_mean_of_current_over_rollout_ratio_and_broadcasts(self):
         ratios = torch.tensor([[2.0, 8.0], [0.25, 1.0]])
@@ -639,33 +636,17 @@ class TestComputeSequenceTISMask(unittest.TestCase):
         new_logprobs = vllm_logprobs + torch.log(ratios)
         response_mask = torch.ones_like(ratios, dtype=torch.bool)
 
-        mask = grpo_utils.compute_sequence_tis_mask(
-            new_logprobs,
-            vllm_logprobs,
-            response_mask,
-            log_ratio_threshold=torch.log(torch.tensor(2.0)).item(),
+        mask, lower_masked, upper_masked, total = grpo_utils.compute_sequence_tis_mask(
+            new_logprobs, vllm_logprobs, response_mask, ratio_upper_bound=2.0
         )
 
         # Geometric means are 4.0 and 0.5, respectively. The sequence-level
         # decision is broadcast to both response tokens in each row.
         expected = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
         torch.testing.assert_close(mask, expected)
-
-    def test_legacy_threshold_masks_all_out_of_range_sequences(self):
-        ratios = torch.tensor([[4.0, 4.0], [4.0, 4.0]])
-        vllm_logprobs = torch.full_like(ratios, -3.0)
-        new_logprobs = vllm_logprobs + torch.log(ratios)
-        response_mask = torch.ones_like(ratios, dtype=torch.bool)
-
-        mask = grpo_utils.compute_sequence_tis_mask(
-            new_logprobs,
-            vllm_logprobs,
-            response_mask,
-            log_ratio_threshold=torch.log(torch.tensor(2.0)).item(),
-        )
-
-        expected = torch.zeros_like(ratios)
-        torch.testing.assert_close(mask, expected)
+        torch.testing.assert_close(lower_masked, torch.tensor(0.0))
+        torch.testing.assert_close(upper_masked, torch.tensor(1.0))
+        torch.testing.assert_close(total, torch.tensor(2.0))
 
 
 class TestComputeGRPOLoss(unittest.TestCase):

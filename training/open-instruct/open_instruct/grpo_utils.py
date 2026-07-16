@@ -128,13 +128,6 @@ class GRPOExperimentConfig(
     When >0, tokens with ratio ≥ tis_mask_upper are multiplied by 0 in the pg loss.
     Set to 0 to disable the upper side of the mask.
     """
-    sequence_tis_mask_log_ratio_threshold: float = 0.0
-    """Sequence-level threshold δ for avg log(π_θ / π_rollout).
-
-    This is log of the geometric-mean token ratio. When >0, whole response samples
-    whose geometric-mean ratio exceeds exp(δ) are masked. This legacy option
-    cannot be combined with sequence_tis_mask_lower or sequence_tis_mask_upper.
-    """
     sequence_tis_mask_lower: float = 0.0
     """Lower bound for the geometric-mean sequence ratio.
 
@@ -388,11 +381,6 @@ class GRPOExperimentConfig(
                 "tis_mask_lower must be less than tis_mask_upper when both mask bounds are enabled, "
                 f"got {self.tis_mask_lower=} and {self.tis_mask_upper=}."
             )
-        if self.sequence_tis_mask_log_ratio_threshold < 0.0:
-            raise ValueError(
-                "sequence_tis_mask_log_ratio_threshold must be ≥ 0 "
-                f"(got {self.sequence_tis_mask_log_ratio_threshold=}). Use 0 to disable."
-            )
         if self.sequence_tis_mask_lower < 0.0 or self.sequence_tis_mask_upper < 0.0:
             raise ValueError(
                 "sequence_tis_mask_lower and sequence_tis_mask_upper must be ≥ 0 "
@@ -406,13 +394,6 @@ class GRPOExperimentConfig(
             raise ValueError(
                 "sequence_tis_mask_lower must be less than sequence_tis_mask_upper when both are enabled, "
                 f"got {self.sequence_tis_mask_lower=} and {self.sequence_tis_mask_upper=}."
-            )
-        if self.sequence_tis_mask_log_ratio_threshold > 0.0 and (
-            self.sequence_tis_mask_lower > 0.0 or self.sequence_tis_mask_upper > 0.0
-        ):
-            raise ValueError(
-                "sequence_tis_mask_log_ratio_threshold cannot be combined with sequence_tis_mask_lower "
-                "or sequence_tis_mask_upper. Use either the legacy log threshold or the direct ratio bounds."
             )
         if self.loss_denominator not in ("token", "sequence") and float(self.loss_denominator) <= 0:
             raise ValueError(
@@ -554,20 +535,21 @@ def compute_sequence_tis_mask(
     new_logprobs: torch.Tensor,
     vllm_logprobs: torch.Tensor,
     response_mask: torch.Tensor,
-    log_ratio_threshold: float,
     rollout_sample_ids: torch.Tensor | None = None,
     sequence_process_group: dist.ProcessGroup | None = None,
     ratio_lower_bound: float = 0.0,
     ratio_upper_bound: float = 0.0,
-) -> torch.Tensor | None:
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Gate a whole sequence using the geometric mean of ρ_t = π_θ / π_rollout.
 
     The aggregation is evaluated in log space for numerical stability:
     ``log(ρ_geo) = mean_t(log(ρ_t))``. The returned decision is broadcast to
-    every valid response token in the sequence.
+    every valid response token in the sequence. Also returns scalar counts of
+    sequences masked by the lower bound, masked by the upper bound, and evaluated.
     """
-    if log_ratio_threshold <= 0.0 and ratio_lower_bound <= 0.0 and ratio_upper_bound <= 0.0:
-        return None
+    zero_count = torch.zeros((), dtype=torch.float32, device=response_mask.device)
+    if ratio_lower_bound <= 0.0 and ratio_upper_bound <= 0.0:
+        return None, zero_count, zero_count.clone(), zero_count.clone()
     with torch.no_grad():
         if rollout_sample_ids is not None:
             sequence_ids = rollout_sample_ids
@@ -585,7 +567,8 @@ def compute_sequence_tis_mask(
         if sequence_process_group is not None:
             dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=sequence_process_group)
         if local_max.item() < 0:
-            return torch.zeros(response_mask.shape, dtype=new_logprobs.dtype, device=response_mask.device)
+            empty_mask = torch.zeros(response_mask.shape, dtype=new_logprobs.dtype, device=response_mask.device)
+            return empty_mask, zero_count, zero_count.clone(), zero_count.clone()
 
         counts = torch.zeros(int(local_max.item()) + 1, dtype=torch.float32, device=response_mask.device)
 
@@ -601,17 +584,23 @@ def compute_sequence_tis_mask(
             dist.all_reduce(log_ratio_sums, op=dist.ReduceOp.SUM, group=sequence_process_group)
 
         avg_log_ratio = log_ratio_sums / counts.clamp_min(1.0)
-        sequence_should_mask = torch.zeros_like(avg_log_ratio, dtype=torch.bool)
-        if log_ratio_threshold > 0.0:
-            sequence_should_mask |= avg_log_ratio > log_ratio_threshold
+        evaluated_sequences = counts > 0
+        lower_should_mask = torch.zeros_like(avg_log_ratio, dtype=torch.bool)
+        upper_should_mask = torch.zeros_like(avg_log_ratio, dtype=torch.bool)
         if ratio_lower_bound > 0.0:
-            sequence_should_mask |= avg_log_ratio < math.log(ratio_lower_bound)
+            lower_should_mask = evaluated_sequences & (avg_log_ratio < math.log(ratio_lower_bound))
         if ratio_upper_bound > 0.0:
-            sequence_should_mask |= avg_log_ratio > math.log(ratio_upper_bound)
+            upper_should_mask = evaluated_sequences & (avg_log_ratio > math.log(ratio_upper_bound))
+        sequence_should_mask = lower_should_mask | upper_should_mask
         keep_by_sequence = (~sequence_should_mask).to(dtype=new_logprobs.dtype)
         mask = torch.zeros(response_mask.shape, dtype=new_logprobs.dtype, device=response_mask.device)
         mask[valid] = keep_by_sequence[flat_ids]
-        return mask
+        return (
+            mask,
+            lower_should_mask.sum(dtype=torch.float32),
+            upper_should_mask.sum(dtype=torch.float32),
+            evaluated_sequences.sum(dtype=torch.float32),
+        )
 
 
 def resolve_old_logprob(

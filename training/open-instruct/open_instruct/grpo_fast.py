@@ -1064,15 +1064,15 @@ class PolicyTrainerRayProcess(RayProcess):
                 value_step_metrics["value/predictions_mean"] = float(np.mean(preds_np))
                 value_step_metrics["value/predictions_std"] = float(np.std(preds_np))
                 value_step_metrics["value/explained_variance"] = 1.0 - float(np.var(residuals)) / (return_var + 1e-8)
+        sequence_tis_mask_enabled = self.args.sequence_tis_mask_lower > 0.0 or self.args.sequence_tis_mask_upper > 0.0
         tis_mask_enabled = (
-            self.args.tis_mask_lower > 0.0
-            or self.args.tis_mask_upper > 0.0
-            or self.args.sequence_tis_mask_log_ratio_threshold > 0.0
-            or self.args.sequence_tis_mask_lower > 0.0
-            or self.args.sequence_tis_mask_upper > 0.0
+            self.args.tis_mask_lower > 0.0 or self.args.tis_mask_upper > 0.0 or sequence_tis_mask_enabled
         )
         tis_mask_kept_tokens = torch.zeros((), device=device)
         tis_mask_total_tokens = torch.zeros((), device=device)
+        sequence_tis_lower_masked = torch.zeros((), device=device)
+        sequence_tis_upper_masked = torch.zeros((), device=device)
+        sequence_tis_total = torch.zeros((), device=device)
         dppo_enabled = self.args.loss_fn == grpo_utils.GRPOLossType.dppo
         dppo_mask_kept_tokens = torch.zeros((), device=device)
         dppo_mask_total_tokens = torch.zeros((), device=device)
@@ -1146,18 +1146,22 @@ class PolicyTrainerRayProcess(RayProcess):
                                 self.args.tis_mask_lower,
                                 self.args.tis_mask_upper,
                             )
-                            sequence_tis_mask_BT = grpo_utils.compute_sequence_tis_mask(
-                                debug_logprobs_BT,
-                                vllm_logprobs_BT,
-                                response_mask_BT,
-                                self.args.sequence_tis_mask_log_ratio_threshold,
-                                data_BT.rollout_sample_ids[i][:, 1:]
-                                if data_BT.rollout_sample_ids is not None
-                                else None,
-                                self._sp_group,
-                                self.args.sequence_tis_mask_lower,
-                                self.args.sequence_tis_mask_upper,
+                            (sequence_tis_mask_BT, sequence_lower_masked, sequence_upper_masked, sequence_total) = (
+                                grpo_utils.compute_sequence_tis_mask(
+                                    debug_logprobs_BT,
+                                    vllm_logprobs_BT,
+                                    response_mask_BT,
+                                    data_BT.rollout_sample_ids[i][:, 1:]
+                                    if data_BT.rollout_sample_ids is not None
+                                    else None,
+                                    self._sp_group,
+                                    self.args.sequence_tis_mask_lower,
+                                    self.args.sequence_tis_mask_upper,
+                                )
                             )
+                            sequence_tis_lower_masked += sequence_lower_masked
+                            sequence_tis_upper_masked += sequence_upper_masked
+                            sequence_tis_total += sequence_total
                             self._record_vllm_local_logprob_debug(
                                 debug_logprobs_BT, vllm_logprobs_BT, response_mask_BT
                             )
@@ -1300,16 +1304,20 @@ class PolicyTrainerRayProcess(RayProcess):
                         self.args.tis_mask_lower,
                         self.args.tis_mask_upper,
                     )
-                    sequence_tis_mask_BT = grpo_utils.compute_sequence_tis_mask(
-                        new_logprobs_BT,
-                        vllm_logprobs_BT,
-                        response_mask_BT,
-                        self.args.sequence_tis_mask_log_ratio_threshold,
-                        data_BT.rollout_sample_ids[i][:, 1:] if data_BT.rollout_sample_ids is not None else None,
-                        self._sp_group,
-                        self.args.sequence_tis_mask_lower,
-                        self.args.sequence_tis_mask_upper,
+                    (sequence_tis_mask_BT, sequence_lower_masked, sequence_upper_masked, sequence_total) = (
+                        grpo_utils.compute_sequence_tis_mask(
+                            new_logprobs_BT,
+                            vllm_logprobs_BT,
+                            response_mask_BT,
+                            data_BT.rollout_sample_ids[i][:, 1:] if data_BT.rollout_sample_ids is not None else None,
+                            self._sp_group,
+                            self.args.sequence_tis_mask_lower,
+                            self.args.sequence_tis_mask_upper,
+                        )
                     )
+                    sequence_tis_lower_masked += sequence_lower_masked
+                    sequence_tis_upper_masked += sequence_upper_masked
+                    sequence_tis_total += sequence_total
                     if self.args.loss_fn == grpo_utils.GRPOLossType.dppo:
                         dppo_mask_BT, _ = grpo_utils.compute_dppo_mask(
                             new_logprobs=new_logprobs_BT,
@@ -1474,6 +1482,18 @@ class PolicyTrainerRayProcess(RayProcess):
                         else torch.zeros((), device=device)
                     )
                     self.local_metrics["debug/tis_mask_frac_kept"] = float(frac_kept)
+                if sequence_tis_mask_enabled:
+                    if sequence_tis_total > 0:
+                        sequence_lower_frac = sequence_tis_lower_masked / sequence_tis_total
+                        sequence_upper_frac = sequence_tis_upper_masked / sequence_tis_total
+                        sequence_kept_frac = 1.0 - sequence_lower_frac - sequence_upper_frac
+                    else:
+                        sequence_lower_frac = torch.zeros((), device=device)
+                        sequence_upper_frac = torch.zeros((), device=device)
+                        sequence_kept_frac = torch.zeros((), device=device)
+                    self.local_metrics["debug/sequence_tis_mask_lower_frac"] = float(sequence_lower_frac)
+                    self.local_metrics["debug/sequence_tis_mask_upper_frac"] = float(sequence_upper_frac)
+                    self.local_metrics["debug/sequence_tis_mask_frac_kept"] = float(sequence_kept_frac)
                 if dppo_enabled:
                     dppo_frac_kept = (
                         dppo_mask_kept_tokens / dppo_mask_total_tokens
