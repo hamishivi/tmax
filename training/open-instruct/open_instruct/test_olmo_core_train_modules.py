@@ -197,7 +197,7 @@ class TestTiledGRPOLMHeadLoss(unittest.TestCase):
         dense_loss = ((pg_loss + beta * kl) * response_mask).sum() / response_mask.sum() * loss_scale
         dense_loss.backward()
 
-        tiled_loss, tiled_kl, tiled_clipfrac, tiled_ratio = grpo_utils.tiled_grpo_lm_head_loss(
+        tiled_loss, tiled_kl, tiled_clipfrac, tiled_ratio, tiled_entropy = grpo_utils.tiled_grpo_lm_head_loss(
             lm_head=lm_head_tiled,
             hidden_states=hidden_tiled,
             selected_token_ids=selected_token_ids,
@@ -211,6 +211,7 @@ class TestTiledGRPOLMHeadLoss(unittest.TestCase):
             clip_higher=clip_higher,
             shards=3,
             loss_scale=loss_scale,
+            record_entropy=True,
         )
         tiled_loss.backward()
 
@@ -221,6 +222,9 @@ class TestTiledGRPOLMHeadLoss(unittest.TestCase):
         expected_clipfrac = ((pg_losses2 > pg_losses).float() * response_mask).sum() / response_mask.sum()
         torch.testing.assert_close(tiled_clipfrac, expected_clipfrac)
         torch.testing.assert_close(tiled_ratio, (ratio * response_mask).sum() / response_mask.sum())
+        dense_entropy = model_utils.entropy_from_logits(logits.detach())
+        expected_entropy = (dense_entropy * response_mask).sum() / response_mask.sum()
+        torch.testing.assert_close(tiled_entropy, expected_entropy)
         torch.testing.assert_close(hidden_tiled.grad, hidden_dense.grad)
         torch.testing.assert_close(lm_head_tiled.weight.grad, lm_head_dense.weight.grad)
         torch.testing.assert_close(lm_head_tiled.bias.grad, lm_head_dense.bias.grad)
@@ -992,6 +996,11 @@ class TestDPPOLoss(unittest.TestCase):
 
 
 class TestLigerGRPOLossConfig(unittest.TestCase):
+    def test_liger_grpo_loss_accepts_entropy_monitoring(self):
+        config = grpo_utils.GRPOExperimentConfig(use_liger_grpo_loss=True, record_entropy=True)
+
+        self.assertTrue(config.record_entropy)
+
     def test_liger_grpo_loss_rejects_unsupported_loss_fn(self):
         with self.assertRaisesRegex(ValueError, "loss_fn=dapo.*loss_fn=cispo.*loss_fn=dppo.*loss_fn=tvpo"):
             grpo_utils.GRPOExperimentConfig(

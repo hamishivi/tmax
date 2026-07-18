@@ -811,7 +811,7 @@ class PolicyTrainerRayProcess(RayProcess):
         torch.cuda.synchronize()
         dp_world_size = self.args.world_size // self.args.sequence_parallel_size
         scale = current_global_count * dp_world_size / (self.args.world_size * float(loss_denominator))
-        loss, kl_avg, clipfrac, ratio_avg = grpo_utils.tiled_grpo_lm_head_loss(
+        tiled_outputs = grpo_utils.tiled_grpo_lm_head_loss(
             lm_head=lm_head,
             hidden_states=hidden_states,
             selected_token_ids=selected_token_ids,
@@ -835,10 +835,16 @@ class PolicyTrainerRayProcess(RayProcess):
             rollout_sample_ids=rollout_sample_ids,
             sequence_process_group=self._sp_group,
             policy_freeze_mask=policy_freeze_mask,
+            record_entropy=self.args.record_entropy,
         )
+        if self.args.record_entropy:
+            loss, kl_avg, clipfrac, ratio_avg, entropy_avg = tiled_outputs
+        else:
+            loss, kl_avg, clipfrac, ratio_avg = tiled_outputs
+            entropy_avg = None
         if ref_logprobs is not None:
-            return loss, (kl_avg, clipfrac, ratio_avg)
-        return loss, (clipfrac, ratio_avg)
+            return loss, (kl_avg, clipfrac, ratio_avg, entropy_avg)
+        return loss, (clipfrac, ratio_avg, entropy_avg)
 
     def _compute_logprobs(
         self, model: torch.nn.Module, data_BT: data_types.CollatedBatchData, cp_contexts_BT: list[Any]
@@ -1254,6 +1260,8 @@ class PolicyTrainerRayProcess(RayProcess):
                             loss_stats_B["policy/clipfrac_avg"][i] = clip_metric
                             loss_stats_B["loss/total_avg"][i] = loss.detach()
                             loss_stats_B["val/ratio"][i] = ratio_metric
+                            if self.args.record_entropy:
+                                loss_stats_B["policy/entropy_avg"][i] = tiled_metrics[-1]
                         continue
 
                     local_logprobs_BT, entropy_BT = grpo_utils.forward_for_logprobs(

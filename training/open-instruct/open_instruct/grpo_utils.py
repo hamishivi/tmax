@@ -198,7 +198,7 @@ class GRPOExperimentConfig(
     blow-ups in extreme ratios. Only used when ``loss_fn=tvpo``.
     """
     record_entropy: bool = False
-    """whether to record the entropy of the policy during training. Uses extra memory."""
+    """Whether to record policy entropy. The tiled loss computes it one LM-head tile at a time."""
     use_vllm_logprobs: bool = False
     """whether to use vLLM's logprobs for training instead of calculating them via forward pass"""
 
@@ -321,8 +321,6 @@ class GRPOExperimentConfig(
                     "`use_liger_grpo_loss` currently only supports `loss_fn=dapo`, `loss_fn=cispo`, "
                     "`loss_fn=dppo`, or `loss_fn=tvpo`."
                 )
-            if self.record_entropy:
-                raise ValueError("`use_liger_grpo_loss` does not support `record_entropy=True`.")
             if self.loss_denominator not in ("token", "sequence"):
                 raise ValueError("`use_liger_grpo_loss` currently requires `loss_denominator=token` or `sequence`.")
             if self.kl_estimator != 2:
@@ -956,8 +954,9 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         sequence_process_group: dist.ProcessGroup | None,
         shards: int,
         loss_scale: torch.Tensor,
+        record_entropy: bool,
         compute_params: list[torch.nn.Parameter],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.dim() != 3:
             raise ValueError(f"hidden_states must be [B, T, H], got {tuple(hidden_states.shape)}")
         if selected_token_ids.shape != hidden_states.shape[:2]:
@@ -1023,6 +1022,7 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         total_kl_sum = torch.zeros(4, dtype=torch.float32, device=hidden_states.device)
         total_clip_sum = torch.zeros_like(total_loss_sum)
         total_ratio_sum = torch.zeros_like(total_loss_sum)
+        total_entropy_sum = torch.zeros_like(total_loss_sum)
         compute_params = [p for p in compute_params if p.requires_grad]
 
         for shard_idx, x_shard in enumerate(x_shards):
@@ -1044,6 +1044,10 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
                 shard_labels = label_shards[shard_idx]
                 new_logprobs = torch.gather(logits, dim=-1, index=shard_labels.unsqueeze(-1)).squeeze(-1)
                 new_logprobs = new_logprobs - torch.logsumexp(logits, dim=-1)
+
+                if record_entropy:
+                    with torch.no_grad():
+                        entropy = model_utils.entropy_from_logits(logits)
 
                 ratio = torch.exp(new_logprobs - old_logprob_shards[shard_idx])
                 if loss_type == GRPOLossType.dapo:
@@ -1101,6 +1105,8 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
             total_kl_sum = total_kl_sum + (kl_all.detach().float() * shard_mask.float()).sum(dim=-1)
             total_clip_sum = total_clip_sum + ((pg_losses2 > pg_losses).detach().float() * shard_mask.float()).sum()
             total_ratio_sum = total_ratio_sum + (ratio.detach().float() * shard_mask.float()).sum()
+            if record_entropy:
+                total_entropy_sum = total_entropy_sum + (entropy.float() * shard_mask.float()).sum()
             torch.autograd.backward(loss_sum, incoming_grad.to(dtype=loss_sum.dtype))
 
         if compute_params:
@@ -1111,6 +1117,8 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
             dist.all_reduce(total_kl_sum, op=dist.ReduceOp.SUM, group=sequence_process_group)
             dist.all_reduce(total_clip_sum, op=dist.ReduceOp.SUM, group=sequence_process_group)
             dist.all_reduce(total_ratio_sum, op=dist.ReduceOp.SUM, group=sequence_process_group)
+            if record_entropy:
+                dist.all_reduce(total_entropy_sum, op=dist.ReduceOp.SUM, group=sequence_process_group)
             dist.all_reduce(metric_denom, op=dist.ReduceOp.SUM, group=sequence_process_group)
         metric_denom = metric_denom.clamp_min(1.0)
 
@@ -1122,7 +1130,8 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         kl_avg = total_kl_sum / metric_denom
         clipfrac = total_clip_sum / metric_denom
         ratio_avg = total_ratio_sum / metric_denom
-        return loss, kl_avg, clipfrac, ratio_avg
+        entropy_avg = total_entropy_sum / metric_denom
+        return loss, kl_avg, clipfrac, ratio_avg, entropy_avg
 
     @staticmethod
     def backward(ctx, *grads) -> tuple:
@@ -1130,7 +1139,7 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         grad = grads[0]
         if isinstance(grad, torch.Tensor):
             x_grad = x_grad * grad.to(dtype=x_grad.dtype)
-        return (None, x_grad, *([None] * 27))
+        return (None, x_grad, *([None] * 28))
 
 
 def tiled_grpo_lm_head_loss(
@@ -1157,7 +1166,9 @@ def tiled_grpo_lm_head_loss(
     policy_mask: torch.Tensor | None = None,
     kl_mask: torch.Tensor | None = None,
     policy_freeze_mask: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    record_entropy: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    """Compute tiled GRPO loss metrics, optionally appending average response-token entropy."""
     has_ref_logprobs = ref_logprobs is not None
     if ref_logprobs is None:
         ref_logprobs = torch.empty(0, dtype=old_logprobs.dtype, device=old_logprobs.device)
@@ -1174,7 +1185,7 @@ def tiled_grpo_lm_head_loss(
     if rollout_sample_ids is None:
         rollout_sample_ids = torch.empty(0, dtype=torch.long, device=old_logprobs.device)
     compute_params = list(lm_head.parameters(recurse=False))
-    return TiledGRPOLMHeadLoss.apply(
+    outputs = TiledGRPOLMHeadLoss.apply(
         lm_head,
         hidden_states,
         selected_token_ids,
@@ -1203,8 +1214,10 @@ def tiled_grpo_lm_head_loss(
         sequence_process_group,
         shards,
         loss_scale,
+        record_entropy,
         compute_params,
     )
+    return outputs if record_entropy else outputs[:4]
 
 
 def _compute_packing_kwargs(position_ids: torch.Tensor, cp_context: object | None = None) -> dict:
