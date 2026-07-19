@@ -2884,7 +2884,7 @@ def run_training(
             enable=False,
         )
 
-    def initialize_weight_sync() -> tuple[futures.Future, WeightSyncTrigger]:
+    def initialize_weight_sync(initial_model_step: int) -> tuple[futures.Future, WeightSyncTrigger]:
         logger.info("[Main Thread] Initializing native vLLM weight sync.")
 
         ray_get_with_progress(
@@ -2912,7 +2912,7 @@ def run_training(
         )
 
         logger.info("[Main Thread] Triggering initial native vLLM weight sync.")
-        trigger.notify(step=resume_training_step)
+        trigger.notify(step=initial_model_step)
         health_check_fn(future, expect_new_weight_sync=True)
         return future, trigger
 
@@ -2933,7 +2933,9 @@ def run_training(
     if args.deepspeed_stage == 3:
         logger.info("[Main Thread] ZeRO-3: running dummy optimizer step to prime NCCL state.")
         ray_get_with_progress([m.dummy_optimizer_step.remote() for m in policy_group.models], desc="ZeRO-3 dummy step")
-        weight_sync_thread_future, weight_sync_trigger = initialize_weight_sync()
+        # The next real optimizer step has not run yet, so the synced policy is
+        # the checkpoint from the preceding completed training step.
+        weight_sync_thread_future, weight_sync_trigger = initialize_weight_sync(resume_training_step - 1)
     ray_get_with_progress([_data_prep_actor.start.remote()], desc="Starting data prep actor")
 
     if eval_dataset is not None:
@@ -3055,7 +3057,7 @@ def run_training(
             # Non-ZeRO-3 runs initialise weight sync after the first training
             # step. ZeRO-3 is handled pre-loop via a dummy step, so
             # weight_sync_trigger is already set in that case.
-            weight_sync_thread_future, weight_sync_trigger = initialize_weight_sync()
+            weight_sync_thread_future, weight_sync_trigger = initialize_weight_sync(training_step)
 
         last_eval_collected = maybe_evaluate(
             args,
