@@ -23,6 +23,31 @@ logger = logger_utils.setup_logger(__name__)
 TORCH_DTYPES: dict[str, torch.dtype] = {"bfloat16": torch.bfloat16, "float32": torch.float32}
 
 
+def should_capture_policy_checkpoint(
+    training_step: int,
+    save_freq: int,
+    capture_checkpoint_window: int = 0,
+    eval_on_step_0: bool = False,
+) -> bool:
+    """Return whether this step is a regular policy checkpoint or falls in its capture window."""
+    if save_freq <= 0:
+        return False
+
+    regular_checkpoint = training_step > 1 and training_step % save_freq == 0
+    step_zero_checkpoint = eval_on_step_0 and training_step == 1
+    if regular_checkpoint or step_zero_checkpoint:
+        return True
+
+    if capture_checkpoint_window <= 0:
+        return False
+
+    if eval_on_step_0 and 1 < training_step <= 1 + capture_checkpoint_window:
+        return True
+
+    previous_regular_checkpoint = (training_step // save_freq) * save_freq
+    return previous_regular_checkpoint > 1 and training_step <= previous_regular_checkpoint + capture_checkpoint_window
+
+
 def compute_pass_at_k_metrics(correct_per_prompt: np.ndarray) -> dict[str, float]:
     """Average pass@1 plus unbiased pass@k (Chen et al.) for k in 1, 2, 4, ... <= n.
 
@@ -92,6 +117,8 @@ class GRPOExperimentConfig(
     """Run evaluation after this many training steps. This controls in-loop evals, which reuse the generation/reward verifier setup. Set to -1 to disable."""
     save_freq: int = 200
     """How many train steps to save the model"""
+    capture_checkpoint_window: int = 0
+    """Save this many additional policy checkpoints immediately after each normally scheduled checkpoint."""
     backend_timeout: int = 120
     """Timeout for inference/training backends in minutes. Default is 2 hours (120 min)."""
     model_dtype: str = "bfloat16"
@@ -400,6 +427,10 @@ class GRPOExperimentConfig(
             )
         if self.checkpoint_state_dir is not None and self.checkpoint_state_freq == -1:
             raise ValueError("`checkpoint_state_freq` must be greater than 0 if `checkpoint_state_dir` is provided!")
+        if self.capture_checkpoint_window < 0:
+            raise ValueError(
+                f"`capture_checkpoint_window` must be greater than or equal to 0, got {self.capture_checkpoint_window}."
+            )
 
         if self.gs_checkpoint_state_dir is not None and not self.gs_checkpoint_state_dir.startswith("gs://"):
             raise ValueError(f"`gs_checkpoint_state_dir` must start with 'gs://', got: {self.gs_checkpoint_state_dir}")

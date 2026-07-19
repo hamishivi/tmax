@@ -2561,8 +2561,11 @@ def maybe_save_checkpoint(
     wandb_url: str,
 ) -> float:
     save_time = 0
-    if args.save_freq > 0 and (
-        (args.eval_on_step_0 and training_step == 1) or (training_step % args.save_freq == 0 and training_step > 1)
+    if grpo_utils.should_capture_policy_checkpoint(
+        training_step=training_step,
+        save_freq=args.save_freq,
+        capture_checkpoint_window=args.capture_checkpoint_window,
+        eval_on_step_0=args.eval_on_step_0,
     ):
         with Timer("[Main Thread] 🗡️ Saving model") as timer:
             checkpoint_dir = f"{args.output_dir}_checkpoints"
