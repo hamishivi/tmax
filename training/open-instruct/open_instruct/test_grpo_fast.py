@@ -478,6 +478,70 @@ class TestGrpoFastVLLM(TestGrpoFastBase):
 class GrpoIntegrationTests(TestGrpoFastBase):
     """Integration tests for GRPO with parallel processing."""
 
+    def test_active_sampling_replenishes_filtered_prompt_with_one_async_step(self):
+        config = data_loader_lib.StreamingDataLoaderConfig(
+            max_prompt_token_length=64,
+            response_length=32,
+            pack_length=128,
+            async_steps=1,
+            num_samples_per_prompt_rollout=2,
+            num_unique_prompts_rollout=1,
+            active_sampling=True,
+            filter_zero_std_samples=True,
+        )
+
+        queries, ground_truths, datasets, raw_queries, _ = self.create_test_data(2)
+        mock_dataset = self.create_mock_dataset(queries, ground_truths, datasets, raw_queries)
+        inference_results_Q = ray_queue.Queue(maxsize=4)
+        prompt_Q = ray_queue.Queue(maxsize=4)
+        self._ray_queues.extend([inference_results_Q, prompt_Q])
+
+        class FakeDataLoader:
+            _epoch = 0
+
+            def __next__(self):
+                return mock_dataset[1]
+
+        # The sole initially generated prompt is filtered because all samples
+        # have the same reward. Its replacement must complete the batch.
+        inference_results_Q.put(self.create_mock_result(0, "0_0", num_samples_per_prompt=2, reward_scores=[0.0, 0.0]))
+
+        def generate_replacement():
+            request = prompt_Q.get(timeout=2)
+            inference_results_Q.put(
+                self.create_mock_result(
+                    request.index, request.prompt_id, num_samples_per_prompt=2, reward_scores=[0.0, 1.0]
+                )
+            )
+
+        producer = threading.Thread(target=generate_replacement, daemon=True)
+        producer.start()
+
+        tokenizer = Mock()
+        tokenizer.batch_decode.side_effect = lambda responses, **_: ["response"] * len(responses)
+        generation_config = Mock(n=config.num_samples_per_prompt_rollout)
+        _, batch, _, batch_stats = data_loader_lib.accumulate_inference_batches(
+            inference_results_Q,
+            generation_config,
+            num_prompts=config.num_unique_prompts_rollout,
+            model_dims=self.create_llama7b_model_dims(),
+            tokenizer=tokenizer,
+            dataset=mock_dataset,
+            base_env_config=EnvConfig(),
+            active_sampling=config.active_sampling,
+            filter_zero_std_samples=config.filter_zero_std_samples,
+            replenish_prompts=True,
+            iter_dataloader=FakeDataLoader(),
+            param_prompt_Q=prompt_Q,
+            timeout=2,
+        )
+
+        producer.join(timeout=2)
+        self.assertFalse(producer.is_alive())
+        self.assertEqual(batch.indices, [1, 1])
+        self.assertEqual(batch_stats.filtered_prompts, 1)
+        self.assertEqual(batch_stats.total_prompts, 1)
+
     def test_out_of_order_processing(self):
         """Test that dataset indices can be processed out of order."""
         num_engines = 4
