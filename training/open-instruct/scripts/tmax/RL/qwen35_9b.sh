@@ -5,6 +5,7 @@
 # but with the dataset mixer list changed ofc :)
 
 BEAKER_IMAGE="${1:?Usage: $0 <beaker-image>}"
+ASYNC_STEPS="${ASYNC_STEPS:-4}"
 
 uv run python mason.py \
        --cluster ai2/jupiter \
@@ -51,7 +52,7 @@ uv run python mason.py \
     --per_device_train_batch_size 1 \
     --num_unique_prompts_rollout 8 \
     --num_samples_per_prompt_rollout 32 \
-    --async_steps 4 \
+    --async_steps "$ASYNC_STEPS" \
     --model_name_or_path hamishivi/Qwen3.5-9B \
     --temperature 1.0 \
     --learning_rate 1e-6 \

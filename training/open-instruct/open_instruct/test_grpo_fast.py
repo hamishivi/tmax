@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from queue import Empty
 from typing import Any
 from unittest.mock import MagicMock, Mock
 
@@ -27,6 +28,15 @@ from open_instruct.dataset_transformation import (
 
 
 class TestBatchMetrics(unittest.TestCase):
+    def test_zero_async_steps_is_supported(self):
+        config = data_loader_lib.StreamingDataLoaderConfig(async_steps=0)
+
+        self.assertEqual(config.async_steps, 0)
+
+    def test_negative_async_steps_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "greater than or equal to 0"):
+            data_loader_lib.StreamingDataLoaderConfig(async_steps=-1)
+
     def test_compute_avg_group_performance(self):
         avg_group_perf = data_loader_lib._compute_avg_group_performance(
             n_solved=2, n_zero=3, n_kept=5, batch_avg_score=0.4
@@ -542,6 +552,123 @@ class GrpoIntegrationTests(TestGrpoFastBase):
         self.assertEqual(batch_stats.filtered_prompts, 1)
         self.assertEqual(batch_stats.total_prompts, 1)
 
+    def test_synchronous_accumulation_replenishes_only_filtered_prompts(self):
+        config = data_loader_lib.StreamingDataLoaderConfig(
+            max_prompt_token_length=64,
+            response_length=32,
+            pack_length=128,
+            async_steps=0,
+            num_samples_per_prompt_rollout=2,
+            num_unique_prompts_rollout=1,
+            active_sampling=True,
+            filter_zero_std_samples=True,
+        )
+
+        queries, ground_truths, datasets, raw_queries, _ = self.create_test_data(3)
+        mock_dataset = self.create_mock_dataset(queries, ground_truths, datasets, raw_queries)
+        inference_results_Q = ray_queue.Queue(maxsize=4)
+        prompt_Q = ray_queue.Queue(maxsize=4)
+        self._ray_queues.extend([inference_results_Q, prompt_Q])
+
+        class FakeDataLoader:
+            _epoch = 0
+
+            def __next__(self):
+                return mock_dataset[2]
+
+        inference_results_Q.put(self.create_mock_result(0, "0_0", num_samples_per_prompt=2, reward_scores=[0.0, 0.0]))
+        inference_results_Q.put(self.create_mock_result(1, "0_1", num_samples_per_prompt=2, reward_scores=[0.0, 1.0]))
+
+        tokenizer = Mock()
+        tokenizer.batch_decode.side_effect = lambda responses, **_: ["response"] * len(responses)
+        generation_config = Mock(n=config.num_samples_per_prompt_rollout)
+        _, batch, _, batch_stats = data_loader_lib.accumulate_inference_batches(
+            inference_results_Q,
+            generation_config,
+            num_prompts=config.num_unique_prompts_rollout,
+            model_dims=self.create_llama7b_model_dims(),
+            tokenizer=tokenizer,
+            dataset=mock_dataset,
+            base_env_config=EnvConfig(),
+            active_sampling=config.active_sampling,
+            filter_zero_std_samples=config.filter_zero_std_samples,
+            replenish_prompts=True,
+            replenish_accepted_prompts=False,
+            iter_dataloader=FakeDataLoader(),  # type: ignore[invalid-argument-type]
+            param_prompt_Q=prompt_Q,
+            training_step=0,
+        )
+
+        self.assertEqual(batch.indices, [1, 1])
+        self.assertEqual(batch_stats.filtered_prompts, 1)
+        self.assertEqual(prompt_Q.qsize(), 1)
+
+    def test_zero_async_steps_dispatches_on_demand_without_prefetch(self):
+        config = data_loader_lib.StreamingDataLoaderConfig(
+            max_prompt_token_length=64,
+            response_length=32,
+            pack_length=128,
+            async_steps=0,
+            num_samples_per_prompt_rollout=2,
+            num_unique_prompts_rollout=1,
+            filter_zero_std_samples=False,
+        )
+        mock_dataset = Dataset.from_dict(
+            {
+                INPUT_IDS_PROMPT_KEY: [[10, 11]],
+                GROUND_TRUTHS_KEY: ["truth"],
+                VERIFIER_SOURCE_KEY: ["dataset"],
+                RAW_PROMPT_KEY: ["query"],
+                "index": [0],
+            }
+        )
+        inference_results_Q = ray_queue.Queue(maxsize=2)
+        prompt_Q = ray_queue.Queue(maxsize=2)
+        self._ray_queues.extend([inference_results_Q, prompt_Q])
+        tokenizer = Mock(pad_token_id=0)
+        tokenizer.batch_decode.return_value = ["response", "response"]
+        generation_config = Mock(n=config.num_samples_per_prompt_rollout)
+
+        with tempfile.TemporaryDirectory() as work_dir:
+            actor = data_loader_lib.DataPreparationActor.remote(  # type: ignore[unresolved-attribute]
+                dataset=mock_dataset,
+                inference_results_Q=inference_results_Q,
+                param_prompt_Q=prompt_Q,
+                tokenizer=tokenizer,
+                config=config,
+                generation_config=generation_config,
+                num_training_steps=3,
+                seed=42,
+                per_device_train_batch_size=1,
+                global_batch_size=1,
+                dp_world_size=1,
+                max_possible_score=1.0,
+                actor_manager=None,
+                model_dims=self.create_llama7b_model_dims(),
+                verbose=False,
+                work_dir=work_dir,
+                tool_names=[],
+                run_name="test_sync",
+                model_name="test_model",
+                base_env_config=EnvConfig(),
+            )
+            ray.get(actor.start.remote())
+
+            with self.assertRaises(Empty):
+                prompt_Q.get(timeout=0.2)
+
+            batch_ref = actor.get_data.remote(rank=0, step=0)
+            request = prompt_Q.get(timeout=2)
+            inference_results_Q.put(self.create_mock_result_from_request(request, num_samples_per_prompt=2))
+            batch_data = ray.get(batch_ref, timeout=10)
+
+            self.assertIn("batch", batch_data)
+            self.assertEqual(prompt_Q.qsize(), 0)
+            self.assertEqual(inference_results_Q.qsize(), 0)
+            with self.assertRaisesRegex(ray.exceptions.RayTaskError, "expected step 1"):
+                ray.get(actor.get_data.remote(rank=0, step=2))
+            ray.kill(actor)
+
     def test_out_of_order_processing(self):
         """Test that dataset indices can be processed out of order."""
         num_engines = 4
@@ -658,7 +785,8 @@ class GrpoIntegrationTests(TestGrpoFastBase):
 
         self.assertEqual(batch.indices, [1, 2])
         self.assertEqual(len(combined_result.responses), num_prompts)
-        self.assertEqual(prompt_Q.qsize(), 1)
+        # One replacement for the stale result plus one prefetch for each accepted result.
+        self.assertEqual(prompt_Q.qsize(), 3)
         self.assertEqual(reward_metrics["stale_results_dropped"], 1.0)
         self.assertEqual(reward_metrics["model_step_min"], 8.0)
         self.assertEqual(reward_metrics["model_step_max"], 10.0)

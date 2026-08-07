@@ -2298,12 +2298,14 @@ def create_generation_configs(
 
 
 class WeightSyncTrigger:
-    """Event-like trigger that also carries the latest target model step."""
+    """Carry the latest requested model step and acknowledge completed synchronization."""
 
     def __init__(self) -> None:
         self._event = threading.Event()
         self._lock = threading.Lock()
+        self._completion_condition = threading.Condition(self._lock)
         self._step: int | None = None
+        self._completed_step = -1
 
     def notify(self, step: int | None = None) -> None:
         with self._lock:
@@ -2320,6 +2322,19 @@ class WeightSyncTrigger:
             step = self._step
             self._event.clear()
             return step
+
+    def mark_complete(self, step: int) -> None:
+        with self._completion_condition:
+            if step < self._completed_step:
+                raise RuntimeError(
+                    f"Weight synchronization completed out of order: step {step} after {self._completed_step}"
+                )
+            self._completed_step = step
+            self._completion_condition.notify_all()
+
+    def wait_until_complete(self, step: int, timeout: float | None = None) -> bool:
+        with self._completion_condition:
+            return self._completion_condition.wait_for(lambda: self._completed_step >= step, timeout=timeout)
 
 
 def weight_sync_thread(
@@ -2410,6 +2425,9 @@ def weight_sync_thread(
             weight_sync_metrics_Q.put_nowait(sync_time_stats)
         except Full:
             logger.warning("[Weight Sync Thread] weight sync metrics queue full, skipping metric")
+
+        if target_model_step is not None:
+            weight_sync_trigger.mark_complete(target_model_step)
 
     logger.info("[Weight Sync Thread] 🛑 Stopping weight sync thread")
 
@@ -2884,6 +2902,17 @@ def run_training(
             enable=False,
         )
 
+    def wait_for_weight_sync_completion(
+        trigger: WeightSyncTrigger, weight_sync_future: futures.Future, step: int
+    ) -> None:
+        start = time.perf_counter()
+        while not trigger.wait_until_complete(step, timeout=0.1):
+            if weight_sync_future.done():
+                weight_sync_future.result()
+                raise RuntimeError(f"Weight sync thread exited before completing step {step}")
+            if time.perf_counter() - start > WEIGHT_SYNC_TIMEOUT_S:
+                raise RuntimeError(f"Weight sync timed out after {WEIGHT_SYNC_TIMEOUT_S}s for step {step}")
+
     def initialize_weight_sync(initial_model_step: int) -> tuple[futures.Future, WeightSyncTrigger]:
         logger.info("[Main Thread] Initializing native vLLM weight sync.")
 
@@ -3058,6 +3087,11 @@ def run_training(
             # step. ZeRO-3 is handled pre-loop via a dummy step, so
             # weight_sync_trigger is already set in that case.
             weight_sync_thread_future, weight_sync_trigger = initialize_weight_sync(training_step)
+
+        if streaming_config.async_steps == 0:
+            if weight_sync_trigger is None or weight_sync_thread_future is None:
+                raise RuntimeError("Synchronous rollout collection requires an active weight synchronization thread")
+            wait_for_weight_sync_completion(weight_sync_trigger, weight_sync_thread_future, training_step)
 
         last_eval_collected = maybe_evaluate(
             args,
@@ -3385,7 +3419,7 @@ def main(
         logger.info(f"Restored episode count: {episode}")
 
     # Create additional queues (main queues already created above)
-    weight_sync_metrics_Q = Queue(maxsize=streaming_config.async_steps)
+    weight_sync_metrics_Q = Queue(maxsize=max(streaming_config.async_steps, 1))
 
     stop_event = threading.Event()
     executor = futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="grpo")

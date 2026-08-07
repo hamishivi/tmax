@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from queue import Empty
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 import ray
@@ -560,6 +560,7 @@ class StreamingDataLoaderConfig:
     pack_length: int = 512
 
     # Batching
+    # Set to 0 for synchronous, learner-driven rollout collection.
     async_steps: int = 8
     num_samples_per_prompt_rollout: int = 4
     num_unique_prompts_rollout: int = 16
@@ -715,8 +716,8 @@ class StreamingDataLoaderConfig:
                 "`filter_zero_std_samples` cannot be True when `num_samples_per_prompt_rollout` is 1, "
                 "as the reward standard deviation will always be 0, causing all samples to be filtered."
             )
-        if self.async_steps < 1:
-            raise ValueError("`async_steps` must be greater than 0. Fully synchronous training is not supported.")
+        if self.async_steps < 0:
+            raise ValueError("`async_steps` must be greater than or equal to 0.")
         if not 0.0 <= self.mask_non_submitting_completions_percent < 1.0:
             raise ValueError("`mask_non_submitting_completions_percent` must be in [0.0, 1.0).")
         if self.mask_non_submitting_completions_percent > 0.0 and not self.mask_non_submitting_completions:
@@ -1017,16 +1018,36 @@ def accumulate_inference_batches(
     save_filtered_rollouts: bool = False,
     filtered_rollouts_save_path: str | None = None,
     run_name: str | None = None,
+    replenish_accepted_prompts: bool = True,
 ) -> (
     tuple[data_types.GenerationResult, Batch, dict, BatchStatistics]
     | tuple[data_types.ShutdownSentinel | None, None, None, None]
 ):
-    if no_resampling_pass_rate is not None:
-        assert iter_dataloader is not None, "no_resampling requires the iter_dataloader passed"
+    """Collect one training batch, optionally maintaining a prompt prefetch window.
 
-    if replenish_prompts:
-        assert param_prompt_Q is not None and iter_dataloader is not None and dataset is not None, (
-            "replenish_prompts requires param_prompt_Q and iter_dataloader and dataset"
+    When ``replenish_accepted_prompts`` is false, only results rejected before
+    counting toward the batch are replaced.
+    """
+    if no_resampling_pass_rate is not None and iter_dataloader is None:
+        raise ValueError("no_resampling requires iter_dataloader")
+
+    if replenish_prompts and (param_prompt_Q is None or iter_dataloader is None):
+        raise ValueError("replenish_prompts requires param_prompt_Q and iter_dataloader")
+
+    prompt_dataloader = cast(HFDataLoader, iter_dataloader)
+    prompt_queue = cast(ray_queue.Queue, param_prompt_Q)
+
+    def enqueue_next_prompt() -> None:
+        example = next(prompt_dataloader)
+        add_prompt_to_generator(
+            example,
+            prompt_dataloader._epoch,
+            prompt_queue,
+            generation_config,
+            is_eval=False,
+            base_env_config=base_env_config,
+            ground_truth_overrides=ground_truth_overrides,
+            image_prewarm_actors=image_prewarm_actors,
         )
 
     results = []
@@ -1099,19 +1120,7 @@ def accumulate_inference_batches(
                 max_result_age_steps,
             )
             if replenish_prompts:
-                assert iter_dataloader is not None
-                assert param_prompt_Q is not None
-                example = next(iter_dataloader)
-                add_prompt_to_generator(
-                    example,
-                    iter_dataloader._epoch,
-                    param_prompt_Q,
-                    generation_config,
-                    is_eval=False,
-                    base_env_config=base_env_config,
-                    ground_truth_overrides=ground_truth_overrides,
-                    image_prewarm_actors=image_prewarm_actors,
-                )
+                enqueue_next_prompt()
             continue
 
         collected_results.append(result)
@@ -1129,20 +1138,8 @@ def accumulate_inference_batches(
         raw_query = example[RAW_PROMPT_KEY]
         sample_active_tools = example.get(TOOLS_COLUMN_KEY)
 
-        if replenish_prompts:
-            assert iter_dataloader is not None
-            assert param_prompt_Q is not None
-            example = next(iter_dataloader)
-            add_prompt_to_generator(
-                example,
-                iter_dataloader._epoch,
-                param_prompt_Q,
-                generation_config,
-                is_eval=False,
-                base_env_config=base_env_config,
-                ground_truth_overrides=ground_truth_overrides,
-                image_prewarm_actors=image_prewarm_actors,
-            )
+        if replenish_prompts and replenish_accepted_prompts:
+            enqueue_next_prompt()
 
         for i in range(len(result.finish_reasons)):
             if result.finish_reasons[i] == "stop" and len(result.responses[i]) == 0:
@@ -1210,6 +1207,8 @@ def accumulate_inference_batches(
             logging.debug(
                 f"[Data Preparation Thread] Filtered prompt with reward std 0, total filtered {total_filtered_prompts}"
             )
+            if active_sampling and replenish_prompts and not replenish_accepted_prompts:
+                enqueue_next_prompt()
             continue
         else:
             num_prompts_sampled += 1
@@ -1504,9 +1503,9 @@ def prepare_collated_data_for_workers(
 class DataPreparationActor:
     """Ray actor singleton that handles centralized data preparation for all ranks.
 
-    This actor runs a background thread that continuously prepares training data,
-    ensuring all ranks receive the same number of micro-batches (preventing deadlock
-    from uneven filtering).
+    A background thread prepares data ahead of the learner when ``async_steps`` is
+    positive and prepares one requested step at a time when it is zero. Centralized
+    preparation ensures all ranks receive the same number of micro-batches.
     """
 
     def __init__(
@@ -1571,6 +1570,8 @@ class DataPreparationActor:
         self.current_prepared_step = -1
         self._last_consumed_step = -1
         self.lock = threading.Lock()
+        self._preparation_requested = threading.Condition(self.lock)
+        self._requested_step = -1
         self.training_step = 0
         self.total_samples_written = 0
         self.metadata_saved = False
@@ -1594,6 +1595,18 @@ class DataPreparationActor:
         self._prep_future = self._executor.submit(self._data_preparation_loop)
         logger.info(f"[DataPreparationActor] Started preparation loop from training_step={self.training_step}")
 
+    def _enqueue_next_prompt(self) -> None:
+        add_prompt_to_generator(
+            next(self.iter_dataloader),
+            self.iter_dataloader._epoch,
+            self.param_prompt_Q,
+            self.generation_config,
+            is_eval=False,
+            base_env_config=self.base_env_config,
+            ground_truth_overrides=self.ground_truth_overrides,
+            image_prewarm_actors=self.image_prewarm_actors,
+        )
+
     def _data_preparation_loop(self):
         logger.info("[DataPreparationActor] Starting _data_preparation_loop")
 
@@ -1603,26 +1616,26 @@ class DataPreparationActor:
             self.metadata_saved = True
 
         num_initial_prompts = self.config.async_steps * self.global_batch_size
-        logger.info(f"[DataPreparationActor] Pushing {num_initial_prompts} initial prompts to param_prompt_Q")
-        for _ in range(num_initial_prompts):
-            add_prompt_to_generator(
-                next(self.iter_dataloader),
-                self.iter_dataloader._epoch,
-                self.param_prompt_Q,
-                self.generation_config,
-                is_eval=False,
-                base_env_config=self.base_env_config,
-                ground_truth_overrides=self.ground_truth_overrides,
-                image_prewarm_actors=self.image_prewarm_actors,
-            )
+        if num_initial_prompts:
+            logger.info(f"[DataPreparationActor] Pushing {num_initial_prompts} initial prompts to param_prompt_Q")
+            for _ in range(num_initial_prompts):
+                self._enqueue_next_prompt()
 
         for step in range(self.training_step, self.num_training_steps):
             generation_idle_wait_start_time = time.perf_counter()
-            while step - self._last_consumed_step > self.config.async_steps:
-                logger.info(
-                    f"[DataPreparationActor] Step {step}: waiting for step {self._last_consumed_step + self.config.async_steps} to be consumed. Consider increasing training compute."
-                )
-                time.sleep(0.1)
+            if self.config.async_steps == 0:
+                with self._preparation_requested:
+                    while self._requested_step < step:
+                        self._preparation_requested.wait()
+                logger.info(f"[DataPreparationActor] Step {step}: dispatching synchronous rollout batch")
+                for _ in range(self.global_batch_size):
+                    self._enqueue_next_prompt()
+            else:
+                while step - self._last_consumed_step > self.config.async_steps:
+                    logger.info(
+                        f"[DataPreparationActor] Step {step}: waiting for step {self._last_consumed_step + self.config.async_steps} to be consumed. Consider increasing training compute."
+                    )
+                    time.sleep(0.1)
             generation_idle_wait_time = time.perf_counter() - generation_idle_wait_start_time
 
             logger.info(
@@ -1639,13 +1652,14 @@ class DataPreparationActor:
                 active_sampling=self.config.active_sampling,
                 filter_zero_std_samples=self.config.filter_zero_std_samples,
                 replenish_prompts=True,
+                replenish_accepted_prompts=self.config.async_steps > 0,
                 no_resampling_pass_rate=self.config.no_resampling_pass_rate,
                 iter_dataloader=self.iter_dataloader,
                 param_prompt_Q=self.param_prompt_Q,
                 training_step=step,
                 verbose=self.verbose,
                 max_possible_score=self.config.max_possible_score,
-                max_result_age_steps=self.config.async_steps,
+                max_result_age_steps=self.config.async_steps if self.config.async_steps > 0 else None,
                 base_env_config=self.base_env_config,
                 ground_truth_overrides=self.ground_truth_overrides,
                 image_prewarm_actors=self.image_prewarm_actors,
@@ -1994,8 +2008,20 @@ class DataPreparationActor:
 
     def get_data(self, rank: int, step: int) -> dict:
         """Called by each rank's StreamingDataLoader. Blocks until data ready."""
+        if not 0 <= step < self.num_training_steps:
+            raise IndexError(f"Requested training step {step}, but valid steps are [0, {self.num_training_steps})")
         if self._prep_future is None:
             self.start()
+        if self.config.async_steps == 0:
+            with self._preparation_requested:
+                if step > self.current_prepared_step:
+                    expected_step = max(self.current_prepared_step + 1, self.training_step)
+                    if step != expected_step:
+                        raise RuntimeError(
+                            f"Synchronous data preparation expected step {expected_step}, but rank {rank} requested {step}"
+                        )
+                    self._requested_step = step
+                self._preparation_requested.notify()
         logger.info(
             f"[DataPreparationActor.get_data] rank={rank} requesting step={step}, current_prepared_step={self.current_prepared_step}"
         )
