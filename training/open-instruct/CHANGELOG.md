@@ -22,6 +22,7 @@ All notable changes to this project will be documented in this file.
 - Add deprecation warning to `finetune.py` pointing users to the OLMo-core SFT implementation (https://github.com/allenai/open-instruct/pull/1574).
 
 ### Fixed
+- Update ZeRO-3 reference policies through matching local shards instead of gathering parameters from two DeepSpeed engines in one collective, preventing hangs with sequence parallelism.
 - Fix `DataPreparationActor` hanging on shutdown by killing the actor with `ray.kill()` during cleanup (https://github.com/allenai/open-instruct/pull/1611).
 - Fix empty optimizer group error with torch 2.10 and DeepSpeed in `finetune.py`, `dpo_tune_cache.py`, and `utils.py`. (https://github.com/allenai/open-instruct/pull/1598)
 - Fix `DatasetTransformationCache.load_or_transform_dataset` return type to match expected tuple unpacking. (https://github.com/allenai/open-instruct/pull/1598)
@@ -40,6 +41,7 @@ All notable changes to this project will be documented in this file.
 - Add `--no_auto_dataset_cache` to GRPO and SFT integration test scripts to avoid HuggingFace 504 timeouts on CI runner (https://github.com/allenai/open-instruct/pull/1571).
 
 ### Added
+- Add `--optimizer_reset_freq` to clear GRPO optimizer state every N completed training steps while preserving the LR scheduler.
 - Add TVPO (Total-Variation Proximal Policy Optimization) loss to `grpo_fast.py` and `olmo_core_train_modules.py`: a prompt-level TV trust region that aggregates `(1/2)·E[|π_θ/μ_θ' − 1|]` across all rollouts of the same prompt. When every prompt is in budget the mask is all-ones (full REINFORCE-IS step); when over budget, blocked tokens have their loss replaced by its detached value so no gradient flows but the loss value is preserved for logging. Adds a `policy_freeze_mask` channel to `compute_grpo_loss` (substitution-based gating, distinct from DPPO's multiplicative `tis_weights` mask). Configurable via `--loss_fn tvpo`, `--tvpo_divergence_threshold`, and `--tvpo_truncation_cap`. Logs `actor/ppo_tv` and `debug/tvpo_mask_frac_kept`.
 - Add Divergence Proximal Policy Optimization (DPPO) loss to `grpo_fast.py` and `olmo_core_train_modules.py`: replaces PPO's per-token ratio clipping with a binary (Bernoulli) TV/KL trust-region mask anchored on the rollout policy μ_θ' (https://arxiv.org/abs/2602.04879). Configurable via `--loss_fn dppo`, `--dppo_divergence_type {tv,kl}`, and `--dppo_divergence_threshold`. Also adds `debug/dppo_mask_frac_kept` and fixes `debug/tis_mask_frac_kept` to be correctly token-weighted across all samples in a batch instead of being overwritten per sample.
 - Add `SWERLSandboxEnv` for per-sample Docker tasks with submit-based evaluation. Extends `RLEnvironment` directly with `execute_bash`, `str_replace_editor`, and `submit` tools. Each task provides its own instruction, seed files, and test scripts via a task data directory. Includes 1-GPU and 8-GPU debug scripts (https://github.com/allenai/open-instruct/pull/1492).

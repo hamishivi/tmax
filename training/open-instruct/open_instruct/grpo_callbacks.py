@@ -4,6 +4,7 @@ GRPO-specific callbacks for OLMo-core Trainer.
 These callbacks handle:
 - vLLM weight synchronization after each training step
 - Reference policy Polyak updates
+- Optimizer state resets
 """
 
 import contextlib
@@ -22,7 +23,7 @@ from torch.distributed._composable.fsdp import FSDPModule
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from open_instruct import data_loader as data_loader_lib
-from open_instruct import logger_utils, utils, vllm_utils
+from open_instruct import grpo_utils, logger_utils, utils, vllm_utils
 
 logger = logger_utils.setup_logger(__name__)
 
@@ -156,6 +157,21 @@ class RefPolicyUpdateCallback(Callback):
         finally:
             for m in fsdp2_submodules:
                 m.reshard()
+
+
+@dataclass
+class OptimizerResetCallback(Callback):
+    """Clear optimizer state after every configured number of training steps."""
+
+    update_interval: int
+
+    @property
+    def train_module(self) -> TransformerTrainModule:
+        return cast(TransformerTrainModule, self.trainer.train_module)
+
+    def post_step(self) -> None:
+        if self.trainer.global_step % self.update_interval == 0:
+            grpo_utils.reset_optimizer_state(self.train_module.optim)
 
 
 @dataclass

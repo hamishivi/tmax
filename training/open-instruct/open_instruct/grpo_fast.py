@@ -717,13 +717,12 @@ class PolicyTrainerRayProcess(RayProcess):
     def update_ref_policy(self):
         if not self.args.load_ref_policy:
             return
-        for ref_param, param in zip(self.ref_policy.parameters(), self.model.parameters()):
-            if self.args.deepspeed_stage == 3:
-                with deepspeed.zero.GatheredParameters([param, ref_param], modifier_rank=0):
-                    if deepspeed.comm.get_rank() == 0:
-                        ref_param.data.mul_(1.0 - self.args.alpha).add_(param.data, alpha=self.args.alpha)
-            else:
-                ref_param.data.mul_(1.0 - self.args.alpha).add_(param.data, alpha=self.args.alpha)
+        grpo_utils.update_reference_policy(
+            self.model, self.ref_policy, self.args.alpha, deepspeed_stage_3=self.args.deepspeed_stage == 3
+        )
+
+    def reset_optimizer(self):
+        grpo_utils.reset_optimizer_state(self.optimizer)
 
     def calculate_token_counts(
         self, accumulation_steps: int, data_BT: data_types.CollatedBatchData
@@ -2450,7 +2449,6 @@ def one_training_step(
     actor_manager: ActorManager | None = None,
 ) -> tuple[int, int]:
     """Train the model for one step. Returns tokens processed and the updated episode count."""
-    update_ref_policy_future = []
     with Timer("[Main Thread] 🗡️ Training") as train_timer:
         results, _ = ray_get_with_progress(
             [policy_group.models[i].step.remote(training_step) for i in range(args.world_size)],
@@ -2466,10 +2464,15 @@ def one_training_step(
             and training_step % args.ref_policy_update_freq == 0
             and args.alpha > 0
         ):
-            update_ref_policy_future.extend(
-                [policy_group.models[i].update_ref_policy.remote() for i in range(args.world_size)]
+            ray_get_with_progress(
+                [policy_group.models[i].update_ref_policy.remote() for i in range(args.world_size)],
+                desc=f"Updating reference policy at step {training_step}",
             )
-            ray_get_with_progress(update_ref_policy_future, desc=f"Updating reference policy at step {training_step}")
+        if args.optimizer_reset_freq is not None and training_step % args.optimizer_reset_freq == 0:
+            ray_get_with_progress(
+                [policy_group.models[i].reset_optimizer.remote() for i in range(args.world_size)],
+                desc=f"Resetting optimizer at step {training_step}",
+            )
 
     save_time = maybe_save_checkpoint(args, training_step, policy_group, chat_template_name, tokenizer, wandb_url)
 

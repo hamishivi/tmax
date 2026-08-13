@@ -46,12 +46,15 @@ Both `grpo.py` and `grpo_fast.py` share the same config classes and accept the s
 | | `--total_episodes` | Total number of episodes in dataset | `100000` |
 | | `--num_epochs` | Number of epochs to train | `1` |
 | | `--num_mini_batches` | Mini-batches to split a batch into | `1` |
+| | `--optimizer_reset_freq` | Clear optimizer state every N completed training steps; preserve the LR scheduler | `None` |
 | | `--seed` | Random seed | `1` |
 | **GRPO Algorithm** | `--beta` | KL coefficient for RLHF objective | `0.05` |
 | | `--clip_lower` | Lower clip range | `0.2` |
 | | `--clip_higher` | Higher clip range (see DAPO) | `0.2` |
 | | `--loss_fn` | Loss function: `dapo` or `cispo` | `dapo` |
 | | `--load_ref_policy` | Load and use reference policy for KL | `True` |
+| | `--ref_policy_update_freq` | Polyak-update the reference policy every N completed training steps | `None` |
+| | `--alpha` | Policy weight in each reference-policy Polyak update; `1.0` performs a hard reset | `0.6` |
 | **Rollout / Sampling** | `--num_unique_prompts_rollout` | Unique prompts per rollout | `16` |
 | | `--num_samples_per_prompt_rollout` | Samples per prompt in rollout | `4` |
 | | `--temperature` | Sampling temperature | `0.7` |

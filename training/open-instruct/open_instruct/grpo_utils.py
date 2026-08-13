@@ -3,7 +3,7 @@ import importlib
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 import torch
@@ -23,11 +23,103 @@ logger = logger_utils.setup_logger(__name__)
 TORCH_DTYPES: dict[str, torch.dtype] = {"bfloat16": torch.bfloat16, "float32": torch.float32}
 
 
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the model owned by a distributed wrapper, if present."""
+    return getattr(model, "module", model)
+
+
+def _validate_matching_parameters(
+    policy: torch.nn.Module, ref_policy: torch.nn.Module
+) -> list[tuple[str, torch.nn.Parameter, torch.nn.Parameter]]:
+    policy_params = list(_unwrap_model(policy).named_parameters())
+    ref_params = list(_unwrap_model(ref_policy).named_parameters())
+    policy_names = [name for name, _ in policy_params]
+    ref_names = [name for name, _ in ref_params]
+    if policy_names != ref_names:
+        raise ValueError("Policy and reference policy parameter names do not match")
+
+    pairs = []
+    for (name, param), (_, ref_param) in zip(policy_params, ref_params, strict=True):
+        param_shape = getattr(param, "ds_shape", param.shape)
+        ref_param_shape = getattr(ref_param, "ds_shape", ref_param.shape)
+        if param_shape != ref_param_shape:
+            raise ValueError(
+                f"Policy and reference policy parameter shapes do not match for {name}: "
+                f"{tuple(param_shape)} != {tuple(ref_param_shape)}"
+            )
+        pairs.append((name, param, ref_param))
+    return pairs
+
+
+@torch.no_grad()
+def update_reference_policy(
+    policy: torch.nn.Module, ref_policy: torch.nn.Module, alpha: float, *, deepspeed_stage_3: bool = False
+) -> None:
+    """Polyak-update a reference policy without mixing distributed-engine collectives.
+
+    ZeRO-3 parameters belonging to separate engines must not be placed in one
+    ``GatheredParameters`` context. After releasing each engine's cached full
+    parameters, corresponding local ZeRO shards have identical layouts and can
+    be updated directly without an all-gather.
+    """
+    pairs = _validate_matching_parameters(policy, ref_policy)
+    if deepspeed_stage_3:
+        for model in (policy, ref_policy):
+            empty_partition_cache = getattr(model, "empty_partition_cache", None)
+            if empty_partition_cache is None:
+                raise ValueError("ZeRO-3 reference policy updates require DeepSpeed engine wrappers")
+            empty_partition_cache()
+
+        zero3_shards = []
+        for name, param, ref_param in pairs:
+            if not hasattr(param, "ds_tensor") or not hasattr(ref_param, "ds_tensor"):
+                raise ValueError(f"ZeRO-3 parameter {name} is missing its local partition")
+            param_ds_tensor = cast(Any, param).ds_tensor
+            ref_param_ds_tensor = cast(Any, ref_param).ds_tensor
+            if param_ds_tensor.shape != ref_param_ds_tensor.shape:
+                raise ValueError(
+                    f"Policy and reference policy ZeRO-3 shard shapes do not match for {name}: "
+                    f"{tuple(param_ds_tensor.shape)} != {tuple(ref_param_ds_tensor.shape)}"
+                )
+            if param_ds_tensor.dtype != ref_param_ds_tensor.dtype:
+                raise ValueError(
+                    f"Policy and reference policy ZeRO-3 shard dtypes do not match for {name}: "
+                    f"{param_ds_tensor.dtype} != {ref_param_ds_tensor.dtype}"
+                )
+            if dist.is_initialized():
+                param_group_ranks = tuple(dist.get_process_group_ranks(cast(Any, param).ds_process_group))
+                ref_param_group_ranks = tuple(dist.get_process_group_ranks(cast(Any, ref_param).ds_process_group))
+                if param_group_ranks != ref_param_group_ranks:
+                    raise ValueError(
+                        f"Policy and reference policy ZeRO-3 process groups do not match for {name}: "
+                        f"{param_group_ranks} != {ref_param_group_ranks}"
+                    )
+            zero3_shards.append((param_ds_tensor, ref_param_ds_tensor))
+
+        for param_ds_tensor, ref_param_ds_tensor in zero3_shards:
+            ref_param_ds_tensor.lerp_(param_ds_tensor.to(ref_param_ds_tensor.device), alpha)
+        return
+
+    for _, param, ref_param in pairs:
+        ref_param.lerp_(param, alpha)
+
+
+def reset_optimizer_state(optimizer: Any) -> None:
+    """Clear accumulated optimizer state while preserving parameter groups and LR."""
+    seen: set[int] = set()
+    current = optimizer
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        state = getattr(current, "state", None)
+        if state is not None and hasattr(state, "clear"):
+            state.clear()
+            return
+        current = getattr(current, "optimizer", None)
+    raise TypeError(f"Could not find mutable optimizer state in {type(optimizer).__name__}")
+
+
 def should_capture_policy_checkpoint(
-    training_step: int,
-    save_freq: int,
-    capture_checkpoint_window: int = 0,
-    eval_on_step_0: bool = False,
+    training_step: int, save_freq: int, capture_checkpoint_window: int = 0, eval_on_step_0: bool = False
 ) -> bool:
     """Return whether this step is a regular policy checkpoint or falls in its capture window."""
     if save_freq <= 0:
@@ -182,6 +274,8 @@ class GRPOExperimentConfig(
     """
     ref_policy_update_freq: int | None = None
     """How many training steps to take before updating the reference policy."""
+    optimizer_reset_freq: int | None = None
+    """How many training steps to take before clearing optimizer state. The LR scheduler is preserved."""
     load_ref_policy: bool = True
     """Whether to load and use a reference policy for KL penalty calculation."""
     loss_fn: GRPOLossType = GRPOLossType.dapo
@@ -333,6 +427,14 @@ class GRPOExperimentConfig(
     """Number of completions per eval prompt for local pass@k metrics."""
 
     def __post_init__(self):
+        if self.ref_policy_update_freq is not None and self.ref_policy_update_freq <= 0:
+            raise ValueError(
+                f"`ref_policy_update_freq` must be greater than 0 when set, got {self.ref_policy_update_freq}."
+            )
+        if self.optimizer_reset_freq is not None and self.optimizer_reset_freq <= 0:
+            raise ValueError(
+                f"`optimizer_reset_freq` must be greater than 0 when set, got {self.optimizer_reset_freq}."
+            )
         if self.send_slack_alerts and not os.environ.get("SLACK_WEBHOOK_URL"):
             logger.warning(
                 "--send_slack_alerts is set but SLACK_WEBHOOK_URL is not in the environment. Slack alerts will not be sent."

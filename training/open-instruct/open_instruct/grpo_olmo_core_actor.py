@@ -28,7 +28,12 @@ from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngin
 
 from open_instruct import data_loader as data_loader_lib
 from open_instruct import grpo_utils, logger_utils, model_utils, olmo_core_utils, utils
-from open_instruct.grpo_callbacks import RefPolicyUpdateCallback, VLLMWeightSyncCallback, olmo_core_to_hf_name
+from open_instruct.grpo_callbacks import (
+    OptimizerResetCallback,
+    RefPolicyUpdateCallback,
+    VLLMWeightSyncCallback,
+    olmo_core_to_hf_name,
+)
 from open_instruct.olmo_core_callbacks import BeakerCallbackV2
 from open_instruct.olmo_core_train_modules import GRPOTrainModule
 from open_instruct.utils import RayProcess, is_beaker_job, ray_get_with_progress
@@ -265,6 +270,11 @@ class PolicyTrainerOLMoCoreProcess(RayProcess):
         if self.ref_policy is not None and self.grpo_config.beta > 0 and self.ref_policy_update_freq is not None:
             trainer_callbacks["ref_policy"] = RefPolicyUpdateCallback(
                 ref_policy=self.ref_policy, alpha=self.grpo_config.alpha, update_interval=self.ref_policy_update_freq
+            )
+
+        if self.grpo_config.optimizer_reset_freq is not None:
+            trainer_callbacks["optimizer_reset"] = OptimizerResetCallback(
+                update_interval=self.grpo_config.optimizer_reset_freq
             )
 
         if is_beaker_job() and self.json_config is not None:
