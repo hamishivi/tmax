@@ -83,13 +83,14 @@ class _ServiceHandler(BaseHTTPRequestHandler):
 
 
 @pytest.fixture
-def service():
+def service(monkeypatch):
     _ServiceHandler.requests = []
     _ServiceHandler.oom = False
     _ServiceHandler.lost = False
     _ServiceHandler.release_error = False
     server = ThreadingHTTPServer(("127.0.0.1", 0), _ServiceHandler)
     _ServiceHandler.base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    monkeypatch.setenv("SANDFLEET_URL", _ServiceHandler.base_url)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -101,12 +102,13 @@ def service():
 
 
 @pytest.fixture(autouse=True)
-def client_token(monkeypatch):
+def sandfleet_environment(monkeypatch):
     monkeypatch.setenv("SANDFLEET_CLIENT_TOKEN", "client-token")
+    monkeypatch.delenv("SANDFLEET_POOL", raising=False)
 
 
 def test_full_backend_contract_and_persistent_remote_lease(service):
-    backend = SandfleetBackend(image="/shared/first.sif", sandfleet_url=service, sandfleet_pool="rollouts")
+    backend = SandfleetBackend(image="/shared/first.sif")
     backend.start()
     assert backend._name == "first"
     assert backend._worker_metadata["path"] == "/cg/step-1"
@@ -130,7 +132,7 @@ def test_full_backend_contract_and_persistent_remote_lease(service):
 
 
 def test_remote_oom_preserves_backend_exception(service):
-    backend = SandfleetBackend(image="/shared/image.sif", sandfleet_url=service)
+    backend = SandfleetBackend(image="/shared/image.sif")
     backend.start()
     _ServiceHandler.oom = True
     try:
@@ -141,7 +143,7 @@ def test_remote_oom_preserves_backend_exception(service):
 
 
 def test_lost_worker_is_a_distinct_retryable_infrastructure_error(service):
-    backend = SandfleetBackend(image="/shared/image.sif", sandfleet_url=service)
+    backend = SandfleetBackend(image="/shared/image.sif")
     backend.start()
     _ServiceHandler.lost = True
     try:
@@ -151,24 +153,18 @@ def test_lost_worker_is_a_distinct_retryable_infrastructure_error(service):
         backend.close()
 
 
-def test_named_pool_ignores_local_memory_setting(service):
-    backend = create_backend(
-        "sandfleet",
-        image="/shared/image.sif",
-        mem_limit="12g",
-        sandfleet_url=service,
-        sandfleet_pool="small",
-        sandfleet_acquire_timeout=123,
-    )
+def test_named_pool_ignores_local_memory_setting(service, monkeypatch):
+    monkeypatch.setenv("SANDFLEET_POOL", "small")
+    backend = create_backend("sandfleet", image="/shared/image.sif", mem_limit="12g")
     assert isinstance(backend, SandfleetBackend)
     assert backend._pool == "small"
     assert backend._resources is None
-    assert backend._acquire_timeout == 123
+    assert backend._acquire_timeout == 900
 
 
 @pytest.mark.parametrize(("mem_limit", "memory_mb"), [("4g", 4096), ("1.5g", 1536), (67108865, 65)])
 def test_backend_requests_two_cpus_and_existing_memory_limit(service, mem_limit, memory_mb):
-    backend = create_backend("sandfleet", image="/shared/image.sif", mem_limit=mem_limit, sandfleet_url=service)
+    backend = create_backend("sandfleet", image="/shared/image.sif", mem_limit=mem_limit)
     backend.start()
     try:
         request = next(
@@ -184,25 +180,25 @@ def test_backend_requests_two_cpus_and_existing_memory_limit(service, mem_limit,
 @pytest.mark.parametrize("mem_limit", ["garbage", "63m", 0])
 def test_backend_rejects_invalid_or_too_small_memory(mem_limit):
     with pytest.raises(ValueError, match="mem_limit"):
-        SandfleetBackend(sandfleet_url="http://controller", mem_limit=mem_limit)
+        SandfleetBackend(mem_limit=mem_limit)
 
 
 def test_client_token_comes_from_environment(monkeypatch):
     monkeypatch.setenv("SANDFLEET_CLIENT_TOKEN", "different-client-token")
     monkeypatch.setenv("SANDFLEET_TOKEN", "admin-token")
-    backend = SandfleetBackend(sandfleet_url="http://controller")
+    backend = SandfleetBackend()
     assert backend._token == "different-client-token"
 
 
 def test_client_role_does_not_fall_back_to_admin(monkeypatch):
     monkeypatch.delenv("SANDFLEET_CLIENT_TOKEN", raising=False)
     monkeypatch.setenv("SANDFLEET_TOKEN", "admin-token")
-    backend = SandfleetBackend(sandfleet_url="http://controller")
+    backend = SandfleetBackend()
     assert backend._token == ""
 
 
 def test_failed_release_keeps_lease_releasable(service):
-    backend = SandfleetBackend(sandfleet_url=service)
+    backend = SandfleetBackend()
     backend.start()
     _ServiceHandler.release_error = True
     with pytest.raises(RuntimeError, match="release failed"):

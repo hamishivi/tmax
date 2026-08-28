@@ -742,21 +742,12 @@ def create_backend(backend_type: str, **kwargs) -> SandboxBackend:
     Returns:
         SandboxBackend instance (not yet started).
     """
-    sandfleet_only_kwargs = {
-        "sandfleet_url",
-        "sandfleet_pool",
-        "sandfleet_request_timeout",
-        "sandfleet_acquire_timeout",
-    }
-    if backend_type != "sandfleet":
-        kwargs = {key: value for key, value in kwargs.items() if key not in sandfleet_only_kwargs}
     if backend_type == "docker":
         return DockerBackend(**kwargs)
     if backend_type == "apptainer":
         return ApptainerBackend(**kwargs)
     if backend_type == "sandfleet":
-        allowed = {"image", "timeout", "mem_limit", "pwd", "extra_start_flags", *sandfleet_only_kwargs}
-        return SandfleetBackend(**{key: value for key, value in kwargs.items() if key in allowed})
+        return SandfleetBackend(**kwargs)
     raise ValueError(
         f"Unknown backend type: {backend_type}. Supported: 'docker', 'apptainer', 'sandfleet'."
     )

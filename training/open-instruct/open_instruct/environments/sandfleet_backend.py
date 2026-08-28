@@ -21,6 +21,8 @@ _API_VERSION = "v1"
 _MAX_REQUEST_BYTES = 64 * 1024 * 1024
 _MIB = 1024 * 1024
 _SANDBOX_CPUS = 2
+_REQUEST_TIMEOUT_SECONDS = 60
+_ACQUIRE_TIMEOUT_SECONDS = 900
 
 
 def _memory_limit_mb(mem_limit: str | int) -> int:
@@ -44,23 +46,19 @@ class SandfleetBackend(SandboxBackend):
         mem_limit: str | int = "4g",
         pwd: str = "/workspace",
         extra_start_flags: tuple[str, ...] = (),
-        sandfleet_url: str | None = None,
-        sandfleet_pool: str | None = None,
-        sandfleet_request_timeout: int = 60,
-        sandfleet_acquire_timeout: int = 900,
     ):
         self._image = image
         self._timeout = timeout
         self._pwd = pwd
         self._extra_start_flags = tuple(extra_start_flags)
-        self._url = (sandfleet_url or os.getenv("SANDFLEET_URL") or "").rstrip("/")
-        self._pool = sandfleet_pool
+        self._url = os.getenv("SANDFLEET_URL", "").rstrip("/")
+        self._pool = os.getenv("SANDFLEET_POOL") or None
         self._resources = (
-            None if sandfleet_pool is not None else {"cpus": _SANDBOX_CPUS, "memory_mb": _memory_limit_mb(mem_limit)}
+            None if self._pool is not None else {"cpus": _SANDBOX_CPUS, "memory_mb": _memory_limit_mb(mem_limit)}
         )
         self._token = os.getenv("SANDFLEET_CLIENT_TOKEN", "")
-        self._request_timeout = sandfleet_request_timeout
-        self._acquire_timeout = sandfleet_acquire_timeout
+        self._request_timeout = _REQUEST_TIMEOUT_SECONDS
+        self._acquire_timeout = _ACQUIRE_TIMEOUT_SECONDS
 
         self._lease_id: str | None = None
         self._lease_token: str | None = None
@@ -75,7 +73,7 @@ class SandfleetBackend(SandboxBackend):
 
     def _ensure_configured(self) -> None:
         if not self._url:
-            raise RuntimeError("Sandfleet service URL is unset; set SANDFLEET_URL or sandfleet_url")
+            raise RuntimeError("Sandfleet service URL is unset; set SANDFLEET_URL")
         if not self._token:
             raise RuntimeError("Sandfleet client token is unset")
 

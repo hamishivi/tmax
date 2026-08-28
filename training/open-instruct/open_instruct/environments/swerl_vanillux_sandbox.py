@@ -564,10 +564,6 @@ class SWERLVanilluxSandboxEnvConfig(BaseEnvConfig):
     backend: str = "docker"
     image: str = "python:3.12-slim"
     mem_limit: str = "4g"
-    sandfleet_url: str | None = None
-    sandfleet_pool: str | None = None
-    sandfleet_request_timeout: int = 60
-    sandfleet_acquire_timeout: int = 900
     penalty: float = -0.05
     task_data_dir: str = ""
     task_data_hf_repo: str = ""

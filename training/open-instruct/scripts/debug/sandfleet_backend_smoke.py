@@ -16,14 +16,7 @@ from open_instruct.environments.backends import create_backend
 
 
 def exercise(index: int, args: argparse.Namespace) -> dict:
-    backend = create_backend(
-        "sandfleet",
-        image=args.image,
-        timeout=args.command_timeout,
-        mem_limit=args.mem_limit,
-        sandfleet_url=args.url,
-        sandfleet_pool=args.pool,
-    )
+    backend = create_backend("sandfleet", image=args.image, timeout=args.command_timeout, mem_limit=args.mem_limit)
     started_at = time.perf_counter()
     try:
         backend.start()
@@ -75,15 +68,13 @@ def exercise(index: int, args: argparse.Namespace) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default=os.environ.get("SANDFLEET_URL"), required=False)
-    parser.add_argument("--pool")
     parser.add_argument("--mem-limit", default="4g")
     parser.add_argument("--image", required=True)
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--command-timeout", type=int, default=120)
     args = parser.parse_args()
-    if not args.url:
-        parser.error("--url or SANDFLEET_URL is required")
+    if not os.environ.get("SANDFLEET_URL"):
+        parser.error("SANDFLEET_URL is required")
     if not os.environ.get("SANDFLEET_CLIENT_TOKEN"):
         parser.error("SANDFLEET_CLIENT_TOKEN is required")
     if args.concurrency < 1:

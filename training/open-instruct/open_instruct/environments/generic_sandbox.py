@@ -367,10 +367,6 @@ class GenericSandboxEnvConfig(BaseEnvConfig):
     backend: str = "docker"
     image: str = "python:3.12-slim"
     mem_limit: str = "4g"
-    sandfleet_url: str | None = None
-    sandfleet_pool: str | None = None
-    sandfleet_request_timeout: int = 60
-    sandfleet_acquire_timeout: int = 900
     penalty: float = -0.05
     write_prompt_file: bool = False
     timeout: int = 300

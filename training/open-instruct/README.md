@@ -20,13 +20,13 @@ private URL and client token:
 ```bash
 export SANDFLEET_URL=http://sandfleet-controller:8765
 export SANDFLEET_CLIENT_TOKEN=...
+# Optional: export SANDFLEET_POOL=rollout-small
 ```
 
 ```json
 {
   "backend": "sandfleet",
   "mem_limit": "4g",
-  "sandfleet_acquire_timeout": 900,
   "image": "/shared/images/tmax.sif"
 }
 ```
@@ -34,14 +34,14 @@ export SANDFLEET_CLIENT_TOKEN=...
 TMAX requests two CPUs and uses the existing `mem_limit` as the Sandfleet RAM
 request. Sandfleet validates that shape against controller policy and routes
 matching requests into one reusable homogeneous pool. TMAX never sends raw
-Slurm flags. A deployment can set `sandfleet_pool` to use a pre-created named
+Slurm flags. A deployment can set `SANDFLEET_POOL` to use a pre-created named
 pool instead; in that mode the pool profile defines resources and `mem_limit`
 is ignored. Sandfleet returns a scoped lease whose Apptainer instance can be
 restarted without submitting another worker job. GPU selection remains a
 Sandfleet service feature until TMAX has a real GPU-sandbox use case.
 
-If an elastic pool has no immediately ready slot, reset waits for Sandfleet to
-start capacity up to `sandfleet_acquire_timeout`. If Slurm preempts the worker
+If an elastic pool has no immediately ready slot, reset waits up to 15 minutes
+for Sandfleet to start capacity. If Slurm preempts the worker
 hosting an active sandbox, the affected rollout ends with `sandbox_lost` and
 `infrastructure_failure` metadata; the next reset acquires replacement
 capacity rather than replaying a potentially non-idempotent command.
