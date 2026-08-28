@@ -148,12 +148,11 @@ def test_lost_worker_is_a_distinct_retryable_infrastructure_error(service):
         backend.close()
 
 
-def test_factory_ignores_local_slurm_and_memory_settings(service):
+def test_named_pool_ignores_local_memory_setting(service):
     backend = create_backend(
         "sandfleet",
         image="/shared/image.sif",
-        mem_limit="4g",
-        srun_cpus_per_task=8,
+        mem_limit="12g",
         sandfleet_url=service,
         sandfleet_pool="small",
         sandfleet_token="token",
@@ -161,17 +160,17 @@ def test_factory_ignores_local_slurm_and_memory_settings(service):
     )
     assert isinstance(backend, SandfleetBackend)
     assert backend._pool == "small"
+    assert backend._resources is None
     assert backend._acquire_timeout == 123
 
 
-def test_backend_requests_declarative_cpu_and_memory(service):
+@pytest.mark.parametrize(("mem_limit", "memory_mb"), [("4g", 4096), ("1.5g", 1536), (67108865, 65)])
+def test_backend_requests_one_cpu_and_existing_memory_limit(service, mem_limit, memory_mb):
     backend = create_backend(
         "sandfleet",
         image="/shared/image.sif",
+        mem_limit=mem_limit,
         sandfleet_url=service,
-        sandfleet_pool=None,
-        sandfleet_cpus=4,
-        sandfleet_memory_mb=8192,
         sandfleet_token="client-token",
     )
     backend.start()
@@ -181,64 +180,15 @@ def test_backend_requests_declarative_cpu_and_memory(service):
             for method, path, payload in _ServiceHandler.requests
             if method == "POST" and path == "/v1/lease-requests"
         )
-        assert request == {"resources": {"cpus": 4, "memory_mb": 8192}, "timeout_seconds": 900}
+        assert request == {"resources": {"cpus": 1, "memory_mb": memory_mb}, "timeout_seconds": 900}
     finally:
         backend.close()
 
 
-def test_backend_preserves_ordered_gpu_type_fallbacks(service):
-    backend = create_backend(
-        "sandfleet",
-        image="/shared/image.sif",
-        sandfleet_url=service,
-        sandfleet_pool=None,
-        sandfleet_cpus=4,
-        sandfleet_memory_mb=8192,
-        sandfleet_gpu=1,
-        sandfleet_gpu_type=("a100_80gb", "a100_40gb", "any"),
-        sandfleet_token="client-token",
-    )
-    backend.start()
-    try:
-        request = next(
-            payload
-            for method, path, payload in _ServiceHandler.requests
-            if method == "POST" and path == "/v1/lease-requests"
-        )
-        assert request["resources"] == {
-            "cpus": 4,
-            "memory_mb": 8192,
-            "gpu": 1,
-            "type": ["a100_80gb", "a100_40gb", "any"],
-        }
-    finally:
-        backend.close()
-
-
-def test_backend_resource_selection_is_unambiguous():
-    with pytest.raises(ValueError, match="either sandfleet_pool"):
-        SandfleetBackend(
-            sandfleet_url="http://controller", sandfleet_pool="default", sandfleet_cpus=1, sandfleet_memory_mb=512
-        )
-    with pytest.raises(ValueError, match="require sandfleet_cpus"):
-        SandfleetBackend(sandfleet_url="http://controller", sandfleet_pool=None, sandfleet_cpus=1)
-    with pytest.raises(ValueError, match="both sandfleet_gpu"):
-        SandfleetBackend(
-            sandfleet_url="http://controller",
-            sandfleet_pool=None,
-            sandfleet_cpus=1,
-            sandfleet_memory_mb=512,
-            sandfleet_gpu=1,
-        )
-    with pytest.raises(ValueError, match="final GPU type fallback"):
-        SandfleetBackend(
-            sandfleet_url="http://controller",
-            sandfleet_pool=None,
-            sandfleet_cpus=1,
-            sandfleet_memory_mb=512,
-            sandfleet_gpu=1,
-            sandfleet_gpu_type=("any", "a100_80gb"),
-        )
+@pytest.mark.parametrize("mem_limit", ["garbage", "63m", 0])
+def test_backend_rejects_invalid_or_too_small_memory(mem_limit):
+    with pytest.raises(ValueError, match="mem_limit"):
+        SandfleetBackend(sandfleet_url="http://controller", mem_limit=mem_limit)
 
 
 def test_client_role_token_is_preferred_from_environment(monkeypatch):

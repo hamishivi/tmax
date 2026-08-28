@@ -6,42 +6,32 @@ import base64
 import json
 import os
 import random
-import re
 import threading
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from docker import errors as docker_errors
+from docker import utils as docker_utils
+
 from open_instruct.environments.backends import ExecutionResult, SandboxBackend, SandboxLostError, SandboxOOMError
 
 _API_VERSION = "v1"
 _MAX_REQUEST_BYTES = 64 * 1024 * 1024
-_GPU_TYPE = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*_[1-9][0-9]*gb")
+_MIB = 1024 * 1024
+_SANDBOX_CPUS = 1
 
 
-def _gpu_payload(gpu: int | None, gpu_type: tuple[str, ...] | list[str] | None) -> dict[str, Any]:
-    if (gpu is None) != (gpu_type is None):
-        raise ValueError("Sandfleet GPU requests require both sandfleet_gpu and sandfleet_gpu_type")
-    if gpu is None or gpu_type is None:
-        return {}
-    if type(gpu) is not int or gpu < 1:
-        raise ValueError("sandfleet_gpu must be a positive integer")
-    types = list(gpu_type)
-    if not types:
-        raise ValueError("sandfleet_gpu_type must be a non-empty fallback list")
-    if len(types) > 32:
-        raise ValueError("sandfleet_gpu_type may contain at most 32 fallbacks")
-    if any(
-        not isinstance(gpu_name, str) or (gpu_name != "any" and _GPU_TYPE.fullmatch(gpu_name) is None)
-        for gpu_name in types
-    ):
-        raise ValueError("GPU types must be 'any' or memory-qualified names such as a100_80gb")
-    if len(set(types)) != len(types):
-        raise ValueError("sandfleet_gpu_type must not contain duplicates")
-    if "any" in types[:-1]:
-        raise ValueError("'any' is only valid as the final GPU type fallback")
-    return {"gpu": gpu, "type": types}
+def _memory_limit_mb(mem_limit: str | int) -> int:
+    try:
+        memory_bytes = docker_utils.parse_bytes(mem_limit)
+    except (TypeError, ValueError, docker_errors.DockerException) as error:
+        raise ValueError(f"Invalid mem_limit {mem_limit!r}") from error
+    memory_mb = (memory_bytes + _MIB - 1) // _MIB
+    if memory_mb < 64:
+        raise ValueError("mem_limit must be at least 64 MiB for Sandfleet")
+    return memory_mb
 
 
 class SandfleetBackend(SandboxBackend):
@@ -51,14 +41,11 @@ class SandfleetBackend(SandboxBackend):
         self,
         image: str = "python:3.12-slim",
         timeout: int = 1800,
+        mem_limit: str | int = "4g",
         pwd: str = "/workspace",
         extra_start_flags: tuple[str, ...] = (),
         sandfleet_url: str | None = None,
-        sandfleet_pool: str | None = "default",
-        sandfleet_cpus: int | None = None,
-        sandfleet_memory_mb: int | None = None,
-        sandfleet_gpu: int | None = None,
-        sandfleet_gpu_type: tuple[str, ...] | list[str] | None = None,
+        sandfleet_pool: str | None = None,
         sandfleet_token: str | None = None,
         sandfleet_token_env: str = "SANDFLEET_CLIENT_TOKEN",
         sandfleet_request_timeout: int = 60,
@@ -70,18 +57,8 @@ class SandfleetBackend(SandboxBackend):
         self._extra_start_flags = tuple(extra_start_flags)
         self._url = (sandfleet_url or os.getenv("SANDFLEET_URL") or "").rstrip("/")
         self._pool = sandfleet_pool
-        gpu_payload = _gpu_payload(sandfleet_gpu, sandfleet_gpu_type)
-        resource_mode = sandfleet_cpus is not None or sandfleet_memory_mb is not None or bool(gpu_payload)
-        if (sandfleet_pool is not None) == resource_mode:
-            raise ValueError("Set either sandfleet_pool or sandfleet_cpus and sandfleet_memory_mb")
-        if resource_mode and (sandfleet_cpus is None or sandfleet_memory_mb is None):
-            raise ValueError("Sandfleet resource requests require sandfleet_cpus and sandfleet_memory_mb")
-        if sandfleet_cpus is not None and sandfleet_cpus < 1:
-            raise ValueError("sandfleet_cpus must be positive")
-        if sandfleet_memory_mb is not None and sandfleet_memory_mb < 64:
-            raise ValueError("sandfleet_memory_mb must be at least 64")
         self._resources = (
-            None if not resource_mode else {"cpus": sandfleet_cpus, "memory_mb": sandfleet_memory_mb, **gpu_payload}
+            None if sandfleet_pool is not None else {"cpus": _SANDBOX_CPUS, "memory_mb": _memory_limit_mb(mem_limit)}
         )
         self._token = sandfleet_token or os.getenv(sandfleet_token_env) or ""
         self._request_timeout = sandfleet_request_timeout

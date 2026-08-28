@@ -25,34 +25,20 @@ export SANDFLEET_CLIENT_TOKEN=...
 ```json
 {
   "backend": "sandfleet",
-  "sandfleet_pool": null,
-  "sandfleet_cpus": 4,
-  "sandfleet_memory_mb": 8192,
+  "mem_limit": "4g",
   "sandfleet_acquire_timeout": 900,
   "image": "/shared/images/tmax.sif"
 }
 ```
 
-Sandfleet validates the requested CPU and RAM against controller policy, then
-routes matching requests into one reusable homogeneous pool. TMAX never sends
-raw Slurm flags. A deployment can still set `sandfleet_pool` to a pre-created
-named pool instead; named-pool and declarative-resource modes are mutually
-exclusive. Sandfleet returns a scoped lease whose Apptainer instance can be
-restarted without submitting another worker job.
-
-GPU requests use an exact count and ordered, memory-qualified type fallbacks:
-
-```json
-{
-  "sandfleet_gpu": 1,
-  "sandfleet_gpu_type": ["a100_80gb", "a100_40gb", "any"]
-}
-```
-
-Sandfleet may only use types in that list, in order; `any` is permitted only
-as the final fallback. The current service validates this schema but rejects
-GPU acquisition until the deployment provides a type-to-Slurm mapping and
-verified device isolation.
+TMAX requests one CPU and uses the existing `mem_limit` as the Sandfleet RAM
+request. Sandfleet validates that shape against controller policy and routes
+matching requests into one reusable homogeneous pool. TMAX never sends raw
+Slurm flags. A deployment can set `sandfleet_pool` to use a pre-created named
+pool instead; in that mode the pool profile defines resources and `mem_limit`
+is ignored. Sandfleet returns a scoped lease whose Apptainer instance can be
+restarted without submitting another worker job. GPU selection remains a
+Sandfleet service feature until TMAX has a real GPU-sandbox use case.
 
 If an elastic pool has no immediately ready slot, reset waits for Sandfleet to
 start capacity up to `sandfleet_acquire_timeout`. If Slurm preempts the worker
