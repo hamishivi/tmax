@@ -18,6 +18,7 @@ class _ServiceHandler(BaseHTTPRequestHandler):
     base_url = ""
     oom = False
     lost = False
+    release_error = False
 
     def log_message(self, *_args):
         pass
@@ -43,6 +44,7 @@ class _ServiceHandler(BaseHTTPRequestHandler):
                 {
                     "request_id": "request-1",
                     "status": "assigned",
+                    "poll_after_seconds": 2,
                     "lease": {
                         "lease_id": "lease-1",
                         "lease_token": "lease-token",
@@ -74,7 +76,10 @@ class _ServiceHandler(BaseHTTPRequestHandler):
     def do_DELETE(self):  # noqa: N802
         payload = self._body()
         self.__class__.requests.append(("DELETE", self.path, payload))
-        self._send(200, {"released": True})
+        if self.release_error:
+            self._send(500, {"error": {"type": "RuntimeError", "message": "release failed"}})
+        else:
+            self._send(200, {"released": True})
 
 
 @pytest.fixture
@@ -82,6 +87,7 @@ def service():
     _ServiceHandler.requests = []
     _ServiceHandler.oom = False
     _ServiceHandler.lost = False
+    _ServiceHandler.release_error = False
     server = ThreadingHTTPServer(("127.0.0.1", 0), _ServiceHandler)
     _ServiceHandler.base_url = f"http://127.0.0.1:{server.server_address[1]}"
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -96,10 +102,7 @@ def service():
 
 def test_full_backend_contract_and_persistent_remote_lease(service):
     backend = SandfleetBackend(
-        image="/shared/first.sif",
-        sandfleet_url=service,
-        sandfleet_pool="rollouts",
-        sandfleet_token="service-token",
+        image="/shared/first.sif", sandfleet_url=service, sandfleet_pool="rollouts", sandfleet_token="service-token"
     )
     backend.start()
     assert backend._name == "first"
@@ -124,11 +127,7 @@ def test_full_backend_contract_and_persistent_remote_lease(service):
 
 
 def test_remote_oom_preserves_backend_exception(service):
-    backend = SandfleetBackend(
-        image="/shared/image.sif",
-        sandfleet_url=service,
-        sandfleet_token="service-token",
-    )
+    backend = SandfleetBackend(image="/shared/image.sif", sandfleet_url=service, sandfleet_token="service-token")
     backend.start()
     _ServiceHandler.oom = True
     try:
@@ -139,11 +138,7 @@ def test_remote_oom_preserves_backend_exception(service):
 
 
 def test_lost_worker_is_a_distinct_retryable_infrastructure_error(service):
-    backend = SandfleetBackend(
-        image="/shared/image.sif",
-        sandfleet_url=service,
-        sandfleet_token="service-token",
-    )
+    backend = SandfleetBackend(image="/shared/image.sif", sandfleet_url=service, sandfleet_token="service-token")
     backend.start()
     _ServiceHandler.lost = True
     try:
@@ -169,8 +164,101 @@ def test_factory_ignores_local_slurm_and_memory_settings(service):
     assert backend._acquire_timeout == 123
 
 
+def test_backend_requests_declarative_cpu_and_memory(service):
+    backend = create_backend(
+        "sandfleet",
+        image="/shared/image.sif",
+        sandfleet_url=service,
+        sandfleet_pool=None,
+        sandfleet_cpus=4,
+        sandfleet_memory_mb=8192,
+        sandfleet_token="client-token",
+    )
+    backend.start()
+    try:
+        request = next(
+            payload
+            for method, path, payload in _ServiceHandler.requests
+            if method == "POST" and path == "/v1/lease-requests"
+        )
+        assert request == {"resources": {"cpus": 4, "memory_mb": 8192}, "timeout_seconds": 900}
+    finally:
+        backend.close()
+
+
+def test_backend_preserves_ordered_gpu_type_fallbacks(service):
+    backend = create_backend(
+        "sandfleet",
+        image="/shared/image.sif",
+        sandfleet_url=service,
+        sandfleet_pool=None,
+        sandfleet_cpus=4,
+        sandfleet_memory_mb=8192,
+        sandfleet_gpu=1,
+        sandfleet_gpu_type=("a100_80gb", "a100_40gb", "any"),
+        sandfleet_token="client-token",
+    )
+    backend.start()
+    try:
+        request = next(
+            payload
+            for method, path, payload in _ServiceHandler.requests
+            if method == "POST" and path == "/v1/lease-requests"
+        )
+        assert request["resources"] == {
+            "cpus": 4,
+            "memory_mb": 8192,
+            "gpu": 1,
+            "type": ["a100_80gb", "a100_40gb", "any"],
+        }
+    finally:
+        backend.close()
+
+
+def test_backend_resource_selection_is_unambiguous():
+    with pytest.raises(ValueError, match="either sandfleet_pool"):
+        SandfleetBackend(
+            sandfleet_url="http://controller", sandfleet_pool="default", sandfleet_cpus=1, sandfleet_memory_mb=512
+        )
+    with pytest.raises(ValueError, match="require sandfleet_cpus"):
+        SandfleetBackend(sandfleet_url="http://controller", sandfleet_pool=None, sandfleet_cpus=1)
+    with pytest.raises(ValueError, match="both sandfleet_gpu"):
+        SandfleetBackend(
+            sandfleet_url="http://controller",
+            sandfleet_pool=None,
+            sandfleet_cpus=1,
+            sandfleet_memory_mb=512,
+            sandfleet_gpu=1,
+        )
+    with pytest.raises(ValueError, match="final GPU type fallback"):
+        SandfleetBackend(
+            sandfleet_url="http://controller",
+            sandfleet_pool=None,
+            sandfleet_cpus=1,
+            sandfleet_memory_mb=512,
+            sandfleet_gpu=1,
+            sandfleet_gpu_type=("any", "a100_80gb"),
+        )
+
+
 def test_client_role_token_is_preferred_from_environment(monkeypatch):
     monkeypatch.setenv("SANDFLEET_CLIENT_TOKEN", "client-token")
     monkeypatch.setenv("SANDFLEET_TOKEN", "admin-token")
     backend = SandfleetBackend(sandfleet_url="http://controller", sandfleet_token=None)
     assert backend._token == "client-token"
+
+
+def test_client_role_does_not_fall_back_to_admin(monkeypatch):
+    monkeypatch.delenv("SANDFLEET_CLIENT_TOKEN", raising=False)
+    monkeypatch.setenv("SANDFLEET_TOKEN", "admin-token")
+    backend = SandfleetBackend(sandfleet_url="http://controller", sandfleet_token=None)
+    assert backend._token == ""
+
+
+def test_failed_release_keeps_lease_releasable(service):
+    backend = SandfleetBackend(sandfleet_url=service, sandfleet_token="client-token")
+    backend.start()
+    _ServiceHandler.release_error = True
+    with pytest.raises(RuntimeError, match="release failed"):
+        backend.close()
+    assert backend._lease_id == "lease-1"

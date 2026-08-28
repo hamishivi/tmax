@@ -15,25 +15,44 @@ The training scripts for this fork live under [`training/open-instruct/scripts/t
 For large sandbox pools that should not consume the training allocation's CPU
 and memory, `backend: "sandfleet"` leases a sandbox from a separate Sandfleet
 service. The service owns the Slurm worker allocations; TMAX only needs its
-private URL, token, and pool name:
+private URL and client token:
 
 ```bash
 export SANDFLEET_URL=http://sandfleet-controller:8765
-export SANDFLEET_TOKEN=...
+export SANDFLEET_CLIENT_TOKEN=...
 ```
 
 ```json
 {
   "backend": "sandfleet",
-  "sandfleet_pool": "rollout-small",
+  "sandfleet_pool": null,
+  "sandfleet_cpus": 4,
+  "sandfleet_memory_mb": 8192,
   "sandfleet_acquire_timeout": 900,
   "image": "/shared/images/tmax.sif"
 }
 ```
 
-The pool profile, rather than TMAX, defines CPU and memory per sandbox.
-Sandfleet returns a scoped lease whose Apptainer instance can be restarted
-without submitting another worker job.
+Sandfleet validates the requested CPU and RAM against controller policy, then
+routes matching requests into one reusable homogeneous pool. TMAX never sends
+raw Slurm flags. A deployment can still set `sandfleet_pool` to a pre-created
+named pool instead; named-pool and declarative-resource modes are mutually
+exclusive. Sandfleet returns a scoped lease whose Apptainer instance can be
+restarted without submitting another worker job.
+
+GPU requests use an exact count and ordered, memory-qualified type fallbacks:
+
+```json
+{
+  "sandfleet_gpu": 1,
+  "sandfleet_gpu_type": ["a100_80gb", "a100_40gb", "any"]
+}
+```
+
+Sandfleet may only use types in that list, in order; `any` is permitted only
+as the final fallback. The current service validates this schema but rejects
+GPU acquisition until the deployment provides a type-to-Slurm mapping and
+verified device isolation.
 
 If an elastic pool has no immediately ready slot, reset waits for Sandfleet to
 start capacity up to `sandfleet_acquire_timeout`. If Slurm preempts the worker

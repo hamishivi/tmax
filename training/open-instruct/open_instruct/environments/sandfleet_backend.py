@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import base64
-import contextlib
 import json
 import os
 import random
+import re
 import threading
 import time
 from typing import Any
@@ -17,6 +17,31 @@ from open_instruct.environments.backends import ExecutionResult, SandboxBackend,
 
 _API_VERSION = "v1"
 _MAX_REQUEST_BYTES = 64 * 1024 * 1024
+_GPU_TYPE = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*_[1-9][0-9]*gb")
+
+
+def _gpu_payload(gpu: int | None, gpu_type: tuple[str, ...] | list[str] | None) -> dict[str, Any]:
+    if (gpu is None) != (gpu_type is None):
+        raise ValueError("Sandfleet GPU requests require both sandfleet_gpu and sandfleet_gpu_type")
+    if gpu is None or gpu_type is None:
+        return {}
+    if type(gpu) is not int or gpu < 1:
+        raise ValueError("sandfleet_gpu must be a positive integer")
+    types = list(gpu_type)
+    if not types:
+        raise ValueError("sandfleet_gpu_type must be a non-empty fallback list")
+    if len(types) > 32:
+        raise ValueError("sandfleet_gpu_type may contain at most 32 fallbacks")
+    if any(
+        not isinstance(gpu_name, str) or (gpu_name != "any" and _GPU_TYPE.fullmatch(gpu_name) is None)
+        for gpu_name in types
+    ):
+        raise ValueError("GPU types must be 'any' or memory-qualified names such as a100_80gb")
+    if len(set(types)) != len(types):
+        raise ValueError("sandfleet_gpu_type must not contain duplicates")
+    if "any" in types[:-1]:
+        raise ValueError("'any' is only valid as the final GPU type fallback")
+    return {"gpu": gpu, "type": types}
 
 
 class SandfleetBackend(SandboxBackend):
@@ -29,9 +54,13 @@ class SandfleetBackend(SandboxBackend):
         pwd: str = "/workspace",
         extra_start_flags: tuple[str, ...] = (),
         sandfleet_url: str | None = None,
-        sandfleet_pool: str = "default",
+        sandfleet_pool: str | None = "default",
+        sandfleet_cpus: int | None = None,
+        sandfleet_memory_mb: int | None = None,
+        sandfleet_gpu: int | None = None,
+        sandfleet_gpu_type: tuple[str, ...] | list[str] | None = None,
         sandfleet_token: str | None = None,
-        sandfleet_token_env: str = "SANDFLEET_TOKEN",
+        sandfleet_token_env: str = "SANDFLEET_CLIENT_TOKEN",
         sandfleet_request_timeout: int = 60,
         sandfleet_acquire_timeout: int = 900,
     ):
@@ -41,12 +70,20 @@ class SandfleetBackend(SandboxBackend):
         self._extra_start_flags = tuple(extra_start_flags)
         self._url = (sandfleet_url or os.getenv("SANDFLEET_URL") or "").rstrip("/")
         self._pool = sandfleet_pool
-        self._token = (
-            sandfleet_token
-            or os.getenv("SANDFLEET_CLIENT_TOKEN")
-            or os.getenv(sandfleet_token_env)
-            or ""
+        gpu_payload = _gpu_payload(sandfleet_gpu, sandfleet_gpu_type)
+        resource_mode = sandfleet_cpus is not None or sandfleet_memory_mb is not None or bool(gpu_payload)
+        if (sandfleet_pool is not None) == resource_mode:
+            raise ValueError("Set either sandfleet_pool or sandfleet_cpus and sandfleet_memory_mb")
+        if resource_mode and (sandfleet_cpus is None or sandfleet_memory_mb is None):
+            raise ValueError("Sandfleet resource requests require sandfleet_cpus and sandfleet_memory_mb")
+        if sandfleet_cpus is not None and sandfleet_cpus < 1:
+            raise ValueError("sandfleet_cpus must be positive")
+        if sandfleet_memory_mb is not None and sandfleet_memory_mb < 64:
+            raise ValueError("sandfleet_memory_mb must be at least 64")
+        self._resources = (
+            None if not resource_mode else {"cpus": sandfleet_cpus, "memory_mb": sandfleet_memory_mb, **gpu_payload}
         )
+        self._token = sandfleet_token or os.getenv(sandfleet_token_env) or ""
         self._request_timeout = sandfleet_request_timeout
         self._acquire_timeout = sandfleet_acquire_timeout
 
@@ -59,6 +96,7 @@ class SandfleetBackend(SandboxBackend):
         self._lease_ttl_seconds = 0
         self._renew_stop = threading.Event()
         self._renew_thread: threading.Thread | None = None
+        self._renewal_error: Exception | None = None
 
     def _ensure_configured(self) -> None:
         if not self._url:
@@ -130,6 +168,8 @@ class SandfleetBackend(SandboxBackend):
     ) -> dict[str, Any]:
         if self._lease_id is None or self._lease_token is None or self._agent_url is None:
             raise RuntimeError("Sandfleet lease is not active. Call start() first.")
+        if self._renewal_error is not None:
+            raise SandboxLostError(f"Sandfleet lease renewal failed: {self._renewal_error}") from self._renewal_error
         try:
             return self._request(
                 self._agent_url,
@@ -141,7 +181,7 @@ class SandfleetBackend(SandboxBackend):
             )
         except ConnectionError as error:
             reason = str(error)
-            with contextlib.suppress(Exception):
+            try:
                 status = self._request(
                     self._url,
                     f"/{_API_VERSION}/leases/{self._lease_id}",
@@ -149,43 +189,41 @@ class SandfleetBackend(SandboxBackend):
                     timeout=self._request_timeout,
                 )
                 reason = status.get("lost_reason") or reason
+            except Exception as controller_error:
+                error.add_note(f"Controller could not explain the lost agent connection: {controller_error}")
             raise SandboxLostError(reason) from error
 
     def _acquire(self) -> dict[str, Any]:
         deadline = time.monotonic() + self._acquire_timeout
+        selection = {"pool": self._pool} if self._resources is None else {"resources": self._resources}
         result = self._request(
             self._url,
             f"/{_API_VERSION}/lease-requests",
             token=self._token,
             method="POST",
-            payload={"pool": self._pool, "timeout_seconds": self._acquire_timeout},
+            payload={**selection, "timeout_seconds": self._acquire_timeout},
         )
         request_id = str(result["request_id"])
-        delay = max(0.0, float(result.get("poll_after_seconds", 2)))
+        delay = max(0.0, float(result["poll_after_seconds"]))
         try:
-            while result.get("status") == "pending":
+            while result["status"] == "pending":
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(f"Timed out waiting for Sandfleet pool {self._pool!r}")
-                base_delay = max(delay, float(result.get("poll_after_seconds", 0)))
+                    raise TimeoutError(f"Timed out waiting for Sandfleet selection {selection!r}")
+                base_delay = max(delay, float(result["poll_after_seconds"]))
                 time.sleep(min(base_delay * random.uniform(0.9, 1.1), remaining))
                 delay = min(10.0, max(0.1, base_delay * 1.5))
-                result = self._request(
-                    self._url,
-                    f"/{_API_VERSION}/lease-requests/{request_id}",
-                    token=self._token,
-                )
-            if result.get("status") != "assigned" or "lease" not in result:
-                raise TimeoutError(result.get("error") or f"Could not acquire from Sandfleet pool {self._pool!r}")
+                result = self._request(self._url, f"/{_API_VERSION}/lease-requests/{request_id}", token=self._token)
+            if result["status"] != "assigned":
+                raise TimeoutError(result["error"] or f"Could not acquire from Sandfleet selection {selection!r}")
             return result["lease"]
-        except Exception:
-            with contextlib.suppress(Exception):
+        except Exception as error:
+            try:
                 self._request(
-                    self._url,
-                    f"/{_API_VERSION}/lease-requests/{request_id}",
-                    token=self._token,
-                    method="DELETE",
+                    self._url, f"/{_API_VERSION}/lease-requests/{request_id}", token=self._token, method="DELETE"
                 )
+            except Exception as cleanup_error:
+                error.add_note(f"Could not cancel Sandfleet lease request {request_id}: {cleanup_error}")
             raise
 
     def _renew_once(self) -> None:
@@ -193,28 +231,28 @@ class SandfleetBackend(SandboxBackend):
         if lease_id is None:
             return
         self._request(
-            self._url,
-            f"/{_API_VERSION}/leases/{lease_id}/renew",
-            token=self._token,
-            method="POST",
-            payload={},
+            self._url, f"/{_API_VERSION}/leases/{lease_id}/renew", token=self._token, method="POST", payload={}
         )
 
     def _renew_loop(self) -> None:
         interval = max(1.0, self._lease_ttl_seconds / 3)
         while not self._renew_stop.wait(interval * random.uniform(0.9, 1.1)):
-            with contextlib.suppress(Exception):
+            try:
                 self._renew_once()
+            except ConnectionError:
+                continue
+            except Exception as error:
+                self._renewal_error = error
+                return
 
     def _start_renewal(self, ttl_seconds: int) -> None:
         self._lease_ttl_seconds = ttl_seconds
+        self._renewal_error = None
         self._renew_stop.clear()
         if ttl_seconds <= 0:
             return
         self._renew_thread = threading.Thread(
-            target=self._renew_loop,
-            name=f"sandfleet-renew-{str(self._lease_id)[:8]}",
-            daemon=True,
+            target=self._renew_loop, name=f"sandfleet-renew-{str(self._lease_id)[:8]}", daemon=True
         )
         self._renew_thread.start()
 
@@ -234,53 +272,42 @@ class SandfleetBackend(SandboxBackend):
         self._lease_id = lease["lease_id"]
         self._lease_token = lease["lease_token"]
         self._agent_url = lease["agent_url"]
-        self._start_renewal(int(lease.get("ttl_seconds", 0)))
+        self._start_renewal(int(lease["ttl_seconds"]))
         try:
-            result = self._agent_request(
-                "start",
-                payload=self._start_payload(),
-                timeout=max(1800, self._timeout + 60),
-            )
-        except Exception:
-            self.close()
+            result = self._agent_request("start", payload=self._start_payload(), timeout=max(1800, self._timeout + 60))
+        except Exception as error:
+            try:
+                self.close()
+            except Exception as close_error:
+                error.add_note(f"Sandfleet lease release also failed: {close_error}")
             raise
-        self._name = result.get("instance_name")
-        self._worker_metadata = result.get("cgroup", {})
+        self._name = result["instance_name"]
+        self._worker_metadata = result["cgroup"]
         self._sandfleet_status = result
 
     def restart(self) -> None:
         if self._lease_id is None:
             self.start()
             return
-        result = self._agent_request(
-            "restart",
-            payload=self._start_payload(),
-            timeout=max(1800, self._timeout + 60),
-        )
-        self._name = result.get("instance_name")
-        self._worker_metadata = result.get("cgroup", {})
+        result = self._agent_request("restart", payload=self._start_payload(), timeout=max(1800, self._timeout + 60))
+        self._name = result["instance_name"]
+        self._worker_metadata = result["cgroup"]
         self._sandfleet_status = result
 
     def run_command(self, command: str, timeout: int | None = None) -> ExecutionResult:
         effective_timeout = self._timeout if timeout is None else timeout
         result = self._agent_request(
-            "exec",
-            payload={"command": command, "timeout": timeout},
-            timeout=effective_timeout + 30,
+            "exec", payload={"command": command, "timeout": timeout}, timeout=effective_timeout + 30
         )
         return ExecutionResult(
-            stdout=str(result["stdout"]),
-            stderr=str(result["stderr"]),
-            exit_code=int(result["exit_code"]),
+            stdout=str(result["stdout"]), stderr=str(result["stderr"]), exit_code=int(result["exit_code"])
         )
 
     def write_file(self, path: str, content: str | bytes) -> None:
         if isinstance(content, str):
             content = content.encode("utf-8")
         self._agent_request(
-            "write-file",
-            payload={"path": path, "content_b64": base64.b64encode(content).decode("ascii")},
-            timeout=120,
+            "write-file", payload={"path": path, "content_b64": base64.b64encode(content).decode("ascii")}, timeout=120
         )
 
     def read_file(self, path: str, binary: bool = False) -> str | bytes:
@@ -301,16 +328,7 @@ class SandfleetBackend(SandboxBackend):
         if self._renew_thread is not None:
             self._renew_thread.join(timeout=2)
             self._renew_thread = None
-        self._lease_id = None
-        self._lease_token = None
-        self._agent_url = None
-        self._name = None
-        self._worker_metadata = {}
-        self._sandfleet_status = {}
-        self._lease_ttl_seconds = 0
-        if lease_id is None or not self._url or not self._token:
-            return
-        with contextlib.suppress(Exception):
+        if lease_id is not None:
             self._request(
                 self._url,
                 f"/{_API_VERSION}/leases/{lease_id}",
@@ -318,3 +336,11 @@ class SandfleetBackend(SandboxBackend):
                 method="DELETE",
                 timeout=max(120, self._request_timeout),
             )
+        self._lease_id = None
+        self._lease_token = None
+        self._agent_url = None
+        self._name = None
+        self._worker_metadata = {}
+        self._sandfleet_status = {}
+        self._lease_ttl_seconds = 0
+        self._renewal_error = None

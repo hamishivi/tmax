@@ -22,6 +22,10 @@ def exercise(index: int, args: argparse.Namespace) -> dict:
         timeout=args.command_timeout,
         sandfleet_url=args.url,
         sandfleet_pool=args.pool,
+        sandfleet_cpus=args.cpus,
+        sandfleet_memory_mb=args.memory_mb,
+        sandfleet_gpu=args.gpu,
+        sandfleet_gpu_type=args.gpu_type,
         sandfleet_token=args.token,
     )
     started_at = time.perf_counter()
@@ -76,14 +80,27 @@ def exercise(index: int, args: argparse.Namespace) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default=os.environ.get("SANDFLEET_URL"), required=False)
-    parser.add_argument("--token", default=os.environ.get("SANDFLEET_TOKEN"), required=False)
-    parser.add_argument("--pool", default="smoke")
+    parser.add_argument("--token", default=os.environ.get("SANDFLEET_CLIENT_TOKEN"), required=False)
+    parser.add_argument("--pool")
+    parser.add_argument("--cpus", type=int)
+    parser.add_argument("--memory-mb", type=int)
+    parser.add_argument("--gpu", type=int)
+    parser.add_argument(
+        "--type", dest="gpu_type", action="append", help="Ordered GPU type fallback; repeat and use 'any' last"
+    )
     parser.add_argument("--image", required=True)
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--command-timeout", type=int, default=120)
     args = parser.parse_args()
     if not args.url or not args.token:
-        parser.error("--url/--token or SANDFLEET_URL/SANDFLEET_TOKEN are required")
+        parser.error("--url/--token or SANDFLEET_URL/SANDFLEET_CLIENT_TOKEN are required")
+    if (args.gpu is None) != (args.gpu_type is None):
+        parser.error("--gpu and at least one --type must be set together")
+    resource_mode = args.cpus is not None or args.memory_mb is not None or args.gpu is not None
+    if (args.pool is not None) == resource_mode:
+        parser.error("set either --pool or --cpus and --memory-mb")
+    if resource_mode and (args.cpus is None or args.memory_mb is None):
+        parser.error("resource requests require --cpus and --memory-mb")
     if args.concurrency < 1:
         parser.error("--concurrency must be positive")
 

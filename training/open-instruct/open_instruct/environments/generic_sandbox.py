@@ -368,8 +368,12 @@ class GenericSandboxEnvConfig(BaseEnvConfig):
     image: str = "python:3.12-slim"
     mem_limit: str = "4g"
     sandfleet_url: str | None = None
-    sandfleet_pool: str = "default"
-    sandfleet_token_env: str = "SANDFLEET_TOKEN"
+    sandfleet_pool: str | None = "default"
+    sandfleet_cpus: int | None = None
+    sandfleet_memory_mb: int | None = None
+    sandfleet_gpu: int | None = None
+    sandfleet_gpu_type: tuple[str, ...] | None = None
+    sandfleet_token_env: str = "SANDFLEET_CLIENT_TOKEN"
     sandfleet_request_timeout: int = 60
     sandfleet_acquire_timeout: int = 900
     penalty: float = -0.05
