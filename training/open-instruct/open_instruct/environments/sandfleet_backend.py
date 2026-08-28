@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 from docker import errors as docker_errors
 from docker import utils as docker_utils
 
-from open_instruct.environments.backends import ExecutionResult, SandboxBackend, SandboxLostError, SandboxOOMError
+from open_instruct.environments.backend_base import ExecutionResult, SandboxBackend, SandboxLostError, SandboxOOMError
 
 _API_VERSION = "v1"
 _MAX_REQUEST_BYTES = 64 * 1024 * 1024

@@ -13,12 +13,24 @@ import subprocess
 import tarfile
 import time
 import uuid
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
 
 import docker as docker_sdk
 
 from open_instruct import logger_utils
+from open_instruct.environments.backend_base import ExecutionResult, SandboxBackend, SandboxLostError, SandboxOOMError
+from open_instruct.environments.sandfleet_backend import SandfleetBackend
+
+__all__ = [
+    "ApptainerBackend",
+    "DockerBackend",
+    "ExecutionResult",
+    "SandboxBackend",
+    "SandboxLostError",
+    "SandboxOOMError",
+    "SandfleetBackend",
+    "create_backend",
+    "is_docker_host_connectivity_error",
+]
 
 logger = logger_utils.setup_logger(__name__)
 
@@ -107,75 +119,6 @@ class _FileSlotSemaphore:
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             handle.close()
-
-
-@dataclass
-class ExecutionResult:
-    """Result from code or command execution."""
-
-    stdout: str
-    stderr: str
-    exit_code: int
-
-
-class SandboxOOMError(RuntimeError):
-    """Raised when the sandbox container was killed by the OOM reaper.
-
-    Callers should treat this as a terminal condition for the current
-    episode (reward 0, done=True) rather than retrying, because the
-    agent's next command will almost certainly trip the same limit.
-    """
-
-
-class SandboxLostError(RuntimeError):
-    """Raised when infrastructure hosting a sandbox disappears.
-
-    Unlike an OOM caused by sandbox workload, this is an infrastructure
-    failure. The current episode cannot be resumed because its ephemeral
-    filesystem is gone, but the environment actor may be reused after reset.
-    """
-
-
-class SandboxBackend(ABC):
-    """Abstract interface for code/command execution backends."""
-
-    @abstractmethod
-    def start(self) -> None:
-        """Initialize the sandbox. Must be called before other operations."""
-
-    def restart(self) -> None:
-        """Replace the sandbox while retaining reusable backend resources.
-
-        Backends without a cheaper reset path get the original close/start
-        behavior. Backends with an outer isolation boundary can override this
-        method and replace only the inner sandbox.
-        """
-        self.close()
-        self.start()
-
-    @abstractmethod
-    def run_command(self, command: str, timeout: int | None = None) -> ExecutionResult:
-        """Execute a shell command in the sandbox."""
-
-    @abstractmethod
-    def write_file(self, path: str, content: str | bytes) -> None:
-        """Write a file to the sandbox filesystem."""
-
-    @abstractmethod
-    def read_file(self, path: str, binary: bool = False) -> str | bytes:
-        """Read a file from the sandbox filesystem."""
-
-    @abstractmethod
-    def put_archive(self, root: str, tar_bytes: bytes) -> None:
-        """Extract a tar archive inside the sandbox, rooted at ``root``.
-
-        ``tar_bytes`` is the raw bytes of a tar archive whose entries are
-        interpreted as paths relative to ``root`` inside the sandbox.
-        """
-
-    @abstractmethod
-    def close(self) -> None:
-        """Cleanup sandbox resources."""
 
 
 class DockerBackend(SandboxBackend):
@@ -814,8 +757,6 @@ def create_backend(backend_type: str, **kwargs) -> SandboxBackend:
     if backend_type == "apptainer":
         return ApptainerBackend(**kwargs)
     if backend_type == "sandfleet":
-        from open_instruct.environments.sandfleet_backend import SandfleetBackend  # noqa: PLC0415
-
         allowed = {"image", "timeout", "mem_limit", "pwd", "extra_start_flags", *sandfleet_only_kwargs}
         return SandfleetBackend(**{key: value for key, value in kwargs.items() if key in allowed})
     raise ValueError(
