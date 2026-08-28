@@ -165,7 +165,7 @@ def test_named_pool_ignores_local_memory_setting(service):
 
 
 @pytest.mark.parametrize(("mem_limit", "memory_mb"), [("4g", 4096), ("1.5g", 1536), (67108865, 65)])
-def test_backend_requests_one_cpu_and_existing_memory_limit(service, mem_limit, memory_mb):
+def test_backend_requests_two_cpus_and_existing_memory_limit(service, mem_limit, memory_mb):
     backend = create_backend(
         "sandfleet",
         image="/shared/image.sif",
@@ -180,7 +180,7 @@ def test_backend_requests_one_cpu_and_existing_memory_limit(service, mem_limit, 
             for method, path, payload in _ServiceHandler.requests
             if method == "POST" and path == "/v1/lease-requests"
         )
-        assert request == {"resources": {"cpus": 1, "memory_mb": memory_mb}, "timeout_seconds": 900}
+        assert request == {"resources": {"cpus": 2, "memory_mb": memory_mb}, "timeout_seconds": 900}
     finally:
         backend.close()
 

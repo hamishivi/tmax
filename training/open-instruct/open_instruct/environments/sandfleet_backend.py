@@ -20,7 +20,7 @@ from open_instruct.environments.backend_base import ExecutionResult, SandboxBack
 _API_VERSION = "v1"
 _MAX_REQUEST_BYTES = 64 * 1024 * 1024
 _MIB = 1024 * 1024
-_SANDBOX_CPUS = 1
+_SANDBOX_CPUS = 2
 
 
 def _memory_limit_mb(mem_limit: str | int) -> int:

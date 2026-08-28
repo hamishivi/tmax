@@ -31,7 +31,7 @@ export SANDFLEET_CLIENT_TOKEN=...
 }
 ```
 
-TMAX requests one CPU and uses the existing `mem_limit` as the Sandfleet RAM
+TMAX requests two CPUs and uses the existing `mem_limit` as the Sandfleet RAM
 request. Sandfleet validates that shape against controller policy and routes
 matching requests into one reusable homogeneous pool. TMAX never sends raw
 Slurm flags. A deployment can set `sandfleet_pool` to use a pre-created named
