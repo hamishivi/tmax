@@ -745,8 +745,6 @@ def create_backend(backend_type: str, **kwargs) -> SandboxBackend:
     sandfleet_only_kwargs = {
         "sandfleet_url",
         "sandfleet_pool",
-        "sandfleet_token",
-        "sandfleet_token_env",
         "sandfleet_request_timeout",
         "sandfleet_acquire_timeout",
     }

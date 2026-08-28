@@ -46,8 +46,6 @@ class SandfleetBackend(SandboxBackend):
         extra_start_flags: tuple[str, ...] = (),
         sandfleet_url: str | None = None,
         sandfleet_pool: str | None = None,
-        sandfleet_token: str | None = None,
-        sandfleet_token_env: str = "SANDFLEET_CLIENT_TOKEN",
         sandfleet_request_timeout: int = 60,
         sandfleet_acquire_timeout: int = 900,
     ):
@@ -60,7 +58,7 @@ class SandfleetBackend(SandboxBackend):
         self._resources = (
             None if sandfleet_pool is not None else {"cpus": _SANDBOX_CPUS, "memory_mb": _memory_limit_mb(mem_limit)}
         )
-        self._token = sandfleet_token or os.getenv(sandfleet_token_env) or ""
+        self._token = os.getenv("SANDFLEET_CLIENT_TOKEN", "")
         self._request_timeout = sandfleet_request_timeout
         self._acquire_timeout = sandfleet_acquire_timeout
 

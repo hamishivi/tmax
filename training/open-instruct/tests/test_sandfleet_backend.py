@@ -100,10 +100,13 @@ def service():
         thread.join(timeout=2)
 
 
+@pytest.fixture(autouse=True)
+def client_token(monkeypatch):
+    monkeypatch.setenv("SANDFLEET_CLIENT_TOKEN", "client-token")
+
+
 def test_full_backend_contract_and_persistent_remote_lease(service):
-    backend = SandfleetBackend(
-        image="/shared/first.sif", sandfleet_url=service, sandfleet_pool="rollouts", sandfleet_token="service-token"
-    )
+    backend = SandfleetBackend(image="/shared/first.sif", sandfleet_url=service, sandfleet_pool="rollouts")
     backend.start()
     assert backend._name == "first"
     assert backend._worker_metadata["path"] == "/cg/step-1"
@@ -127,7 +130,7 @@ def test_full_backend_contract_and_persistent_remote_lease(service):
 
 
 def test_remote_oom_preserves_backend_exception(service):
-    backend = SandfleetBackend(image="/shared/image.sif", sandfleet_url=service, sandfleet_token="service-token")
+    backend = SandfleetBackend(image="/shared/image.sif", sandfleet_url=service)
     backend.start()
     _ServiceHandler.oom = True
     try:
@@ -138,7 +141,7 @@ def test_remote_oom_preserves_backend_exception(service):
 
 
 def test_lost_worker_is_a_distinct_retryable_infrastructure_error(service):
-    backend = SandfleetBackend(image="/shared/image.sif", sandfleet_url=service, sandfleet_token="service-token")
+    backend = SandfleetBackend(image="/shared/image.sif", sandfleet_url=service)
     backend.start()
     _ServiceHandler.lost = True
     try:
@@ -155,7 +158,6 @@ def test_named_pool_ignores_local_memory_setting(service):
         mem_limit="12g",
         sandfleet_url=service,
         sandfleet_pool="small",
-        sandfleet_token="token",
         sandfleet_acquire_timeout=123,
     )
     assert isinstance(backend, SandfleetBackend)
@@ -166,13 +168,7 @@ def test_named_pool_ignores_local_memory_setting(service):
 
 @pytest.mark.parametrize(("mem_limit", "memory_mb"), [("4g", 4096), ("1.5g", 1536), (67108865, 65)])
 def test_backend_requests_two_cpus_and_existing_memory_limit(service, mem_limit, memory_mb):
-    backend = create_backend(
-        "sandfleet",
-        image="/shared/image.sif",
-        mem_limit=mem_limit,
-        sandfleet_url=service,
-        sandfleet_token="client-token",
-    )
+    backend = create_backend("sandfleet", image="/shared/image.sif", mem_limit=mem_limit, sandfleet_url=service)
     backend.start()
     try:
         request = next(
@@ -191,22 +187,22 @@ def test_backend_rejects_invalid_or_too_small_memory(mem_limit):
         SandfleetBackend(sandfleet_url="http://controller", mem_limit=mem_limit)
 
 
-def test_client_role_token_is_preferred_from_environment(monkeypatch):
-    monkeypatch.setenv("SANDFLEET_CLIENT_TOKEN", "client-token")
+def test_client_token_comes_from_environment(monkeypatch):
+    monkeypatch.setenv("SANDFLEET_CLIENT_TOKEN", "different-client-token")
     monkeypatch.setenv("SANDFLEET_TOKEN", "admin-token")
-    backend = SandfleetBackend(sandfleet_url="http://controller", sandfleet_token=None)
-    assert backend._token == "client-token"
+    backend = SandfleetBackend(sandfleet_url="http://controller")
+    assert backend._token == "different-client-token"
 
 
 def test_client_role_does_not_fall_back_to_admin(monkeypatch):
     monkeypatch.delenv("SANDFLEET_CLIENT_TOKEN", raising=False)
     monkeypatch.setenv("SANDFLEET_TOKEN", "admin-token")
-    backend = SandfleetBackend(sandfleet_url="http://controller", sandfleet_token=None)
+    backend = SandfleetBackend(sandfleet_url="http://controller")
     assert backend._token == ""
 
 
 def test_failed_release_keeps_lease_releasable(service):
-    backend = SandfleetBackend(sandfleet_url=service, sandfleet_token="client-token")
+    backend = SandfleetBackend(sandfleet_url=service)
     backend.start()
     _ServiceHandler.release_error = True
     with pytest.raises(RuntimeError, match="release failed"):

@@ -23,7 +23,6 @@ def exercise(index: int, args: argparse.Namespace) -> dict:
         mem_limit=args.mem_limit,
         sandfleet_url=args.url,
         sandfleet_pool=args.pool,
-        sandfleet_token=args.token,
     )
     started_at = time.perf_counter()
     try:
@@ -77,15 +76,16 @@ def exercise(index: int, args: argparse.Namespace) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default=os.environ.get("SANDFLEET_URL"), required=False)
-    parser.add_argument("--token", default=os.environ.get("SANDFLEET_CLIENT_TOKEN"), required=False)
     parser.add_argument("--pool")
     parser.add_argument("--mem-limit", default="4g")
     parser.add_argument("--image", required=True)
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--command-timeout", type=int, default=120)
     args = parser.parse_args()
-    if not args.url or not args.token:
-        parser.error("--url/--token or SANDFLEET_URL/SANDFLEET_CLIENT_TOKEN are required")
+    if not args.url:
+        parser.error("--url or SANDFLEET_URL is required")
+    if not os.environ.get("SANDFLEET_CLIENT_TOKEN"):
+        parser.error("SANDFLEET_CLIENT_TOKEN is required")
     if args.concurrency < 1:
         parser.error("--concurrency must be positive")
 

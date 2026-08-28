@@ -566,7 +566,6 @@ class SWERLVanilluxSandboxEnvConfig(BaseEnvConfig):
     mem_limit: str = "4g"
     sandfleet_url: str | None = None
     sandfleet_pool: str | None = None
-    sandfleet_token_env: str = "SANDFLEET_CLIENT_TOKEN"
     sandfleet_request_timeout: int = 60
     sandfleet_acquire_timeout: int = 900
     penalty: float = -0.05
