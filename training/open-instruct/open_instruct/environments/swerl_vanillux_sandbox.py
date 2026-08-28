@@ -37,7 +37,7 @@ from openenv.core.env_server.types import State
 
 from open_instruct import logger_utils
 
-from .backends import SandboxBackend, SandboxOOMError, create_backend
+from .backends import SandboxBackend, SandboxLostError, SandboxOOMError, create_backend
 from .base import BaseEnvConfig, EnvCall, RLEnvironment, StepResult
 from .swerl_sandbox import LAST_STEP_WARNING, SUBMIT_MARKER, TIMING_LOG_THRESHOLD_S, TIMING_LOGS
 from .tools.utils import coerce_args
@@ -302,11 +302,9 @@ class SWERLVanilluxSandboxEnv(RLEnvironment):
             self._backend = None
 
         if self._backend is not None:
-            self._backend.close()
-            record_phase("close")
             self._backend._image = self._backend_kwargs.get("image", self._backend._image)
-            self._backend.start()
-            record_phase("start")
+            self._backend.restart()
+            record_phase("restart")
         else:
             bkwargs = dict(self._backend_kwargs)
             bkwargs.setdefault("timeout", self._timeout)
@@ -424,6 +422,22 @@ class SWERLVanilluxSandboxEnv(RLEnvironment):
                     reward=0.0,
                     done=True,
                     metadata={"oom_killed": True, "task_id": self._task_id},
+                )
+            except SandboxLostError as e:
+                logger.warning(f"[{self._task_id}] sandbox worker lost: {e}")
+                with contextlib.suppress(Exception):
+                    self._backend.close()
+                self._backend = None
+                return StepResult(
+                    result="Sandbox worker was lost. Ending this rollout so it can be resampled.",
+                    reward=0.0,
+                    done=True,
+                    metadata={
+                        "sandbox_lost": True,
+                        "infrastructure_failure": True,
+                        "error": str(e),
+                        "task_id": self._task_id,
+                    },
                 )
         return self._with_last_step_warning(
             StepResult(result=format_error_message(f"Unknown tool '{call.name}'. The only available tool is `bash`."))
@@ -550,6 +564,11 @@ class SWERLVanilluxSandboxEnvConfig(BaseEnvConfig):
     backend: str = "docker"
     image: str = "python:3.12-slim"
     mem_limit: str = "4g"
+    sandfleet_url: str | None = None
+    sandfleet_pool: str = "default"
+    sandfleet_token_env: str = "SANDFLEET_TOKEN"
+    sandfleet_request_timeout: int = 60
+    sandfleet_acquire_timeout: int = 900
     penalty: float = -0.05
     task_data_dir: str = ""
     task_data_hf_repo: str = ""

@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from open_instruct.environments.backends import ExecutionResult
+from open_instruct.environments.backends import ExecutionResult, SandboxLostError
 from open_instruct.environments.base import EnvCall, StepResult
 from open_instruct.environments.swerl_sandbox import LAST_STEP_WARNING, SWERLSandboxEnv
 from open_instruct.environments.swerl_vanillux_sandbox import (
@@ -106,6 +106,21 @@ class TestSWERLSandboxLastStepWarning(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn(LAST_STEP_WARNING, first.result)
         self.assertIn(LAST_STEP_WARNING, second.result)
+
+    async def test_lost_worker_ends_rollout_and_discards_backend(self):
+        env = SWERLSandboxEnv()
+
+        class _LostBackend(_FakeBackend):
+            def run_command(self, command: str) -> ExecutionResult:
+                raise SandboxLostError("worker preempted")
+
+        env._backend = _LostBackend()
+        result = await env.step(EnvCall(id="1", name="bash", args={"command": "echo never"}))
+
+        self.assertTrue(result.done)
+        self.assertTrue(result.metadata["sandbox_lost"])
+        self.assertTrue(result.metadata["infrastructure_failure"])
+        self.assertIsNone(env._backend)
 
 
 class TestSWERLVanilluxSandbox(unittest.IsolatedAsyncioTestCase):

@@ -12,7 +12,7 @@ from openenv.core.env_server.types import State
 
 from open_instruct import logger_utils
 
-from .backends import SandboxBackend, create_backend
+from .backends import SandboxBackend, SandboxLostError, create_backend
 from .base import BaseEnvConfig, EnvCall, RLEnvironment, StepResult
 from .tools.utils import coerce_args
 
@@ -153,12 +153,13 @@ class GenericSandboxEnv(RLEnvironment):
 
     def _do_reset(self, **kwargs: Any) -> tuple[StepResult, list[dict]]:
         task_prompt = kwargs.get("task_prompt")
-        if self._backend is not None:
-            self._backend.close()
-        bkwargs = dict(self._backend_kwargs)
-        bkwargs.setdefault("timeout", self._timeout)
-        self._backend = create_backend(self._backend_type, **bkwargs)
-        self._backend.start()
+        if self._backend is None:
+            bkwargs = dict(self._backend_kwargs)
+            bkwargs.setdefault("timeout", self._timeout)
+            self._backend = create_backend(self._backend_type, **bkwargs)
+            self._backend.start()
+        else:
+            self._backend.restart()
         self._step_count = 0
         self._task_prompt = task_prompt
 
@@ -191,16 +192,28 @@ class GenericSandboxEnv(RLEnvironment):
 
         self._step_count += 1
 
-        if call.name == "execute_bash":
-            args = coerce_args(_EXECUTE_BASH_TOOL["function"]["parameters"], call.args)
-            return self._execute_bash(args)
-        elif call.name == "str_replace_editor":
-            args = coerce_args(_STR_REPLACE_EDITOR_TOOL["function"]["parameters"], call.args)
-            return self._execute_editor(args)
-        else:
+        try:
+            if call.name == "execute_bash":
+                args = coerce_args(_EXECUTE_BASH_TOOL["function"]["parameters"], call.args)
+                return self._execute_bash(args)
+            elif call.name == "str_replace_editor":
+                args = coerce_args(_STR_REPLACE_EDITOR_TOOL["function"]["parameters"], call.args)
+                return self._execute_editor(args)
+            else:
+                return StepResult(
+                    result=f"Error: Unknown tool '{call.name}'. Available: execute_bash, str_replace_editor",
+                    reward=self._penalty,
+                )
+        except SandboxLostError as error:
+            logger.warning("Sandbox worker was lost: %s", error)
+            with contextlib.suppress(Exception):
+                self._backend.close()
+            self._backend = None
             return StepResult(
-                result=f"Error: Unknown tool '{call.name}'. Available: execute_bash, str_replace_editor",
-                reward=self._penalty,
+                result="Sandbox worker was lost. Ending this rollout so it can be resampled.",
+                reward=0.0,
+                done=True,
+                metadata={"sandbox_lost": True, "infrastructure_failure": True, "error": str(error)},
             )
 
     def _execute_bash(self, args: dict) -> StepResult:
@@ -354,6 +367,11 @@ class GenericSandboxEnvConfig(BaseEnvConfig):
     backend: str = "docker"
     image: str = "python:3.12-slim"
     mem_limit: str = "4g"
+    sandfleet_url: str | None = None
+    sandfleet_pool: str = "default"
+    sandfleet_token_env: str = "SANDFLEET_TOKEN"
+    sandfleet_request_timeout: int = 60
+    sandfleet_acquire_timeout: int = 900
     penalty: float = -0.05
     write_prompt_file: bool = False
     timeout: int = 300

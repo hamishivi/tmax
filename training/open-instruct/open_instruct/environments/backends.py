@@ -127,12 +127,31 @@ class SandboxOOMError(RuntimeError):
     """
 
 
+class SandboxLostError(RuntimeError):
+    """Raised when infrastructure hosting a sandbox disappears.
+
+    Unlike an OOM caused by sandbox workload, this is an infrastructure
+    failure. The current episode cannot be resumed because its ephemeral
+    filesystem is gone, but the environment actor may be reused after reset.
+    """
+
+
 class SandboxBackend(ABC):
     """Abstract interface for code/command execution backends."""
 
     @abstractmethod
     def start(self) -> None:
         """Initialize the sandbox. Must be called before other operations."""
+
+    def restart(self) -> None:
+        """Replace the sandbox while retaining reusable backend resources.
+
+        Backends without a cheaper reset path get the original close/start
+        behavior. Backends with an outer isolation boundary can override this
+        method and replace only the inner sandbox.
+        """
+        self.close()
+        self.start()
 
     @abstractmethod
     def run_command(self, command: str, timeout: int | None = None) -> ExecutionResult:
@@ -774,14 +793,37 @@ def create_backend(backend_type: str, **kwargs) -> SandboxBackend:
     """Factory function to create a sandbox backend.
 
     Args:
-        backend_type: ``"docker"`` or ``"apptainer"``.
+        backend_type: ``"docker"``, ``"apptainer"``, or ``"sandfleet"``.
         **kwargs: Backend-specific arguments.
 
     Returns:
         SandboxBackend instance (not yet started).
     """
+    sandfleet_only_kwargs = {
+        "sandfleet_url",
+        "sandfleet_pool",
+        "sandfleet_token",
+        "sandfleet_token_env",
+        "sandfleet_request_timeout",
+        "sandfleet_acquire_timeout",
+    }
+    if backend_type != "sandfleet":
+        kwargs = {key: value for key, value in kwargs.items() if key not in sandfleet_only_kwargs}
     if backend_type == "docker":
         return DockerBackend(**kwargs)
     if backend_type == "apptainer":
         return ApptainerBackend(**kwargs)
-    raise ValueError(f"Unknown backend type: {backend_type}. Supported: 'docker', 'apptainer'.")
+    if backend_type == "sandfleet":
+        from open_instruct.environments.sandfleet_backend import SandfleetBackend  # noqa: PLC0415
+
+        allowed = {
+            "image",
+            "timeout",
+            "pwd",
+            "extra_start_flags",
+            *sandfleet_only_kwargs,
+        }
+        return SandfleetBackend(**{key: value for key, value in kwargs.items() if key in allowed})
+    raise ValueError(
+        f"Unknown backend type: {backend_type}. Supported: 'docker', 'apptainer', 'sandfleet'."
+    )
