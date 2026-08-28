@@ -6,6 +6,8 @@ import base64
 import contextlib
 import json
 import os
+import random
+import threading
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -39,7 +41,12 @@ class SandfleetBackend(SandboxBackend):
         self._extra_start_flags = tuple(extra_start_flags)
         self._url = (sandfleet_url or os.getenv("SANDFLEET_URL") or "").rstrip("/")
         self._pool = sandfleet_pool
-        self._token = sandfleet_token or os.getenv(sandfleet_token_env) or ""
+        self._token = (
+            sandfleet_token
+            or os.getenv("SANDFLEET_CLIENT_TOKEN")
+            or os.getenv(sandfleet_token_env)
+            or ""
+        )
         self._request_timeout = sandfleet_request_timeout
         self._acquire_timeout = sandfleet_acquire_timeout
 
@@ -49,12 +56,15 @@ class SandfleetBackend(SandboxBackend):
         self._worker_metadata: dict[str, Any] = {}
         self._sandfleet_status: dict[str, Any] = {}
         self._name: str | None = None
+        self._lease_ttl_seconds = 0
+        self._renew_stop = threading.Event()
+        self._renew_thread: threading.Thread | None = None
 
     def _ensure_configured(self) -> None:
         if not self._url:
             raise RuntimeError("Sandfleet service URL is unset; set SANDFLEET_URL or sandfleet_url")
         if not self._token:
-            raise RuntimeError("Sandfleet service token is unset")
+            raise RuntimeError("Sandfleet client token is unset")
 
     @staticmethod
     def _decode_error(error: HTTPError) -> tuple[str, str]:
@@ -151,12 +161,15 @@ class SandfleetBackend(SandboxBackend):
             payload={"pool": self._pool, "timeout_seconds": self._acquire_timeout},
         )
         request_id = str(result["request_id"])
+        delay = max(0.0, float(result.get("poll_after_seconds", 2)))
         try:
             while result.get("status") == "pending":
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(f"Timed out waiting for Sandfleet pool {self._pool!r}")
-                time.sleep(min(float(result.get("poll_after_seconds", 2)), remaining))
+                base_delay = max(delay, float(result.get("poll_after_seconds", 0)))
+                time.sleep(min(base_delay * random.uniform(0.9, 1.1), remaining))
+                delay = min(10.0, max(0.1, base_delay * 1.5))
                 result = self._request(
                     self._url,
                     f"/{_API_VERSION}/lease-requests/{request_id}",
@@ -175,6 +188,36 @@ class SandfleetBackend(SandboxBackend):
                 )
             raise
 
+    def _renew_once(self) -> None:
+        lease_id = self._lease_id
+        if lease_id is None:
+            return
+        self._request(
+            self._url,
+            f"/{_API_VERSION}/leases/{lease_id}/renew",
+            token=self._token,
+            method="POST",
+            payload={},
+        )
+
+    def _renew_loop(self) -> None:
+        interval = max(1.0, self._lease_ttl_seconds / 3)
+        while not self._renew_stop.wait(interval * random.uniform(0.9, 1.1)):
+            with contextlib.suppress(Exception):
+                self._renew_once()
+
+    def _start_renewal(self, ttl_seconds: int) -> None:
+        self._lease_ttl_seconds = ttl_seconds
+        self._renew_stop.clear()
+        if ttl_seconds <= 0:
+            return
+        self._renew_thread = threading.Thread(
+            target=self._renew_loop,
+            name=f"sandfleet-renew-{str(self._lease_id)[:8]}",
+            daemon=True,
+        )
+        self._renew_thread.start()
+
     def _start_payload(self) -> dict[str, Any]:
         return {
             "image": self._image,
@@ -191,6 +234,7 @@ class SandfleetBackend(SandboxBackend):
         self._lease_id = lease["lease_id"]
         self._lease_token = lease["lease_token"]
         self._agent_url = lease["agent_url"]
+        self._start_renewal(int(lease.get("ttl_seconds", 0)))
         try:
             result = self._agent_request(
                 "start",
@@ -252,12 +296,18 @@ class SandfleetBackend(SandboxBackend):
         )
 
     def close(self) -> None:
-        lease_id, self._lease_id = self._lease_id, None
+        lease_id = self._lease_id
+        self._renew_stop.set()
+        if self._renew_thread is not None:
+            self._renew_thread.join(timeout=2)
+            self._renew_thread = None
+        self._lease_id = None
         self._lease_token = None
         self._agent_url = None
         self._name = None
         self._worker_metadata = {}
         self._sandfleet_status = {}
+        self._lease_ttl_seconds = 0
         if lease_id is None or not self._url or not self._token:
             return
         with contextlib.suppress(Exception):

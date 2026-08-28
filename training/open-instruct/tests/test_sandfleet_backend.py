@@ -47,9 +47,12 @@ class _ServiceHandler(BaseHTTPRequestHandler):
                         "lease_id": "lease-1",
                         "lease_token": "lease-token",
                         "agent_url": self.base_url,
+                        "ttl_seconds": 3600,
                     },
                 },
             )
+        elif self.path == "/v1/leases/lease-1/renew":
+            self._send(200, {"lease_id": "lease-1", "ttl_seconds": 3600})
         elif self.path.endswith("/start"):
             self._send(200, {"instance_name": "first", "cgroup": {"path": "/cg/step-1"}})
         elif self.path.endswith("/restart"):
@@ -110,11 +113,13 @@ def test_full_backend_contract_and_persistent_remote_lease(service):
     backend.restart()
     assert backend._name == "second"
     assert backend._lease_id == "lease-1"
+    backend._renew_once()
     backend.close()
 
     paths = [path for _, path, _ in _ServiceHandler.requests]
     assert paths.count("/v1/lease-requests") == 1
     assert "/v1/leases/lease-1/restart" in paths
+    assert "/v1/leases/lease-1/renew" in paths
     assert paths[-1] == "/v1/leases/lease-1"
 
 
@@ -162,3 +167,10 @@ def test_factory_ignores_local_slurm_and_memory_settings(service):
     assert isinstance(backend, SandfleetBackend)
     assert backend._pool == "small"
     assert backend._acquire_timeout == 123
+
+
+def test_client_role_token_is_preferred_from_environment(monkeypatch):
+    monkeypatch.setenv("SANDFLEET_CLIENT_TOKEN", "client-token")
+    monkeypatch.setenv("SANDFLEET_TOKEN", "admin-token")
+    backend = SandfleetBackend(sandfleet_url="http://controller", sandfleet_token=None)
+    assert backend._token == "client-token"
