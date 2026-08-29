@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.error import HTTPError
 
 import pytest
 
@@ -160,6 +162,60 @@ def test_named_pool_ignores_local_memory_setting(service, monkeypatch):
     assert backend._pool == "small"
     assert backend._resources is None
     assert backend._acquire_timeout == 900
+    assert backend._request_timeout == 300
+
+
+def _transient_error() -> HTTPError:
+    body = io.BytesIO(b'{"error":{"type":"RuntimeError","message":"try later"}}')
+    return HTTPError("http://controller", 503, "Service Unavailable", {}, body)
+
+
+def test_replay_safe_requests_retry_with_backoff(monkeypatch):
+    outcomes = iter([_transient_error(), _transient_error(), io.BytesIO(b'{"ok":true}')])
+    calls = []
+    delays = []
+
+    def request(*args, **kwargs):
+        calls.append((args, kwargs))
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr("open_instruct.environments.sandfleet_backend.urlopen", request)
+    monkeypatch.setattr("open_instruct.environments.sandfleet_backend.time.sleep", delays.append)
+    backend = SandfleetBackend()
+
+    assert backend._request("http://controller", "/v1/health", token="client-token") == {"ok": True}
+    assert len(calls) == 3
+    assert len(delays) == 2
+    assert delays[0] < delays[1]
+
+
+def test_renewal_retries_but_lease_creation_does_not(monkeypatch):
+    monkeypatch.setenv("SANDFLEET_URL", "http://controller")
+    outcomes = iter([_transient_error(), io.BytesIO(b'{"lease_id":"lease-1"}')])
+    calls = []
+
+    def request(*args, **kwargs):
+        calls.append((args, kwargs))
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr("open_instruct.environments.sandfleet_backend.urlopen", request)
+    monkeypatch.setattr("open_instruct.environments.sandfleet_backend.time.sleep", lambda _delay: None)
+    backend = SandfleetBackend()
+    backend._lease_id = "lease-1"
+    backend._renew_once()
+    assert len(calls) == 2
+
+    calls.clear()
+    outcomes = iter([_transient_error(), io.BytesIO(b"{}")])
+    with pytest.raises(RuntimeError, match="try later"):
+        SandfleetBackend().start()
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize(("mem_limit", "memory_mb"), [("4g", 4096), ("1.5g", 1536), (67108865, 65)])

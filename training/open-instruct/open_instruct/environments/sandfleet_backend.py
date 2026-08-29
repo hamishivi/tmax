@@ -21,8 +21,12 @@ _API_VERSION = "v1"
 _MAX_REQUEST_BYTES = 64 * 1024 * 1024
 _MIB = 1024 * 1024
 _SANDBOX_CPUS = 2
-_REQUEST_TIMEOUT_SECONDS = 60
+_REQUEST_TIMEOUT_SECONDS = 300
 _ACQUIRE_TIMEOUT_SECONDS = 900
+_RETRY_WINDOW_SECONDS = 60
+_RETRY_INITIAL_DELAY_SECONDS = 0.5
+_RETRY_MAX_DELAY_SECONDS = 5
+_RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 502, 503, 504})
 
 
 def _memory_limit_mb(mem_limit: str | int) -> int:
@@ -34,6 +38,14 @@ def _memory_limit_mb(mem_limit: str | int) -> int:
     if memory_mb < 64:
         raise ValueError("mem_limit must be at least 64 MiB for Sandfleet")
     return memory_mb
+
+
+def _sleep_before_retry(deadline: float, delay: float) -> float | None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    time.sleep(min(delay * random.uniform(0.9, 1.1), remaining))
+    return min(_RETRY_MAX_DELAY_SECONDS, delay * 2)
 
 
 class SandfleetBackend(SandboxBackend):
@@ -112,6 +124,7 @@ class SandfleetBackend(SandboxBackend):
         method: str = "GET",
         payload: dict[str, Any] | None = None,
         timeout: float | None = None,
+        retry: bool | None = None,
     ) -> dict[str, Any]:
         body = None if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
         if body is not None and len(body) > _MAX_REQUEST_BYTES:
@@ -120,16 +133,31 @@ class SandfleetBackend(SandboxBackend):
         if body is not None:
             headers["Content-Type"] = "application/json"
         request = Request(base_url.rstrip("/") + path, data=body, headers=headers, method=method)
-        try:
-            with urlopen(request, timeout=timeout or self._request_timeout) as response:  # noqa: S310
-                raw = response.read()
-                return json.loads(raw) if raw else {}
-        except HTTPError as error:
-            error_type, message = self._decode_error(error)
-            self._raise_remote_error(error_type, message, cause=error)
-        except URLError as error:
-            raise ConnectionError(f"Could not reach Sandfleet endpoint {base_url!r}: {error.reason}") from error
-        raise AssertionError("unreachable")
+        retry = method in {"GET", "DELETE"} if retry is None else retry
+        retry_deadline = time.monotonic() + _RETRY_WINDOW_SECONDS
+        delay = _RETRY_INITIAL_DELAY_SECONDS
+        while True:
+            try:
+                with urlopen(request, timeout=timeout or self._request_timeout) as response:  # noqa: S310
+                    raw = response.read()
+                    return json.loads(raw) if raw else {}
+            except HTTPError as error:
+                if retry and error.code in _RETRYABLE_HTTP_STATUSES:
+                    next_delay = _sleep_before_retry(retry_deadline, delay)
+                    if next_delay is not None:
+                        error.close()
+                        delay = next_delay
+                        continue
+                error_type, message = self._decode_error(error)
+                self._raise_remote_error(error_type, message, cause=error)
+            except OSError as error:
+                if retry:
+                    next_delay = _sleep_before_retry(retry_deadline, delay)
+                    if next_delay is not None:
+                        delay = next_delay
+                        continue
+                reason = error.reason if isinstance(error, URLError) else str(error)
+                raise ConnectionError(f"Could not reach Sandfleet endpoint {base_url!r}: {reason}") from error
 
     def _agent_request(
         self,
@@ -138,6 +166,7 @@ class SandfleetBackend(SandboxBackend):
         method: str = "POST",
         payload: dict[str, Any] | None = None,
         timeout: float | None = None,
+        retry: bool | None = None,
     ) -> dict[str, Any]:
         if self._lease_id is None or self._lease_token is None or self._agent_url is None:
             raise RuntimeError("Sandfleet lease is not active. Call start() first.")
@@ -151,6 +180,7 @@ class SandfleetBackend(SandboxBackend):
                 method=method,
                 payload=payload,
                 timeout=timeout,
+                retry=retry,
             )
         except ConnectionError as error:
             reason = str(error)
@@ -204,7 +234,12 @@ class SandfleetBackend(SandboxBackend):
         if lease_id is None:
             return
         self._request(
-            self._url, f"/{_API_VERSION}/leases/{lease_id}/renew", token=self._token, method="POST", payload={}
+            self._url,
+            f"/{_API_VERSION}/leases/{lease_id}/renew",
+            token=self._token,
+            method="POST",
+            payload={},
+            retry=True,
         )
 
     def _renew_loop(self) -> None:
@@ -284,7 +319,7 @@ class SandfleetBackend(SandboxBackend):
         )
 
     def read_file(self, path: str, binary: bool = False) -> str | bytes:
-        result = self._agent_request("read-file", payload={"path": path}, timeout=120)
+        result = self._agent_request("read-file", payload={"path": path}, timeout=120, retry=True)
         content = base64.b64decode(result["content_b64"].encode("ascii"), validate=True)
         return content if binary else content.decode("utf-8", errors="replace")
 
