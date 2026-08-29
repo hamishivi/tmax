@@ -27,6 +27,13 @@ _RETRY_WINDOW_SECONDS = 60
 _RETRY_INITIAL_DELAY_SECONDS = 0.5
 _RETRY_MAX_DELAY_SECONDS = 5
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 502, 503, 504})
+_REMOTE_ERRORS: dict[str, type[Exception]] = {
+    "FileNotFoundError": FileNotFoundError,
+    "IsADirectoryError": IsADirectoryError,
+    "SandboxLostError": SandboxLostError,
+    "SandboxOOMError": SandboxOOMError,
+    "ValueError": ValueError,
+}
 
 
 def _memory_limit_mb(mem_limit: str | int) -> int:
@@ -103,16 +110,9 @@ class SandfleetBackend(SandboxBackend):
 
     @staticmethod
     def _raise_remote_error(error_type: str, message: str, *, cause: Exception) -> None:
-        if error_type == "SandboxOOMError":
-            raise SandboxOOMError(message) from cause
-        if error_type == "SandboxLostError":
-            raise SandboxLostError(message) from cause
-        if error_type == "FileNotFoundError":
-            raise FileNotFoundError(message) from cause
-        if error_type == "IsADirectoryError":
-            raise IsADirectoryError(message) from cause
-        if error_type == "ValueError":
-            raise ValueError(message) from cause
+        exception = _REMOTE_ERRORS.get(error_type)
+        if exception is not None:
+            raise exception(message) from cause
         raise RuntimeError(f"Sandfleet {error_type}: {message}") from cause
 
     def _request(
@@ -138,7 +138,8 @@ class SandfleetBackend(SandboxBackend):
         delay = _RETRY_INITIAL_DELAY_SECONDS
         while True:
             try:
-                with urlopen(request, timeout=timeout or self._request_timeout) as response:  # noqa: S310
+                request_timeout = self._request_timeout if timeout is None else timeout
+                with urlopen(request, timeout=request_timeout) as response:  # noqa: S310
                     raw = response.read()
                     return json.loads(raw) if raw else {}
             except HTTPError as error:
@@ -247,8 +248,6 @@ class SandfleetBackend(SandboxBackend):
         while not self._renew_stop.wait(interval * random.uniform(0.9, 1.1)):
             try:
                 self._renew_once()
-            except ConnectionError:
-                continue
             except Exception as error:
                 self._renewal_error = error
                 return

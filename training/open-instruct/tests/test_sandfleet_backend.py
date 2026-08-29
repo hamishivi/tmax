@@ -218,6 +218,24 @@ def test_renewal_retries_but_lease_creation_does_not(monkeypatch):
     assert len(calls) == 1
 
 
+def test_renewal_failure_is_exposed_to_the_next_operation(monkeypatch):
+    backend = SandfleetBackend()
+    backend._lease_ttl_seconds = 3
+    monkeypatch.setattr(backend._renew_stop, "wait", lambda _timeout: False)
+
+    def fail_renewal():
+        raise ConnectionError("controller unavailable after retry window")
+
+    monkeypatch.setattr(backend, "_renew_once", fail_renewal)
+    backend._renew_loop()
+
+    backend._lease_id = "lease-1"
+    backend._lease_token = "lease-token"
+    backend._agent_url = "http://agent"
+    with pytest.raises(SandboxLostError, match="controller unavailable"):
+        backend._agent_request("exec")
+
+
 @pytest.mark.parametrize(("mem_limit", "memory_mb"), [("4g", 4096), ("1.5g", 1536), (67108865, 65)])
 def test_backend_requests_two_cpus_and_existing_memory_limit(service, mem_limit, memory_mb):
     backend = create_backend("sandfleet", image="/shared/image.sif", mem_limit=mem_limit)
