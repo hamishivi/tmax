@@ -37,6 +37,7 @@ from openenv.core.env_server.types import State
 
 from open_instruct import logger_utils
 
+from .apptainer_images import prefer_local_sif
 from .backends import SandboxBackend, SandboxLostError, SandboxOOMError, create_backend
 from .base import BaseEnvConfig, EnvCall, RLEnvironment, StepResult
 from .swerl_sandbox import LAST_STEP_WARNING, SUBMIT_MARKER, TIMING_LOG_THRESHOLD_S, TIMING_LOGS
@@ -287,6 +288,12 @@ class SWERLVanilluxSandboxEnv(RLEnvironment):
                 "SWERLVanilluxSandboxEnv requires an explicit image per task. "
                 "Set env_config.image or provide image.txt in task data."
             )
+        if self._backend_type in ("apptainer", "sandfleet"):
+            # Both run apptainer on the sandbox host; a plain docker ref forces a
+            # per-lease pull + OCI->SIF conversion there (exit=255 under
+            # restricted egress). Resolve to the prebuilt local pool when
+            # configured.
+            resolved_image = prefer_local_sif(resolved_image)
         self._backend_kwargs["image"] = resolved_image
         if self._backend_type == "docker" and kwargs.get("docker_host"):
             self._backend_kwargs["docker_host"] = kwargs["docker_host"]

@@ -21,6 +21,7 @@ private URL and client token:
 export SANDFLEET_URL=http://sandfleet-controller:8765
 export SANDFLEET_CLIENT_TOKEN=...
 # Optional: export SANDFLEET_POOL=rollout-small
+# Optional: export SWERL_APPTAINER_SIF_DIR=/shared/sifs
 ```
 
 ```json
@@ -39,6 +40,13 @@ pool instead; in that mode the pool profile defines resources and `mem_limit`
 is ignored. Sandfleet returns a scoped lease whose Apptainer instance can be
 restarted without submitting another worker job. GPU selection remains a
 Sandfleet service feature until TMAX has a real GPU-sandbox use case.
+
+When `SWERL_APPTAINER_SIF_DIR` is set, Apptainer-family backends first look for
+a nonempty local SIF named from the full image reference, then fall back to a
+SIF with the same trailing hexadecimal content hash. This supports mirrored
+image names without pulling and converting an OCI image on every lease. The
+configured directory must exist and be readable; unmatched non-hash references
+retain the normal Apptainer pull behavior.
 
 If an elastic pool has no immediately ready slot, reset waits up to 15 minutes
 for Sandfleet to start capacity. If Slurm preempts the worker
