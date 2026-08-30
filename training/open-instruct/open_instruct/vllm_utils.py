@@ -57,6 +57,7 @@ from open_instruct import logger_utils, utils
 from open_instruct.data_types import (
     EnvConfig,
     EnvConfigEntry,
+    FatalGenerationError,
     GenerationResult,
     PromptRequest,
     RequestInfo,
@@ -69,13 +70,7 @@ from open_instruct.environments.tools.parsers import ToolParser, create_tool_par
 from open_instruct.ground_truth_utils import RewardConfig
 
 logger = logger_utils.setup_logger(__name__)
-SANDBOX_TIMING_LOGS = os.getenv("SWERL_SANDBOX_TIMING_LOGS", "").strip().lower() not in {
-    "",
-    "0",
-    "false",
-    "no",
-    "off",
-}
+SANDBOX_TIMING_LOGS = os.getenv("SWERL_SANDBOX_TIMING_LOGS", "").strip().lower() not in {"", "0", "false", "no", "off"}
 SANDBOX_TIMING_LOG_THRESHOLD_S = float(os.getenv("SWERL_SANDBOX_TIMING_LOG_THRESHOLD_S", "1.0"))
 RESET_FAILURE_ZERO_REWARD = os.getenv("SWERL_RESET_FAILURE_ZERO_REWARD", "").strip().lower() not in {
     "",
@@ -147,10 +142,7 @@ def patch_vllm_qwen3_5_lm_head_fp32() -> None:
     # default. This mirrors vLLM's MiniMax fix: do the final projection in fp32
     # to avoid bf16 rounding in logits/logprobs.
     patched_classes = []
-    for module_name in (
-        "vllm.model_executor.models.qwen3_5",
-        "vllm.model_executor.models.qwen3_5_mtp",
-    ):
+    for module_name in ("vllm.model_executor.models.qwen3_5", "vllm.model_executor.models.qwen3_5_mtp"):
         try:
             module = __import__(module_name, fromlist=[""])
         except ImportError:
@@ -534,9 +526,37 @@ def add_request(actor: "LLMRayActor", request: PromptRequest) -> None:
         seed = request.generation_config.seed + j if request.generation_config.seed is not None else None
         sub_sampling_params = dataclasses.replace(sampling_params, seed=seed)
         sub_request_id = f"{request_id}_{j}"
-        actor.active_tasks[sub_request_id] = asyncio.run_coroutine_threadsafe(
+        task = asyncio.run_coroutine_threadsafe(
             process_request(actor, sub_request_id, sub_sampling_params), actor.loop
         )
+        actor.active_tasks[sub_request_id] = task
+        task.add_done_callback(
+            lambda completed, request_id=request_id, is_eval=request.is_eval: _report_request_failure(
+                actor, request_id, is_eval, completed
+            )
+        )
+
+
+def _report_request_failure(actor: "LLMRayActor", request_id: str, is_eval: bool, task: futures.Future) -> None:
+    """Wake the result consumer immediately when a background request fails."""
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is None:
+        return
+    with actor._request_failure_lock:
+        if request_id in actor._reported_request_failures:
+            return
+        actor._reported_request_failures.add(request_id)
+    failure = FatalGenerationError(
+        request_id=request_id,
+        error_type=type(error).__name__,
+        message=str(error),
+        traceback="".join(traceback.format_exception(error)),
+    )
+    logger.error("Fatal background generation failure for %s: %s: %s", request_id, failure.error_type, failure.message)
+    queue = actor.eval_results_queue if is_eval else actor.results_queue
+    queue.put(failure)
 
 
 FALLBACK_CHAT_TEMPLATE = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
@@ -704,6 +724,8 @@ class LLMRayActor:
         self.request_metadata = {}
         self.active_tasks = {}
         self.request_outputs = {}
+        self._reported_request_failures: set[str] = set()
+        self._request_failure_lock = threading.Lock()
         self.reward_config = reward_config
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
@@ -830,16 +852,12 @@ class LLMRayActor:
     def _init_openai_client(self) -> None:
         base_url = f"http://127.0.0.1:{self.server_port}/v1"
         self.client = openai.AsyncOpenAI(
-            base_url=base_url,
-            api_key="EMPTY",
-            timeout=VLLM_OPENAI_TIMEOUT_S,
-            max_retries=VLLM_OPENAI_MAX_RETRIES,
+            base_url=base_url, api_key="EMPTY", timeout=VLLM_OPENAI_TIMEOUT_S, max_retries=VLLM_OPENAI_MAX_RETRIES
         )
         self.model_name = self.llm_engine.vllm_config.model_config.model
 
         logger.info(
-            "Waiting for vLLM OpenAI API server to be ready at %s "
-            "(timeout=%.1fs, max_retries=%d)",
+            "Waiting for vLLM OpenAI API server to be ready at %s (timeout=%.1fs, max_retries=%d)",
             base_url,
             VLLM_OPENAI_TIMEOUT_S,
             VLLM_OPENAI_MAX_RETRIES,
@@ -942,9 +960,7 @@ class LLMRayActor:
             try:
                 future.result()
             except Exception as e:
-                raise RuntimeError(
-                    f"{source} failed with {type(e).__name__}: {e}\n{traceback.format_exc()}"
-                ) from None
+                raise RuntimeError(f"{source} failed with {type(e).__name__}: {e}\n{traceback.format_exc()}") from None
 
         check_future("vLLM prefetch worker", self._prefetch_future)
         check_future("vLLM completion worker", self._process_future)

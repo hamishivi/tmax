@@ -23,6 +23,7 @@ from pathlib import Path
 from queue import Empty
 from typing import Any, Literal, cast
 
+import docker as docker_sdk
 import numpy as np
 import ray
 import torch
@@ -125,8 +126,6 @@ class ImagePrewarmActor:
             return dict(self._stats) | {"seen": len(self._seen), "inflight": len(self._inflight)}
 
     def _pull_image(self, image: str) -> None:
-        import docker as docker_sdk
-
         client = docker_sdk.from_env(timeout=300)
         try:
             client.images.get(image)
@@ -1100,6 +1099,11 @@ def accumulate_inference_batches(
 
         if isinstance(result, data_types.ShutdownSentinel):
             return result, None, None, None
+        if isinstance(result, data_types.FatalGenerationError):
+            raise RuntimeError(
+                f"Fatal generation failure for {result.request_id}: "
+                f"{result.error_type}: {result.message}\n{result.traceback}"
+            )
 
         if (
             max_result_age_steps is not None
@@ -1807,17 +1811,12 @@ class DataPreparationActor:
             #    tool-using rollouts.
             num_before_filter = len(result.finish_reasons)
             response_length_cap = self.config.response_length
-
-            def _is_truncated(i: int) -> bool:
-                return result.finish_reasons[i] != "stop" or len(result.responses[i]) >= response_length_cap
-
-            def _is_non_submitting(i: int) -> bool:
-                states = result.request_info.rollout_states
-                if i >= len(states):
-                    return False
-                return not states[i].get("done", True)
-
-            truncated_idxes = [i for i in range(num_before_filter) if _is_truncated(i)]
+            rollout_states = result.request_info.rollout_states
+            truncated_idxes = [
+                i
+                for i in range(num_before_filter)
+                if result.finish_reasons[i] != "stop" or len(result.responses[i]) >= response_length_cap
+            ]
             num_truncated_completion = len(truncated_idxes)
             truncated_completion_correct_count = (
                 int(sum(1 for i in truncated_idxes if raw_scores[i] > 0)) if num_truncated_completion else 0
@@ -1826,28 +1825,29 @@ class DataPreparationActor:
                 [len(result.responses[i]) for i in truncated_idxes], dtype=np.int64
             )
 
-            non_submitting_idxes = [i for i in range(num_before_filter) if _is_non_submitting(i)]
+            non_submitting_idxes = [
+                i
+                for i in range(min(num_before_filter, len(rollout_states)))
+                if not rollout_states[i].get("done", True)
+            ]
             num_non_submitting_completion = len(non_submitting_idxes)
             num_unmasked_non_submitting_completion = 0
+            non_submitting_idxes_set = set(non_submitting_idxes)
 
             do_mask_filter = self.config.mask_truncated_completions or self.config.mask_non_submitting_completions
             if do_mask_filter:
-                truncated_drop_idxes = {
-                    i for i in range(num_before_filter) if self.config.mask_truncated_completions and _is_truncated(i)
-                }
-                non_submitting_drop_idxes = [
-                    i
-                    for i in range(num_before_filter)
+                truncated_drop_idxes = set(truncated_idxes) if self.config.mask_truncated_completions else set()
+                non_submitting_drop_idxes = (
+                    [i for i in non_submitting_idxes if i not in truncated_drop_idxes]
                     if self.config.mask_non_submitting_completions
-                    and _is_non_submitting(i)
-                    and i not in truncated_drop_idxes
-                ]
+                    else []
+                )
                 unmasked_non_submitting_idxes: set[int] = set()
                 if self.config.mask_non_submitting_completions_percent > 0.0:
                     submitting_keep_count = sum(
                         1
                         for i in range(num_before_filter)
-                        if i not in truncated_drop_idxes and not _is_non_submitting(i)
+                        if i not in truncated_drop_idxes and i not in non_submitting_idxes_set
                     )
                     unmasked_non_submitting_idxes = _sample_non_submitting_unmask_idxes(
                         submitting_count=submitting_keep_count,

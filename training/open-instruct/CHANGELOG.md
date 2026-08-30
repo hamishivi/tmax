@@ -22,6 +22,7 @@ All notable changes to this project will be documented in this file.
 - Add deprecation warning to `finetune.py` pointing users to the OLMo-core SFT implementation (https://github.com/allenai/open-instruct/pull/1574).
 
 ### Fixed
+- Surface fatal background rollout failures through the inference result queue so Sandfleet configuration errors wake data preparation and terminate training with their original message instead of wedging the trainer (https://github.com/hamishivi/tmax/pull/7).
 - Update ZeRO-3 reference policies through matching local shards instead of gathering parameters from two DeepSpeed engines in one collective, preventing hangs with sequence parallelism.
 - Fix `DataPreparationActor` hanging on shutdown by killing the actor with `ray.kill()` during cleanup (https://github.com/allenai/open-instruct/pull/1611).
 - Fix empty optimizer group error with torch 2.10 and DeepSpeed in `finetune.py`, `dpo_tune_cache.py`, and `utils.py`. (https://github.com/allenai/open-instruct/pull/1598)
