@@ -22,6 +22,7 @@ import contextlib
 import io
 import os
 import random
+import re
 import shlex
 import shutil
 import subprocess
@@ -45,6 +46,81 @@ from .tools.utils import coerce_args
 logger = logger_utils.setup_logger(__name__)
 
 VANILLUX_CALL_LIMIT = int(os.getenv("VANILLUX_CALL_LIMIT", "100"))
+
+# --- Local SIF resolution -----------------------------------------------------
+# On clusters where sandbox hosts cannot (or should not) pull container images,
+# a prebuilt pool of SIFs can be provided via SWERL_APPTAINER_SIF_DIR. Docker
+# refs handed to apptainer-family backends are then resolved to local .sif
+# files; when the variable is unset this is a no-op. Two naming schemes are
+# supported: the sanitized full ref, and a fallback keyed on the trailing
+# content-hash token (mirrors rename namespaces/tags but preserve the hash).
+_LOCAL_SIF_HITS: set[str] = set()
+_SIF_HASH_INDEX: dict[str, str] | None = None
+
+
+def _sif_name_for_image(image: str) -> str | None:
+    ref = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", image).strip().strip("/")
+    name = re.sub(r"[^A-Za-z0-9._-]+", "__", ref).strip("._-")
+    return f"{name}.sif" if name else None
+
+
+def _sif_hash_index(sif_dir: str) -> dict[str, str]:
+    global _SIF_HASH_INDEX
+    if _SIF_HASH_INDEX is None:
+        index: dict[str, str] = {}
+        try:
+            for name in sorted(os.listdir(sif_dir)):
+                if not name.endswith(".sif"):
+                    continue
+                token = name[:-4].rsplit("__", 1)[-1].lower()
+                if re.fullmatch(r"[0-9a-f]{6,64}", token):
+                    index.setdefault(token, name)
+        except OSError:
+            pass
+        _SIF_HASH_INDEX = index
+    return _SIF_HASH_INDEX
+
+
+def _image_hash_candidates(image: str) -> list[str]:
+    ref = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", image).strip().strip("/")
+    path, tag = ref, None
+    match = re.match(r"^(.+?):([A-Za-z0-9._-]+)$", ref)
+    if match:
+        path, tag = match.group(1), match.group(2)
+    candidates: list[str] = []
+    for token in (tag, path.rsplit("/", 1)[-1]):
+        if token:
+            token = token.lower()
+            if re.fullmatch(r"[0-9a-f]{6,64}", token) and token not in candidates:
+                candidates.append(token)
+    return candidates
+
+
+def _prefer_local_sif(image: str) -> str:
+    if image.startswith(("/", "./")) or image.endswith(".sif"):
+        return image
+    sif_dir = os.environ.get("SWERL_APPTAINER_SIF_DIR")
+    if not sif_dir:
+        return image
+    sif_name = _sif_name_for_image(image)
+    if sif_name:
+        sif_path = os.path.join(sif_dir, sif_name)
+        if os.path.isfile(sif_path) and os.path.getsize(sif_path) > 0:
+            if image not in _LOCAL_SIF_HITS:
+                logger.info("Using local Apptainer SIF for %s: %s", image, sif_path)
+                _LOCAL_SIF_HITS.add(image)
+            return sif_path
+    for token in _image_hash_candidates(image):
+        hashed_name = _sif_hash_index(sif_dir).get(token)
+        if not hashed_name:
+            continue
+        candidate = os.path.join(sif_dir, hashed_name)
+        if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+            if image not in _LOCAL_SIF_HITS:
+                logger.info("Using local Apptainer SIF (hash match) for %s: %s", image, candidate)
+                _LOCAL_SIF_HITS.add(image)
+            return candidate
+    return image
 
 _BASH_WRAPPER_PATH = "/tmp/.swerl_vanillux_bash_wrapper.sh"
 _BASH_WRAPPER_PATH_QUOTED = shlex.quote(_BASH_WRAPPER_PATH)
@@ -287,6 +363,12 @@ class SWERLVanilluxSandboxEnv(RLEnvironment):
                 "SWERLVanilluxSandboxEnv requires an explicit image per task. "
                 "Set env_config.image or provide image.txt in task data."
             )
+        if self._backend_type in ("apptainer", "sandfleet"):
+            # Both run apptainer on the sandbox host; a plain docker ref forces a
+            # per-lease pull + OCI->SIF conversion there (exit=255 under
+            # restricted egress). Resolve to the prebuilt local pool when
+            # configured.
+            resolved_image = _prefer_local_sif(resolved_image)
         self._backend_kwargs["image"] = resolved_image
         if self._backend_type == "docker" and kwargs.get("docker_host"):
             self._backend_kwargs["docker_host"] = kwargs["docker_host"]
