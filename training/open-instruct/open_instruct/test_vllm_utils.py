@@ -1,5 +1,9 @@
 import logging
+import queue
+import threading
 import unittest
+from concurrent import futures
+from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import MagicMock
 
@@ -7,7 +11,7 @@ import vllm
 from parameterized import parameterized
 
 from open_instruct import vllm_utils
-from open_instruct.data_types import PromptRequest
+from open_instruct.data_types import FatalGenerationError, PromptRequest
 from open_instruct.utils import ModelDims
 
 
@@ -31,6 +35,31 @@ class TestTruncateEnvOutputTokens(unittest.TestCase):
         )
         self.assertEqual(result, expected_tokens)
         self.assertEqual(excess, expected_excess)
+
+
+class TestFatalGenerationErrors(unittest.TestCase):
+    def test_background_failure_is_reported_once(self):
+        result_queue = queue.Queue()
+        actor = SimpleNamespace(
+            _request_failure_lock=threading.Lock(),
+            _reported_request_failures=set(),
+            results_queue=result_queue,
+            eval_results_queue=queue.Queue(),
+        )
+        first = futures.Future()
+        first.set_exception(ValueError("declarative resources are disabled"))
+        duplicate = futures.Future()
+        duplicate.set_exception(ValueError("same request"))
+
+        vllm_utils._report_request_failure(actor, "train_1", False, first)
+        vllm_utils._report_request_failure(actor, "train_1", False, duplicate)
+
+        failure = result_queue.get_nowait()
+        self.assertIsInstance(failure, FatalGenerationError)
+        self.assertEqual(failure.request_id, "train_1")
+        self.assertEqual(failure.error_type, "ValueError")
+        self.assertIn("declarative resources are disabled", failure.message)
+        self.assertTrue(result_queue.empty())
 
 
 class TestVllmUtils3(unittest.TestCase):

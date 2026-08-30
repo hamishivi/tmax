@@ -18,7 +18,14 @@ from transformers import AutoTokenizer
 
 from open_instruct import data_loader as data_loader_lib
 from open_instruct import rl_utils, utils
-from open_instruct.data_types import EnvConfig, GenerationResult, PromptRequest, RequestInfo, TokenStatistics
+from open_instruct.data_types import (
+    EnvConfig,
+    FatalGenerationError,
+    GenerationResult,
+    PromptRequest,
+    RequestInfo,
+    TokenStatistics,
+)
 from open_instruct.dataset_transformation import (
     GROUND_TRUTHS_KEY,
     INPUT_IDS_PROMPT_KEY,
@@ -997,6 +1004,30 @@ class TestStreamingAccumulation(TestGrpoFastBase):
 
 class TestAccumulateInferenceBatches(TestGrpoFastBase):
     """Test accumulate_inference_batches function."""
+
+    def test_fatal_generation_error_wakes_batch_consumer(self):
+        inference_results_Q = ray_queue.Queue(maxsize=1)
+        self._ray_queues.append(inference_results_Q)
+        inference_results_Q.put(
+            FatalGenerationError(
+                request_id="train_1",
+                error_type="ValueError",
+                message="Declarative resource requests are disabled; start the controller with --enable-dynamic-resources",
+                traceback="remote traceback",
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "--enable-dynamic-resources"):
+            data_loader_lib.accumulate_inference_batches(
+                inference_results_Q,
+                Mock(n=1),
+                num_prompts=1,
+                model_dims=Mock(),
+                tokenizer=Mock(),
+                dataset=Mock(),
+                base_env_config=EnvConfig(),
+                timeout=1,
+            )
 
     def test_all_prompts_filtered_returns_none(self):
         """Test that accumulate_inference_batches returns None when all prompts are filtered."""

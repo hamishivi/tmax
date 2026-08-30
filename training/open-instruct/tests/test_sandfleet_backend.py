@@ -170,6 +170,27 @@ def _transient_error() -> HTTPError:
     return HTTPError("http://controller", 503, "Service Unavailable", {}, body)
 
 
+def test_configuration_rejection_preserves_controller_guidance(monkeypatch):
+    body = io.BytesIO(
+        b'{"error":{"type":"ValueError","message":"Declarative resource requests are disabled; '
+        b'start the controller with --enable-dynamic-resources"}}'
+    )
+
+    def reject(*_args, **_kwargs):
+        raise HTTPError("http://controller", 400, "Bad Request", {}, body)
+
+    monkeypatch.setattr("open_instruct.environments.sandfleet_backend.urlopen", reject)
+
+    with pytest.raises(ValueError, match="--enable-dynamic-resources"):
+        SandfleetBackend()._request(
+            "http://controller",
+            "/v1/lease-requests",
+            token="client-token",
+            method="POST",
+            payload={"resources": {"cpus": 2, "memory_mb": 4096}},
+        )
+
+
 def test_replay_safe_requests_retry_with_backoff(monkeypatch):
     outcomes = iter([_transient_error(), _transient_error(), io.BytesIO(b'{"ok":true}')])
     calls = []
