@@ -877,7 +877,12 @@ class LLMRayActor:
     def _init_openai_client(self) -> None:
         base_url = f"http://127.0.0.1:{self.server_port}/v1"
         self.client = openai.AsyncOpenAI(
-            base_url=base_url, api_key="EMPTY", timeout=VLLM_OPENAI_TIMEOUT_S, max_retries=VLLM_OPENAI_MAX_RETRIES
+            base_url=base_url,
+            api_key="EMPTY",
+            timeout=VLLM_OPENAI_TIMEOUT_S,
+            max_retries=VLLM_OPENAI_MAX_RETRIES,
+            # This server is always local to the actor, regardless of proxy settings.
+            http_client=openai.DefaultAsyncHttpxClient(trust_env=False),
         )
         self.model_name = self.llm_engine.vllm_config.model_config.model
 
