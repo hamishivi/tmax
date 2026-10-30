@@ -139,27 +139,36 @@ Feel free to swap out daytona for your sandboxing backend of choice.
 
 ## Task data on Harbor
 
-We also ship the full **15k** task corpus in [Harbor](https://www.harborframework.com/docs/datasets)
-format so you can run it out of the box. It's published on the Harbor registry as
-**[`tmax/TMax-15K-Harbor`](https://hub.harborframework.com/datasets/tmax/TMax-15K-Harbor/latest)**
-(public): the legacy 10k self-contained tasks plus 5k newer *intricate*
-multi-modal tasks. Every task ships as a self-contained Harbor environment with
-a programmatic verifier, so you can evaluate any agent/model on it directly — no
-need to regenerate or build anything from `rl_data/`.
+The **TMax v1.1 13K corpus (13,565 tasks)** is available in
+[Harbor](https://docs.harborframework.com/datasets/datasets) format on Hugging Face:
+**[`TMaxxx/tmax-13-v1.1-harbor`](https://huggingface.co/datasets/TMaxxx/tmax-13-v1.1-harbor)**.
+It packages the hardened and prefiltered [v1.1 training dataset](https://huggingface.co/datasets/TMaxxx/tmax-13-v1.1/tree/8d47de78dc85ae7f8cf4853b6777a0917e49fad9),
+preserving the released instructions, verifiers, supporting assets, and public
+Linux/AMD64 environment images. Download the pinned release and use its extractor
+to preserve executable permissions:
 
 ```bash
-# evaluate an agent on a 10-task subset using the Daytona cloud sandbox
-# (no local Docker required — swap `--env daytona` for `--env docker` to build locally)
-export DAYTONA_API_KEY='xxx'
-uv run harbor run -d "tmax/TMax-15K-Harbor@latest" \
+uvx --from huggingface_hub hf download TMaxxx/tmax-13-v1.1-harbor \
+    tasks.zip extract_tasks.py dataset_release.json --repo-type dataset \
+    --revision 40d3c355374af7e3361f614950da52fd5fe63bb0 \
+    --local-dir tmax-13-v1.1-harbor
+python3 tmax-13-v1.1-harbor/extract_tasks.py
+
+# evaluate an agent on a 10-task subset using local Docker
+uvx --from harbor==0.25.0 harbor run --path tmax-13-v1.1-harbor/tasks \
     --agent terminus-2 --model "<model>" \
-    --env daytona -l 10
+    --env docker -l 10
 ```
 
 Drop `-l` to run the full set, or use `-i`/`-x` to include/exclude tasks by name.
+For the Daytona cloud sandbox, set `DAYTONA_API_KEY` and use `--env daytona`.
 Per-task rewards and agent/verifier logs land under `jobs/<job-name>/`. See
 [`rl_data/README.md`](rl_data/README.md#evaluating-on-the-published-harbor-dataset)
 for the full set of run options.
+
+The v1.1 download above is a Harbor-format task bundle. The original 14,601-task
+release remains available on Harbor Hub as
+[`tmax/TMax-15K-Harbor@2`](https://hub.harborframework.com/datasets/tmax/TMax-15K-Harbor/2).
 
 ## Requirements
 
@@ -169,7 +178,7 @@ for the full set of run options.
 - (for data generation) **`apptainer`** on PATH for building and running task containers.
 - (for training) A configured **Docker/Podman**, **Apptainer**, or **Sandfleet** backend. Docker Hub credentials may be needed for authenticated or high-volume image pulls; Apptainer and Sandfleet can use prepared SIF images. See the [training recipes](training/open-instruct/scripts/tmax/README.md) for setup.
 - **`HF_TOKEN`** for the Hugging Face upload stage and for pulling gated models.
-- (to evaluate on the published `tmax/TMax-15K-Harbor` dataset) a model API key
+- (to evaluate the Harbor-format task data) a model API key
   for your chosen agent plus a container runtime — Docker locally, or
   `DAYTONA_API_KEY` for the Daytona sandbox on Docker-less hosts.
 
