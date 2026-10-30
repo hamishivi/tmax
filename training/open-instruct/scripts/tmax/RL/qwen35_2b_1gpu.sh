@@ -68,6 +68,7 @@ uv run python open_instruct/grpo_fast.py \
     --push_to_hub false \
     --with_tracking \
     --save_traces \
+    --rollouts_save_path "${ROLLOUTS_SAVE_PATH:-$OUTPUT_DIR/rollouts}" \
     --save_trainer_logprobs false \
     --tools swerl_vanillux_sandbox \
     --tool_configs "$TOOL_CONFIGS" \

@@ -56,7 +56,7 @@ Each recipe passes `--no_auto_dataset_cache` before `--` so submission does not
 import vLLM locally. Dataset preparation happens on the training nodes.
 `OUTPUT_DIR` defaults to `/output` for full recipes; checkpoints and traces should
 be placed on storage retained by your launcher. Set `ROLLOUTS_SAVE_PATH` to override
-the default `$OUTPUT_DIR/rollouts` in full RL recipes. Reference-policy state is
+the default `$OUTPUT_DIR/rollouts` in any RL recipe. Reference-policy state is
 saved alongside trainer checkpoints under `$OUTPUT_DIR/checkpoint_state`.
 
 ## RL data and execution
