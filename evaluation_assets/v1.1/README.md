@@ -14,6 +14,24 @@ The teaser's 2B and 27B Terminal-Bench 2.0 scores come from separate evaluations
 
 These runs use Vanillux 0.2.3: Sandfleet for TB-Lite and Terminal-Bench 2.1, and Daytona for Terminal-Bench 2.0. TB-Lite has 96 tasks, Terminal-Bench 2.1 has 88 tasks (`configure-git-webserver` excluded), and Terminal-Bench 2.0 has 89 tasks. Terminal-Bench 2.0 agent-timeout attempts were retired and rerun at concurrency four.
 
+## Task coverage and exclusions
+
+The following exclusions apply consistently to all five released models within each benchmark:
+
+| Benchmark | Excluded task | Reason |
+|---|---|---|
+| TB-Lite | `acl-permissions-inheritance` | Deferred before evaluation and absent from the prepared source snapshot. |
+| TB-Lite | `etl_checkpoint_resume_bug` | PostgreSQL could not start as its service account in the sandbox, including when running the reference solution; no verifier reward was produced. |
+| TB-Lite | `sales-data-csv-analysis` | The image's working directory was inaccessible under the sandbox's user mapping, so startup failed before agent execution. |
+| TB-Lite | `mlflow-register` | The background MLflow server encountered IPC failures and artifact-upload hangs under the sandbox's fakeroot runtime. |
+| Terminal-Bench 2.1 | `configure-git-webserver` | OpenSSH could not perform the irreversible privilege drop required by its privilege-separation checks in this sandbox; the reference solution also failed. |
+
+**Terminal-Bench 2.0 includes all 89 tasks**, including `configure-git-webserver`, using the Daytona backend. That task's exclusion applies only to the Terminal-Bench 2.1 runs above.
+
+Scores and standard errors use the retained task sets: **96 TB-Lite tasks, 88 Terminal-Bench 2.1 tasks, and 89 Terminal-Bench 2.0 tasks**, with three trials per task. Excluded tasks are omitted from the score denominator.
+
+## Archive contents
+
 Each `tmax-{size}b/` directory contains `tb-lite/`, `terminal-bench-2.1/`, and `terminal-bench-2.0/`. A benchmark directory has a `summary.json` and one directory per accepted trial:
 
 - `agent/trajectory.json`: conversation messages and tool calls.
