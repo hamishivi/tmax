@@ -9,7 +9,7 @@ set -eo pipefail
 BEAKER_IMAGE="${1:?Usage: $0 <beaker-image>}"
 ASYNC_STEPS="${ASYNC_STEPS:-4}"
 VLLM_SEED_PER_TURN="${VLLM_SEED_PER_TURN:-true}"
-DATASET="${DATASET:-TMaxxx/tmax-13-v1.1}"
+DATASET="${DATASET:-TMaxxx/tmax-13k-v1.1}"
 SANDBOX_BACKEND="${SANDBOX_BACKEND:-docker}"
 OUTPUT_DIR="${OUTPUT_DIR:-/output}"
 # TOOL_CONFIGS can override the complete environment config, including local task data.

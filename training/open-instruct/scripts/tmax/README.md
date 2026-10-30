@@ -62,7 +62,7 @@ saved alongside trainer checkpoints under `$OUTPUT_DIR/checkpoint_state`.
 
 | Variable | Behavior |
 | --- | --- |
-| `DATASET` | Dataset mixer and task-data repository; defaults to `TMaxxx/tmax-13-v1.1` |
+| `DATASET` | Dataset mixer and task-data repository; defaults to `TMaxxx/tmax-13k-v1.1` |
 | `ASYNC_STEPS` | Zero selects synchronous collection; positive values enable prefetching |
 | `VLLM_SEED_PER_TURN` | Defaults to `true`, using distinct deterministic seeds for generation turns |
 | `SANDBOX_BACKEND` | Defaults to `docker`; also supports `apptainer` and `sandfleet` |

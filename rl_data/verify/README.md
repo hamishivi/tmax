@@ -14,7 +14,7 @@ changes reproduce historical verdicts automatically.
 
 ## Use the released tasks
 
-For training, use [TMaxxx/tmax-13-v1.1](https://huggingface.co/datasets/TMaxxx/tmax-13-v1.1).
+For training, use [TMaxxx/tmax-13k-v1.1](https://huggingface.co/datasets/TMaxxx/tmax-13k-v1.1).
 Its [metadata companion](https://huggingface.co/datasets/TMaxxx/tmax-13-v1.1-metadata)
 contains audit columns and `image-recipe/`. Use those published recipes or the
 released Docker images to recover the historical repaired environments. Do not

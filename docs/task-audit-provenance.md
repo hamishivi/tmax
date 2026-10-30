@@ -83,7 +83,7 @@ Its metadata has 7,015 `validated`, 6,520 `not_validated`, 26 `not_evaluable`, a
 4 `budget_limited` tasks. The 7,015 demonstrated passing tasks are a separate
 subset under the historical solver and nominal two-attempt, 600-second, 40-step
 budget. Neither infrastructure failure nor failure to solve proves unsolvability.
-See the public [training dataset](https://huggingface.co/datasets/TMaxxx/tmax-13-v1.1/tree/84c6b85842e6ea108db97647ebbe48f9f1c8e7be)
+See the public [training dataset](https://huggingface.co/datasets/TMaxxx/tmax-13k-v1.1/tree/84c6b85842e6ea108db97647ebbe48f9f1c8e7be)
 and [metadata companion](https://huggingface.co/datasets/TMaxxx/tmax-13-v1.1-metadata/tree/62fdc43e34e8c8e9895aa3126ec02e1c1233591c).
 
 The public conversion retains **11,852 original Docker references** and publishes
@@ -97,7 +97,7 @@ The source metadata/image-pool revisions are
 `0c4e432c59f9fb7daa7c58dcc43bf31a75230cc8` respectively.
 
 The original conversion files are independently downloadable at the pinned
-[conversion directory](https://huggingface.co/datasets/TMaxxx/tmax-13-v1.1/tree/84c6b85842e6ea108db97647ebbe48f9f1c8e7be/conversion).
+[conversion directory](https://huggingface.co/datasets/TMaxxx/tmax-13k-v1.1/tree/84c6b85842e6ea108db97647ebbe48f9f1c8e7be/conversion).
 Their SHA256s match the untracked local `scripts/data/` files at import. They
 converted already repaired artifacts for publication; they did not produce the
 paper's judge labels or repair proposals.
