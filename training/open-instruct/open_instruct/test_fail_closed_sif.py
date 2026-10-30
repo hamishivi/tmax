@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from open_instruct.environments import apptainer_images as ai
 
-IMAGE = "hamishi740/swerl-tmax-v3:deadbeefcafe"
+IMAGE = "example/task:deadbeefcafe"
 
 
 def _pool(tmp: str, *names: str) -> str:

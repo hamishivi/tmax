@@ -68,9 +68,7 @@ def _started_backend(fake: _FakeApptainer, **kwargs) -> ApptainerBackend:
 class TestImageNormalization(unittest.TestCase):
     def test_plain_tag_gets_docker_prefix(self):
         self.assertEqual(_normalize_apptainer_image("ubuntu:22.04"), "docker://ubuntu:22.04")
-        self.assertEqual(
-            _normalize_apptainer_image("hamishi740/swerl-tmax-v3:abc123"), "docker://hamishi740/swerl-tmax-v3:abc123"
-        )
+        self.assertEqual(_normalize_apptainer_image("example/task:abc123"), "docker://example/task:abc123")
 
     def test_uri_passes_through(self):
         self.assertEqual(_normalize_apptainer_image("docker://foo:bar"), "docker://foo:bar")

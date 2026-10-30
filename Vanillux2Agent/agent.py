@@ -34,8 +34,6 @@ from rl_data.generator.vanillux_solver import (
     _truncate_observation,
 )
 
-from Vanillux2Agent.daytona_capture import execute_daytona_command
-
 os.environ.setdefault("OPENAI_API_KEY", "dummy")
 
 logger = logging.getLogger(__name__)
@@ -282,9 +280,6 @@ class Vanillux2Agent(BaseAgent):
         )
 
     async def _execute_bash(self, command: str, environment: BaseEnvironment) -> _CommandResult:
-        if getattr(getattr(environment, "type", lambda: None)(), "value", None) == "daytona":
-            captured = await execute_daytona_command(environment, self._wrap_command(command), self.command_timeout)
-            return _CommandResult(*captured)
         if getattr(environment, "preserves_command_timeout", False):
             result = await environment.exec(command=self._wrap_command(command), timeout_sec=self.command_timeout)
             timed_out = getattr(result, "timed_out", None)

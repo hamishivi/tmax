@@ -3,22 +3,33 @@
 # this is the 'big' SFT
 # We use a version of Qwen 3.5 with an interleaved reasoning chat template
 
-BEAKER_IMAGE="${1:-nathanl/open_instruct_auto}"
+set -eo pipefail
 
-echo "Using Beaker image: $BEAKER_IMAGE"
-
-DATASET=allenai/tmax-sft-big
+BEAKER_IMAGE="${1:?Usage: $0 <beaker-image>}"
+DATASET="${DATASET:-allenai/tmax-sft-big}"
+MASON_ARGS=(--cluster "${BEAKER_CLUSTER:?Set BEAKER_CLUSTER}")
+if [ -n "${BEAKER_WORKSPACE:-}" ]; then
+    MASON_ARGS+=(--workspace "$BEAKER_WORKSPACE")
+fi
+if [ -n "${BEAKER_BUDGET:-}" ]; then
+    MASON_ARGS+=(--budget "$BEAKER_BUDGET")
+fi
+DATA_ARGS=(--dataset_mixer_list "$DATASET" 1.0)
+if [ -n "${PRETOKENIZED_JSONL:-}" ]; then
+    # This path must be visible on every training node.
+    DATA_ARGS=(--pretokenized_jsonl "$PRETOKENIZED_JSONL")
+fi
 
 uv run python mason.py \
-    --cluster ai2/jupiter \
-    --workspace ai2/open-instruct-dev \
+    "${MASON_ARGS[@]}" \
     --priority urgent \
     --image "$BEAKER_IMAGE" \
     --pure_docker_mode \
     --preemptible \
     --num_nodes 4 \
-    --budget ai2/oe-adapt \
     --gpus 8 \
+    --no_auto_dataset_cache \
+    --auto_output_dir_path "" \
     -- \
     accelerate launch \
     --mixed_precision bf16 \
@@ -30,7 +41,6 @@ uv run python mason.py \
     --exp_name sft_qwen35_9b_big \
     --model_name_or_path hamishivi/Qwen3.5-9B \
     --tokenizer_name hamishivi/Qwen3.5-9B \
-    --use_flash_attn \
     --max_seq_length 32768 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 4 \
@@ -39,9 +49,10 @@ uv run python mason.py \
     --warmup_ratio 0.03 \
     --weight_decay 0.0 \
     --num_train_epochs 2 \
-    --dataset_mixer_list $DATASET 1.0 \
+    "${DATA_ARGS[@]}" \
     --gradient_checkpointing \
     --report_to wandb \
     --with_tracking \
     --logging_steps 1 \
+    --output_dir "${OUTPUT_DIR:-/output}" \
     --seed 42

@@ -82,13 +82,12 @@ Launch scripts for the tmax models live under `training/open-instruct/scripts/tm
 (`SFT/` and `RL/`):
 
 ```bash
-# from training/open-instruct/, e.g. RL on Qwen3.5-4B
+# from training/open-instruct/, with BEAKER_CLUSTER configured, e.g. Qwen3.5-4B
 bash scripts/tmax/RL/qwen35_4b.sh <beaker-image>
 ```
 
 See [`training/open-instruct/scripts/tmax/README.md`](training/open-instruct/scripts/tmax/README.md)
-for how to read the scripts (`mason.py` launcher vs. the underlying training command)
-and how to run them off-cluster.
+for runtime configuration, Sandfleet execution, dataset overrides, and pretokenized SFT input.
 
 ### Evaluate a model
 
@@ -126,7 +125,6 @@ uv run harbor run \
   --agent-import-path Vanillux2Agent:Vanillux2Agent \
   --model openai/tmax-9b \
   --agent-kwarg api_base=http://localhost:8008/v1 \
-  --agent-kwarg max_format_errors=64 \
   --n-concurrent 16 \
   -k 5 \
   --job-name swerl-qwen32-2b-tmax-step100-vanillux2-daytona-tblite
@@ -189,9 +187,3 @@ If you use this codebase or models in your research, please cite our paper:
       url={https://arxiv.org/abs/2606.23321}, 
 }
 ```
-
-## Training and evaluation implementation
-
-See [training and sandbox behavior](docs/training-fixes.md) and
-[offline evaluation dependency repairs](eval-repairs/README.md) for the portable
-training implementation and evaluation preparation tools.
