@@ -28,7 +28,7 @@ The conversion scripts are **specific to the released 13,565-task corpus**:
 1. Prepare a local snapshot of the source metadata revision
    `6f62db2f3ed0b1ebf386de2009a3d649d13e5616`, containing `tasks.jsonl`,
    `prefilter.jsonl`, `task-data.tar.gz`, and `image-recipe/`. The canonical public
-   repository is now `TMaxxx/tmax-13-v1.1-metadata`.
+   repository is now `TMaxxx/tmax-13k-v1.1-metadata`.
 2. Provide the original Open Instruct Parquet reference, recipe root (the directory
    containing `image-recipe/`), and an exported original Docker repository tag list
    as `{"tags": [...]}`. The script checks 13,565 unique tasks, 1,713 derived
