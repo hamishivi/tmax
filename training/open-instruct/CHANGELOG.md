@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 
 ### Changed
+- Default TMax RL recipes to the repaired v1.1 dataset and per-turn seeding, and remove the Qwen3-8B RL recipe (https://github.com/hamishivi/tmax/pull/14).
 - Release capped DPPO, distributed padding and reference checkpoints, explicit reward validity, reliable rollouts, Sandfleet execution, independent grading deadlines, aligned prompts, pretokenized SFT input, and updated portable reproduction recipes (https://github.com/hamishivi/tmax/pull/11).
 - Fix GRPO policy gradient scaling with ZeRO-3 sequence parallelism and tiled loss normalization for uneven or empty response shards (https://github.com/hamishivi/tmax/pull/9).
 - Fix Qwen3.5 packing logprob mismatch: call `patch_qwen3_5_packing()` inside `PolicyTrainerRayProcess.from_pretrained()` so the GatedDeltaNet sequence-isolation patch is applied in the Ray worker process, not only in the main process. Without this, packed rows leaked state between sub-sequences, causing `vllm_vs_local_logprob_diff_mean` ~0.21 instead of the expected ~0.02.
