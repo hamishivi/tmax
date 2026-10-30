@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# DPPO training on Qwen3.6 27B with tmax-15k data
+# DPPO training on Qwen3.6 27B with TMax-13K v1.1 data
 # we used the same script for other datasets,
 # but with the dataset mixer list changed ofc :)
 
@@ -8,8 +8,8 @@ set -eo pipefail
 
 BEAKER_IMAGE="${1:?Usage: $0 <beaker-image>}"
 ASYNC_STEPS="${ASYNC_STEPS:-4}"
-VLLM_SEED_PER_TURN="${VLLM_SEED_PER_TURN:-false}"
-DATASET="${DATASET:-allenai/tmax-15k-open-instruct}"
+VLLM_SEED_PER_TURN="${VLLM_SEED_PER_TURN:-true}"
+DATASET="${DATASET:-TMaxxx/tmax-13-v1.1}"
 SANDBOX_BACKEND="${SANDBOX_BACKEND:-docker}"
 OUTPUT_DIR="${OUTPUT_DIR:-/output}"
 # TOOL_CONFIGS can override the complete environment config, including local task data.
@@ -56,7 +56,7 @@ fi
 uv run python mason.py \
        "${MASON_ARGS[@]}" \
        --image "$BEAKER_IMAGE" \
-       --description "tmax-15k DPPO Qwen36 27b" \
+       --description "tmax-13k v1.1 DPPO Qwen36 27b" \
        --pure_docker_mode \
        --priority urgent \
        --preemptible \

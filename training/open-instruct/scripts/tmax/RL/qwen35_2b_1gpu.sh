@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# DPPO training on Qwen3.5 2B with tmax-15k data.
+# DPPO training on Qwen3.5 2B with TMax-13K v1.1 data.
 # this script is intended for debugging, not for actual training.
 
 set -eo pipefail
 
 ASYNC_STEPS="${ASYNC_STEPS:-0}"
-VLLM_SEED_PER_TURN="${VLLM_SEED_PER_TURN:-false}"
-DATASET="${DATASET:-allenai/tmax-15k-open-instruct}"
+VLLM_SEED_PER_TURN="${VLLM_SEED_PER_TURN:-true}"
+DATASET="${DATASET:-TMaxxx/tmax-13-v1.1}"
 SANDBOX_BACKEND="${SANDBOX_BACKEND:-docker}"
 OUTPUT_DIR="${OUTPUT_DIR:-output/qwen35_2b_dppo_1gpu}"
 # TOOL_CONFIGS can override the complete environment config, including local task data.

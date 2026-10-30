@@ -25,14 +25,13 @@ asynchronous collection (`ASYNC_STEPS=4`). All RL recipes explicitly set
 | `RL/qwen35_4b.sh` | Qwen3.5-4B |
 | `RL/qwen35_9b.sh` | Qwen3.5-9B |
 | `RL/qwen36_27b.sh` | Qwen3.6-27B |
-| `RL/qwen3_8b.sh` | Qwen3-8B with the SFT warm start |
 | `SFT/sft_qwen3_8b_small.sh` | Qwen3-8B on Tmax SFT data |
 | `SFT/sft_qwen3_8b_big.sh` | Qwen3-8B on the full SFT mixture |
 | `SFT/sft_qwen35_9b_small.sh` | Qwen3.5-9B on Tmax SFT data |
 | `SFT/sft_qwen35_9b_big.sh` | Qwen3.5-9B on the full SFT mixture |
 
 The full recipes keep their existing GPU layouts: the 2B/4B RL recipes request
-four nodes, the 9B/27B/8B RL recipes eight, and SFT four, each with eight GPUs.
+four nodes, the 9B/27B RL recipes eight, and SFT four, each with eight GPUs.
 The 27B recipe also uses `--gather_whole_model false --deepspeed_zpg 1`.
 
 ## Launching full recipes
@@ -63,15 +62,15 @@ saved alongside trainer checkpoints under `$OUTPUT_DIR/checkpoint_state`.
 
 | Variable | Behavior |
 | --- | --- |
-| `DATASET` | Dataset mixer and task-data repository; defaults to `allenai/tmax-15k-open-instruct` |
+| `DATASET` | Dataset mixer and task-data repository; defaults to `TMaxxx/tmax-13-v1.1` |
 | `ASYNC_STEPS` | Zero selects synchronous collection; positive values enable prefetching |
-| `VLLM_SEED_PER_TURN` | Defaults to `false`; set `true` to use distinct deterministic seeds for generation turns |
+| `VLLM_SEED_PER_TURN` | Defaults to `true`, using distinct deterministic seeds for generation turns |
 | `SANDBOX_BACKEND` | Defaults to `docker`; also supports `apptainer` and `sandfleet` |
 | `TOOL_CONFIGS` | Optional complete JSON override for the sandbox configuration |
 
-Select the dataset and generation-seed setting recorded for the run you want to
-reproduce. The v1.1 size/SFT-warm-start runs used per-turn seeding. Changing only
-the model or dataset does not reproduce all historical run settings.
+The defaults use the repaired 13,565-task TMax v1.1 dataset and per-turn seeding
+used by the v1.1 size runs. Override `DATASET` and `VLLM_SEED_PER_TURN` to match
+other historical runs; changing only the model does not reproduce all run settings.
 
 By default, the generated tool config follows `DATASET`, sets ordinary command
 timeout to 120 seconds and verifier timeout to 600 seconds, and uses `/` as the
