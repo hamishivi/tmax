@@ -17,7 +17,7 @@ The 2B and 27B releases were subsequently corrected to ship the exact templates 
 | [2B](https://huggingface.co/TMaxxx/tmax-2b-v1.1) | 400 | 18.20 ± 1.38 | 5.30 ± 1.00 | 9.36 ± 1.06 |
 | [27B](https://huggingface.co/TMaxxx/tmax-27b-v1.1) | 200 | 77.35 ± 1.78 | 43.94 ± 1.56 | 44.94 ± 1.76 |
 
-Values are percentages ± standard error in percentage points. These are the existing preserved-thinking evaluation results used in the paper; this correction does not introduce new model rollouts. The original conversations below remain available as historical evidence of the earlier configuration, including 27B step 400. The [correction data and templates](../../scripts/release/preserved_thinking_scores.json) pin the intended sweep and exact template hashes. Each affected Hugging Face branch includes `preserved_thinking.json` with its source checkpoint revision and weight fingerprint.
+Values are percentages ± standard error in percentage points. These are the existing preserved-thinking evaluation results used in the paper; this correction does not introduce new model rollouts. The original conversations below remain available as historical evidence of the earlier configuration, including 27B step 400. The [evaluated templates](../../scripts/release/thinking_templates/) are included in this repository. Each affected Hugging Face branch includes `release_manifest.json` with its evaluation results and `preserved_thinking.json` with its template hash, source checkpoint revision, and weight fingerprint.
 
 These runs use Vanillux 0.2.3 with the Daytona backend. Agent-timeout attempts were retired and rerun at concurrency four; only accepted scoring trials are included.
 
