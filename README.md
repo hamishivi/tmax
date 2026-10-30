@@ -177,7 +177,7 @@ for the full set of run options.
 
 - **V1.1:**
   - Models and data: [TMax v1.1 collection](https://huggingface.co/collections/TMaxxx/tmax-v11).
-  - Evaluation rollouts: [`evaluation_assets/v1.1/`](evaluation_assets/v1.1/) (coming later).
+  - Evaluation rollouts: [`evaluation_assets/v1.1/`](evaluation_assets/v1.1/) (2B, 4B, 8B, 9B, and 27B on TB-Lite and Terminal-Bench 2.0/2.1).
 - **V1.0:**
   - Models and data: [Ai2 TMax collection](https://huggingface.co/collections/allenai/tmax).
   - Evaluation rollouts: [`evaluation_assets/v1.0/`](evaluation_assets/v1.0/).
