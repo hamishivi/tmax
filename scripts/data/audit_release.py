@@ -17,7 +17,7 @@ import urllib.request
 import pyarrow.parquet as pq
 
 TRAINING = ('TMaxxx/tmax-13k-v1.1', '84c6b85842e6ea108db97647ebbe48f9f1c8e7be')
-METADATA = ('TMaxxx/tmax-13-v1.1-metadata', '62fdc43e34e8c8e9895aa3126ec02e1c1233591c')
+METADATA = ('TMaxxx/tmax-13k-v1.1-metadata', '62fdc43e34e8c8e9895aa3126ec02e1c1233591c')
 ORIGINAL = ('allenai/TMax-15K', 'e3ded940596cc611c9815684ba51a7e8ee0cffc9')
 REFERENCE = ('allenai/tmax-15k-open-instruct', '7b090eca98bf351356bc1c64290c5c4a09f2f98c')
 ARCHIVE_SHA256 = 'a654638ec448403823273b6510eeb457ae6d9914c7bf4f87ce5302d1fb0c7146'
