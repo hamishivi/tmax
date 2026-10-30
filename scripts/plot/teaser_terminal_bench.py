@@ -21,6 +21,9 @@ Run::
 
     uv run python scripts/plot/teaser_terminal_bench.py
 
+The default CSV and display configuration match the TMax v1.1 teaser. Scores
+are percentages; missing standard deviations are unknown, not zero.
+
 Styling mirrors ``rl_data/comparison/styles.py`` (DejaVu Serif, no top/right
 spines, light-grey axes, Anthropic-warm palette) so the teaser reads as part of
 the same figure family as the rest of the paper.
@@ -175,6 +178,10 @@ RECIPE: Dict[str, str] = {
     "TermiGen-Qwen2.5-32B":  "sft",
     "LiberCoder-32B":        "sft",
     "LiberCoder-235B-A22B":  "sft",
+    "OpenThinker-Agent-32B": "sft",
+    "CalibForge-30B":        "sft",
+    "CalibForge-35B":        "sft",
+    "Lego-32B":             "sft",
     # RL open recipes
     "Endless-Terminals-8B":  "rl",
     "OpenThinker-Agent-V1":  "rl",
@@ -182,6 +189,9 @@ RECIPE: Dict[str, str] = {
     "TMax-9B":               "rl",
     "TMax-4B":               "rl",
     "TMax-2B":               "rl",
+    "OpenThinker-Agent-RL-8B": "rl",
+    "SETA-V4-Flash":          "rl",
+    "RST-122B":              "rl",
 }
 RECIPE_COLORS: Dict[str, str] = {
     "sft": "#4E6E94",   # denim
@@ -231,25 +241,25 @@ MODEL_STYLE: Dict[str, dict] = {
     "TMax-4B": dict(logo=OURS_LOGO, logo_scale=1.1, label="TMax-4B",
                     dx=29, dy=2, ha="left", va="center"),
     "TMax-2B": dict(logo=OURS_LOGO, logo_scale=0.92, label="TMax-2B",
-                    x_offset=0.0, dx=21, dy=13, ha="left", va="bottom"),
+                    x_offset=0.0, dx=26, dy=3, ha="left", va="center"),
     # ---- our base models (Qwen) -------------------------------------------
     "Qwen3.5-2B": dict(logo=QWEN_LOGO, logo_scale=0.68, label="Qwen3.5-2B",
-                       x_offset=0.0, dx=16, dy=-2, ha="left", va="center"),
+                       x_offset=0.0, dx=17, dy=2, ha="left", va="center"),
     "Qwen3.5-4B": dict(logo=QWEN_LOGO, logo_scale=0.85, label="Qwen3.5-4B",
-                       dx=0, dy=-16, ha="center", va="top"),
+                       dx=18, dy=1, ha="left", va="center"),
     "Qwen3-8B": dict(logo=QWEN_LOGO, logo_scale=0.90, label="Qwen3-8B",
-                     dx=15, dy=1, ha="left", va="center"),
+                     dx=16, dy=6, ha="left", va="center"),
     "Qwen3.5-9B": dict(logo=QWEN_LOGO, label="Qwen3.5-9B",
-                       dx=0, dy=-22, ha="center", va="top"),
+                       dx=-13, dy=0, ha="right", va="center"),
     "Qwen3.6-27B": dict(logo=QWEN_LOGO, logo_scale=0.82, label="Qwen3.6-27B",
-                        x_offset=0.0, dx=-16, dy=-6, ha="right", va="top"),
+                        x_offset=0.0, dx=30, dy=-20, ha="left", va="top", leader=True),
     # ---- prior terminal agents --------------------------------------------
-    "Nemotron-Terminal-8B": dict(logo=NVIDIA_LOGO, logo_scale=0.63, label="Nemotron-8B",
-                                 dx=14, dy=0, ha="left", va="center"),
-    "Nemotron-Terminal-14B": dict(logo=NVIDIA_LOGO, logo_scale=0.66, label="Nemotron-14B",
-                                  dx=0, dy=15, ha="center", va="bottom"),
-    "Nemotron-Terminal-32B": dict(logo=NVIDIA_LOGO, logo_scale=0.70, label="Nemotron-32B",
-                                  dx=0, dy=15, ha="center", va="bottom"),
+    "Nemotron-Terminal-8B": dict(logo=NVIDIA_LOGO, logo_scale=0.63, label="Nemotron 8B",
+                                 dx=20, dy=-2, ha="left", va="center", leader=True),
+    "Nemotron-Terminal-14B": dict(logo=NVIDIA_LOGO, logo_scale=0.66, label="Nemotron 14B",
+                                  dx=17, dy=8, ha="left", va="bottom", leader=True),
+    "Nemotron-Terminal-32B": dict(logo=NVIDIA_LOGO, logo_scale=0.70, label="Nemotron 32B",
+                                  dx=-35, dy=15, ha="right", va="bottom", leader=True),
     "TermiGen-Qwen2.5-32B": dict(label="TermiGen-32B", leader=True,
                                  dx=5, dy=-42, ha="left", va="top"),
     "Endless-Terminals-8B": dict(label="Endless-8B",
@@ -258,36 +268,49 @@ MODEL_STYLE: Dict[str, dict] = {
                                  dx=14, dy=0, ha="left", va="center"),
     "TerminalTraj-7B": dict(label="TerminalTraj-7B",
                             dx=0, dy=-7, ha="center", va="top"),
-    "TerminalTraj-14B": dict(label="TerminalTraj-14B", leader=True,
-                             dx=16, dy=-33, ha="left", va="top"),
-    "TerminalTraj-32B": dict(label="TerminalTraj-32B",
-                             dx=14, dy=0, ha="left", va="center"),
+    "TerminalTraj-14B": dict(label=""),
+    "TerminalTraj-32B": dict(label="TerminalTraj 32B", leader=True,
+                             dx=19, dy=0, ha="left", va="center"),
     "LiberCoder-32B": dict(label="LiberCoder-32B", leader=True,
                            dx=-5, dy=-20, ha="right", va="top"),
-    "LiberCoder-235B-A22B": dict(label="LiberCoder-235B-A22B",
-                                 dx=0, dy=-7, ha="center", va="top"),
+    "LiberCoder-235B-A22B": dict(label="LiberCoder 235B", leader=True,
+                                 dx=-19, dy=-14, ha="right", va="top"),
+    "OpenThinker-Agent-32B": dict(label="OpenThinker 32B", leader=True,
+                                  dx=19, dy=2, ha="left", va="center"),
+    "OpenThinker-Agent-RL-8B": dict(label="OT-Agent RL 8B", leader=True,
+                                    dx=13, dy=13, ha="left", va="bottom"),
+    "SETA-V4-Flash": dict(label="SETA V4 Flash", leader=True,
+                          dx=-12, dy=-7, ha="right", va="top"),
+    "CalibForge-30B": dict(label="CalibForge 30B", leader=True,
+                           dx=0, dy=18, ha="center", va="bottom"),
+    "CalibForge-35B": dict(label="CalibForge 35B", leader=True,
+                           dx=15, dy=-7, ha="left", va="center"),
+    "Lego-32B": dict(label="Lego 32B", leader=True,
+                     dx=-33, dy=0, ha="right", va="center"),
+    "RST-122B": dict(label="RST 122B", leader=True,
+                     dx=20, dy=-12, ha="left", va="center"),
     # ---- open-weight frontier ---------------------------------------------
     "GPT-OSS-120B": dict(logo=OPENAI_LOGO, logo_scale=0.75, label="GPT-OSS-120B",
-                         dx=0, dy=-19, ha="center", va="top"),
+                         dx=24, dy=-5, ha="left", va="center", leader=True),
     "Kimi-K2.5": dict(logo="Kimi-logo-2025.png", logo_scale=0.95, label="Kimi-K2.5",
                       dx=18, dy=0, ha="left", va="center"),
-    "MiniMax-M2.7": dict(logo="minimax-logo.png", logo_scale=1.0, label="MiniMax-M2.7",
+    "MiniMax-M2.7": dict(logo="minimax-logo.png", logo_scale=1.0, label="",
                          dx=-12, dy=-16, ha="center", va="top"),
     "DeepSeek-V3.2": dict(logo=DEEPSEEK_LOGO, logo_scale=1.0, label="DeepSeek-V3.2",
                           dx=0, dy=-20, ha="center", va="top"),
     "GLM-5": dict(logo="GLM-Zai-Logo.png", logo_scale=0.82, label="GLM-5",
-                  dx=16, dy=0, ha="left", va="center"),
+                  dx=13, dy=-14, ha="left", va="center"),
     # ---- closed (undisclosed size; live in the "?" column) ----------------
     "Claude-Sonnet-4.6": dict(logo="Claude_AI_logo.png", logo_scale=0.95,
-                              label="Claude-Sonnet-4.6",
-                              dx=0, dy=-22, ha="center", va="top"),
+                              label="Sonnet 4.6",
+                              dx=0, dy=-12, ha="center", va="center"),
     "Claude-Haiku-4.5": dict(logo="Claude_AI_logo.png", logo_scale=0.78,
-                             label="Claude-Haiku-4.5", x_offset=-0.22,
-                             dx=0, dy=-21, ha="center", va="top"),
+                             label="Haiku 4.5", x_offset=-0.22,
+                             dx=0, dy=-17, ha="center", va="top"),
     "GPT-5-mini": dict(logo=OPENAI_LOGO, logo_scale=0.95, label="GPT-5-mini",
-                       x_offset=0.22, dx=0, dy=-20, ha="center", va="top"),
+                       x_offset=0.22, dx=-5, dy=15, ha="right", va="bottom"),
     "GPT-5-nano": dict(logo=OPENAI_LOGO, logo_scale=0.75, label="GPT-5-nano",
-                       x_offset=0.0, dx=0, dy=-18, ha="center", va="top"),
+                       x_offset=0.0, dx=0, dy=-14, ha="center", va="top"),
 }
 
 DEFAULTS = dict(
@@ -325,15 +348,15 @@ class TeaserStyle:
     # Typography
     font_family: str = "serif"
     font_serif: Sequence[str] = field(default_factory=lambda: ["DejaVu Serif"])
-    font_size: float = 16.0
-    axes_label_size: float = 18.5
-    tick_size: float = 16.0
-    annotation_size: float = 12.5
-    annotation_size_ours: float = 14.5
-    legend_size: float = 13.5
+    font_size: float = 18.0
+    axes_label_size: float = 20.0
+    tick_size: float = 17.0
+    annotation_size: float = 13.0
+    annotation_size_ours: float = 15.0
+    legend_size: float = 14.0
 
     # Layout / spines
-    figsize: Tuple[float, float] = (14.0, 7.0)
+    figsize: Tuple[float, float] = (14.0, 8.5)
     spine_color: str = "#808080"
     spine_linewidth: float = 1.25
 
@@ -400,6 +423,7 @@ class TeaserStyle:
     frontier_color: str = "#C9BBA9"
     frontier_alpha: float = 0.16
     frontier_label: str = "Very large  /  undisclosed size"
+    frontier_label_y: float = 25.0
 
     # Dashed leader lines (point -> label) for crowded coincident markers
     leader_color: str = "#888888"
@@ -580,7 +604,7 @@ def render(rows: List[Row], style: TeaserStyle, out_base: Path) -> None:
     if style.frontier_band:
         ax.axvspan(style.frontier_x, X_LIM[1], color=style.frontier_color,
                    alpha=style.frontier_alpha, zorder=0, linewidth=0)
-        ax.text((style.frontier_x + X_LIM[1]) / 2.0, style.ylim[1] - 1.6,
+        ax.text((style.frontier_x + X_LIM[1]) / 2.0, style.frontier_label_y,
                 style.frontier_label, ha="center", va="top",
                 fontsize=style.annotation_size, color="#9A8B79",
                 style="italic", zorder=1)
