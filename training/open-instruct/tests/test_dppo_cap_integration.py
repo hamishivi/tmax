@@ -1,5 +1,8 @@
 """CPU regression checks for capped DPPO integrated with padded batches."""
 
+import ast
+import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -39,3 +42,34 @@ def test_padding_does_not_enter_drift_metrics():
     metrics = accumulator.compute_metrics()
     assert metrics["debug/vllm_vs_local_logprob_diff_max"] == 0.0
     assert metrics["policy_drift/effective_data_pct"] == 100.0
+
+
+@pytest.mark.parametrize("training_step,model_step,age", [(1, 0, 0), (2, 1, 0), (2, 0, 1), (100, 98, 1)])
+def test_drift_age_uses_completed_policy_updates(training_step, model_step, age):
+    source = Path(__file__).parents[1] / "open_instruct/grpo_fast.py"
+    calls = [
+        node
+        for node in ast.walk(ast.parse(source.read_text()))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "policy_drift"
+        and node.func.attr == "update"
+    ]
+    assert len(calls) == 2  # Tiled and dense loss paths must use the same policy version.
+    ns = production_namespace()
+    for call in calls:
+        version = next(keyword.value for keyword in call.keywords if keyword.arg == "training_step")
+        policy_step = eval(compile(ast.Expression(version), str(source), "eval"), {"training_step": training_step})
+        accumulator = ns["PolicyDriftAccumulator"]("cpu", max_staleness=1)
+        accumulator.update(
+            torch.zeros(1),
+            torch.zeros(1),
+            torch.ones(1, dtype=torch.bool),
+            torch.ones(1),
+            model_steps=torch.tensor([model_step]),
+            training_step=policy_step,
+        )
+        metrics = accumulator.compute_metrics()
+        assert math.isfinite(metrics[f"policy_drift/age_{age}_probability_change_p95_x"])
+        assert metrics[f"policy_drift/age_{age}_probability_change_p95_x"] == 1.0

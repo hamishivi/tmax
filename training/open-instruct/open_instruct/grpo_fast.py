@@ -1253,7 +1253,9 @@ class PolicyTrainerRayProcess(RayProcess):
                                 model_steps=(
                                     data_BT.model_steps[i][:, 1:] if data_BT.model_steps is not None else None
                                 ),
-                                training_step=training_step,
+                                # Rollout model versions count completed updates;
+                                # training_step labels the update about to run.
+                                training_step=training_step - 1,
                             )
                         is_accumulation_boundary = (local_step + 1) % accumulation_steps == 0
                         self.model.set_gradient_accumulation_boundary(is_accumulation_boundary)
@@ -1436,7 +1438,7 @@ class PolicyTrainerRayProcess(RayProcess):
                         response_mask=response_mask_BT,
                         policy_gradient_weights=policy_gradient_weights_BT,
                         model_steps=data_BT.model_steps[i][:, 1:] if data_BT.model_steps is not None else None,
-                        training_step=training_step,
+                        training_step=training_step - 1,
                     )
 
                     pg_losses_BT, pg_losses2_BT, pg_loss_max_BT, kl_BT = grpo_utils.compute_grpo_loss(

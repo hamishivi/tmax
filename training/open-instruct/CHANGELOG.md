@@ -24,6 +24,7 @@ All notable changes to this project will be documented in this file.
 - Add deprecation warning to `finetune.py` pointing users to the OLMo-core SFT implementation (https://github.com/allenai/open-instruct/pull/1574).
 
 ### Fixed
+- Report fresh rollout policy drift at age zero in both tiled and dense GRPO loss paths (https://github.com/hamishivi/tmax/pull/11).
 - Load local JSONL/Parquet training data during tool discovery using the same file formats supported by the training dataset loader (https://github.com/hamishivi/tmax/pull/11).
 - Fix `DataPreparationActor` hanging on shutdown by killing the actor with `ray.kill()` during cleanup (https://github.com/allenai/open-instruct/pull/1611).
 - Fix empty optimizer group error with torch 2.10 and DeepSpeed in `finetune.py`, `dpo_tune_cache.py`, and `utils.py`. (https://github.com/allenai/open-instruct/pull/1598)
