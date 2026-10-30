@@ -739,11 +739,7 @@ class LLMRayActor:
         self.max_steps = max_steps
         self.per_turn_max_tokens = per_turn_max_tokens
         self.seed_per_turn = seed_per_turn
-        # the generic-except gate consumes this
-        # attribute; the sync removed producer AND consumer together, and repair r1
-        # restored only the consumer — first mid-step sandbox fault then raised
-        # AttributeError and killed the trainer (found by the worker-disappearance
-        # test, 11082494). Default False matches pre-sync and every shipped recipe.
+        # The tool-error recovery path reads this setting after sandbox failures.
         self.tool_call_format_error_feedback = tool_call_format_error_feedback
         self.tool_call_timeout = tool_call_timeout
         self.mask_tool_use = mask_tool_use
