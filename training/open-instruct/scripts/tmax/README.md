@@ -90,9 +90,12 @@ TOOL_CONFIGS='{"backend":"sandfleet","task_data_dir":"/data/task-data","pwd":"/"
 The launcher uses the backend in `TOOL_CONFIGS` to select sandbox setup. Sandfleet
 requires `SANDFLEET_URL` and a client token. Beaker recipes accept `SANDFLEET_CLIENT_TOKEN_SECRET` as the name of
 a secret to expose as `SANDFLEET_CLIENT_TOKEN`; the local debug recipe reads the
-token directly from its environment. `SANDFLEET_POOL` is optional. Install the
-controller and workers from [Sandfleet](https://github.com/hamishivi/sandfleet)
-at matching revisions; the training client uses the HTTP API directly.
+token directly from its environment. `SANDFLEET_POOL` is optional. Use Sandfleet
+0.16.1 or later for its pool-deletion and recovery fixes, with the controller and
+workers at matching revisions. Follow the
+[Sandfleet TMAX setup guide](https://github.com/hamishivi/sandfleet/blob/main/docs/tmax.md)
+for worker Python requirements, prepared images, resource sizing, and a backend
+smoke test. The training client uses the HTTP API directly.
 
 The full RL recipes forward operator-provided `SANDFLEET_URL`, `SANDFLEET_POOL`,
 `SANDFLEET_REGISTRY`, `SWERL_APPTAINER_SIF_DIR`, `SWERL_ROLLOUT_TIMEOUT_S`,
