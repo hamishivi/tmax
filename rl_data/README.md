@@ -10,6 +10,12 @@ Hugging Face Hub.
 This is the code behind the **Terminal Data Generation** section of the paper.
 We use `gemini-3.1-pro-preview` as the generation model.
 
+The paper's TMax-13K v1.1 additionally applies a post-generation audit and repair
+pass. See [`verify/README.md`](verify/README.md) for the restored tools, the
+distinction between the hardened prefilter and solvability subset, and historical
+reproducibility limitations. The generation-stage validation discussion below
+describes generation before that post-pass.
+
 ## Compositional generation
 
 Instead of an expensive multi-stage validation pipeline, each task is a single
