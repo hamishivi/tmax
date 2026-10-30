@@ -25,9 +25,9 @@ training recipe was changed. The original working checkout was not modified.
 
 ## Source classification
 
-[`task-audit-import.json`](task-audit-import.json) records SHA256s of the imported
-local files and the historical blobs. “Exact at import” describes the untracked
-local source before publication changes, not necessarily this PR's final file.
+The comparison below describes the imported local files against the historical
+commit above. “Exact at import” refers to the untracked local source before
+publication changes, not necessarily this PR's final file.
 
 | Components | Relationship at import | Public preparation changes |
 |---|---|---|
@@ -55,7 +55,7 @@ repair and image removal (September 11), to action/label decoupling and
 solvability export (September 12), to runtime sanity and recipe generation
 (September 13). The imported directory's October 3 README reports later direct
 API smoke tests. Those historical smoke claims are not fresh tests performed by
-this publication task. Its original script hashes remain in the import manifest.
+this publication task.
 
 ## What matches the paper and released artifacts
 
@@ -139,8 +139,8 @@ paper's judge labels or repair proposals.
 
 ## Checks performed for this publication
 
-[`task-audit-release-checks.json`](task-audit-release-checks.json) is the output of
-`python scripts/data/audit_release.py`, using pinned public revisions. It checks
+`python scripts/data/audit_release.py` checks pinned public revisions and writes
+a local report to the requested `--out` path. It checks
 all 13,565 training records and metadata rows, all 1,036 exclusions against the
 original 14,601 IDs, the exact Open Instruct schema including HF metadata, required
 archive files and instruction/prompt agreement, the 1,713 image publication

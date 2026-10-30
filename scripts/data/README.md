@@ -18,10 +18,10 @@ uv run python scripts/data/audit_release.py \
   --cache rl_data/output/release-cache --out rl_data/output/release-checks.json
 ```
 
-The checked report is in [`docs/task-audit-release-checks.json`](../../docs/task-audit-release-checks.json).
-It distinguishes artifact checks performed here from prior authors' runtime
-claims. Missing historical model access and uncommitted build orchestration
-prevent an identical rerun of the paper.
+The command writes its report to the requested `--out` path under
+`rl_data/output/`; generated reports are local run outputs. The report distinguishes
+artifact checks from prior authors' runtime claims. Missing historical model
+access and uncommitted build orchestration prevent an identical rerun of the paper.
 
 The conversion scripts are **specific to the released 13,565-task corpus**:
 
