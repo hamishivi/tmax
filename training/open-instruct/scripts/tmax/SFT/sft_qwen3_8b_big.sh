@@ -53,5 +53,6 @@ uv run python mason.py \
     --report_to wandb \
     --with_tracking \
     --logging_steps 1 \
+    --try_launch_beaker_eval_jobs False \
     --output_dir "${OUTPUT_DIR:-/output}" \
     --seed 42

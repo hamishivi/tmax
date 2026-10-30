@@ -22,6 +22,7 @@ with contextlib.suppress(Exception):
     import deepspeed
 
 # isort: on
+import hashlib
 import json
 import math
 import os
@@ -103,7 +104,8 @@ def load_pretokenized_jsonl(path: str, max_seq_length: int | None):
     tokens), avoiding any retokenization mismatch.
     """
 
-    def gen():
+    def gen(source_sha256: str):
+        # The digest participates in the dataset cache key through gen_kwargs.
         with open(path) as fh:
             for line in fh:
                 line = line.strip()
@@ -118,7 +120,9 @@ def load_pretokenized_jsonl(path: str, max_seq_length: int | None):
                     continue
                 yield {"input_ids": input_ids, "attention_mask": [1] * len(input_ids), "labels": labels}
 
-    dataset = datasets.Dataset.from_generator(gen)
+    with open(path, "rb") as source:
+        source_sha256 = hashlib.file_digest(source, "sha256").hexdigest()
+    dataset = datasets.Dataset.from_generator(gen, gen_kwargs={"source_sha256": source_sha256})
     print(f"load_pretokenized_jsonl: kept {len(dataset)} examples (max_seq_length={max_seq_length}) from {path}")
     return dataset
 

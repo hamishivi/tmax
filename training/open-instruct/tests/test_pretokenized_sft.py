@@ -1,6 +1,7 @@
 """Pretokenized trajectories retain tool tokens and labels without retokenizing."""
 
 import ast
+import hashlib
 import json
 from pathlib import Path
 
@@ -14,7 +15,7 @@ def loader():
         for node in ast.parse(source.read_text()).body
         if isinstance(node, ast.FunctionDef) and node.name == "load_pretokenized_jsonl"
     )
-    namespace = {"datasets": datasets, "json": json}
+    namespace = {"datasets": datasets, "json": json, "hashlib": hashlib}
     exec(compile(ast.Module(body=[definition], type_ignores=[]), str(source), "exec"), namespace)
     return namespace[definition.name]
 
@@ -39,3 +40,14 @@ def test_mismatched_and_overlong_records_are_filtered(tmp_path):
     dataset = loader()(str(path), 3)
     assert len(dataset) == 1
     assert dataset[0]["input_ids"] == [5, 6]
+
+
+def test_replacing_jsonl_at_same_path_invalidates_cache(tmp_path):
+    path = tmp_path / "trajectories.jsonl"
+    load = loader()
+    path.write_text(json.dumps({"input_ids": [1, 2], "labels": [-100, 2]}) + "\n")
+    first = load(str(path), 3)
+    path.write_text(json.dumps({"input_ids": [3, 4], "labels": [-100, 4]}) + "\n")
+    second = load(str(path), 3)
+    assert first[0]["input_ids"] == [1, 2]
+    assert second[0]["input_ids"] == [3, 4]
