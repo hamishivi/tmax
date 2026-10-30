@@ -172,11 +172,20 @@ uv run python rl_data/verify/export_prefilter.py --corpus "$RUN/corpus-final" \
 
 Omit `--verified` for a prefilter without rollout evidence. Final exports require
 actual materialised patches. New evidence carries a fingerprint of every task file
-and image bytes; changed artifacts invalidate prior attempts regardless of directory
+including entry types, permissions and symlink targets, plus image bytes;
+changed artifacts invalidate prior attempts regardless of directory
 name. These checks read the SIFs and can take time on a full corpus. Historical
 traces lack these fingerprints and cannot be admitted by the new export CLI.
+Earlier content-only fingerprints also require fresh validation; relabeling old
+traces with a new fingerprint would not establish what was executed.
 Rewritten verifiers require a current sanity result. Known runtime defects remain
 visible in the prefilter and are excluded from the demonstrated passing subset.
+Sanity rechecks use fresh staging directories. Missing/invalid rewards and
+infrastructure failures carry no scored evidence; verifier timeouts remain
+separate budget outcomes rather than scored rejections.
+Upload-root directories must be real directories. Supporting file symlinks are
+preserved, and extracted oracle overlays replace links without writing through
+them into the original corpus.
 The episode deadline is checked between blocking steps, so 600 seconds is a
 nominal budget, not a hard process kill guarantee.
 

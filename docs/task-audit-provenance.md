@@ -38,13 +38,13 @@ local source before publication changes, not necessarily this PR's final file.
 | `build_index.py` | Historical join/reconciliation, with root parameterised | Retained |
 | `apply_repairs.py` | Historical oracle extraction/leak definitions, with protected roots parameterised | Validate removal paths/collisions; fail extraction on missing assets |
 | `fix_tasks.py`, `label_tasks.py` | Historical prompt/guard/resumability flow with direct-client imports, provider-specific keys and smoke changes | Clear stale proposed scripts on a refused retry; no claim of historical model equivalence |
-| `repair.py` | Historical prompts/guards; local docstring corrected to describe image removal | Reject unsafe paths, parent-directory removals affecting instruction inputs, and oracle basename collisions |
-| `rollout.py` | Historical solver/harness with later provider defaults, proper tool-result messages, signature retention and tool-history trimming | Fingerprint final task/image bytes and refuse stale resume evidence |
-| `materialise.py` | Historical corpus adoption with protected roots parameterised | Fresh output only; require checked image builds; preserve supporting tests; refuse incomplete repairs/assets |
+| `repair.py` | Historical prompts/guards; local docstring corrected to describe image removal | Validate all declared changes independently of action; reject unsafe paths, parent-directory removals affecting instruction inputs, and oracle basename collisions |
+| `rollout.py` | Historical solver/harness with later provider defaults, proper tool-result messages, signature retention and tool-history trimming | Fingerprint final task/image artifacts, refuse stale resume evidence, distinguish invalid rewards/timeouts from scored rejections |
+| `materialise.py` | Historical corpus adoption with protected roots parameterised | Fresh output only; require checked image builds; preserve supporting tests and symlinks; refuse incomplete repairs/assets |
 | `export_prefilter.py` | Historical final keep policy with root parameterised | Explicit inputs, plan-only candidate IDs, final adoption checks, separate exclusions and validation status |
 | `make_recipe.py` | Historical recipe generator with root parameterised | Export from checked build receipts and explicit dependency import names |
-| `sanity.py` | Historical bounded empty-submission runtime check with root parameterised | Explicit final corpus; preserve all test assets and fingerprint results |
-| `gate.py`, `replay.py` | Historical A/B/replay analysis with roots parameterised | Retained as optional historical analyses, not required release gates |
+| `sanity.py` | Historical bounded empty-submission runtime check with root parameterised | Explicit final corpus; fresh staging with all test assets; fingerprint results and preserve verifier failure metadata |
+| `gate.py`, `replay.py` | Historical A/B/replay analysis with roots parameterised | Optional historical analyses, not required release gates; the shared `run_arm` propagates missing-reward, timeout and infrastructure metadata |
 | `llm_client.py`, `smoke_tools.py`, `__init__.py` | Later local additions; absent from the historical branch | Direct-provider replacement and provider tool smoke; not historical gateway code |
 | `image_safety.py`, `build_images.py` | Absent from both historical branch and imported directory | New public reconstruction and shared validation |
 | `scripts/data/prepare_hardened_open_instruct.py`, `publish_hardened_images.py` | Exact copies of the later scripts shipped with the public training dataset | Canonical public repository names; publication requires explicit `--apply` |
@@ -148,7 +148,7 @@ receipts/plan and 1,763-source-derivative accounting, and conversion-source hash
 The task archive SHA256 is
 `a654638ec448403823273b6510eeb457ae6d9914c7bf4f87ce5302d1fb0c7146`.
 
-The 26 offline tests cover provider routing/retries/auth redaction, tool-call history,
+The 36 offline tests cover provider routing/retries/auth redaction, tool-call history,
 repair guards, checked build adoption, resolved dependency pins, missing oracle
 and image handling, supporting test preservation, keep/exclusion accounting,
 stale validation rejection, and deterministic OCI whiteouts. Every Python source

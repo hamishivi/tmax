@@ -15,6 +15,7 @@ and ask only whether the VERIFIER works -- not whether it grades correctly.
   BUILD_FAILED      its own gcc/cargo/make step failed  it cannot run here
   EXEC_BLOCKED      exit 126 / permission denied        its sandboxing is broken
   NO_REWARD         never wrote /logs/verifier/reward   harness error, not a score
+  TIMEOUT           verifier exhausted its time budget  no completed measurement
   PASSES_EMPTY      scored >0 for doing nothing         it is a rubber stamp
 
 An assertion failure is the CORRECT outcome here and is not a defect: an empty
@@ -42,6 +43,7 @@ from rollout import load_corpus  # noqa: E402
 from image_safety import corpus_fingerprints  # noqa: E402
 from pathlib import Path
 import shutil
+import tempfile
 
 B = os.path.abspath(os.getenv("VERIFY_ROOT", "rl_data/output/verification"))
 
@@ -55,6 +57,11 @@ BLOCKED = re.compile(r"exit (code|status) 126|Permission denied|not executable",
 def classify(rec: dict) -> str:
     if rec.get("error"):
         return "INFRA"
+    metadata = rec.get('metadata') or {}
+    if metadata.get('timeout'):
+        return 'TIMEOUT'
+    if metadata.get('invalid_reward'):
+        return 'NO_REWARD'
     obs = rec.get("observation") or ""
     reward = rec.get("reward")
     if reward is None:
@@ -87,7 +94,7 @@ def main() -> int:
     tasks = sorted(r['task_id'] for r in artifacts if r['verifier_repaired'])
     fingerprints = corpus_fingerprints(Path(args.corpus))
     if args.tasks:
-        want = set(json.load(open(args.tasks, encoding="utf-8")))
+        want = set(json.loads(Path(args.tasks).read_text()))
         tasks = [t for t in tasks if t in want]
     if args.num_shards > 1:
         tasks = tasks[args.shard :: args.num_shards]
@@ -104,7 +111,7 @@ def main() -> int:
     path = os.path.join(args.out, f"sanity{suffix}.jsonl")
     done = set()
     if os.path.isfile(path):
-        for line in open(path, encoding="utf-8"):
+        for line in Path(path).read_text().splitlines():
             try:
                 row = json.loads(line)
                 if row.get('artifact_id') == fingerprints.get(row.get('task_id')):
@@ -121,14 +128,16 @@ def main() -> int:
 
     def work(t):
         try:
-            td = os.path.join(root, t, 'task-data')
-            shutil.copytree(os.path.join(args.corpus, 'task-data', t), os.path.join(td, t), dirs_exist_ok=True)
-            arm = asyncio.run(run_arm(t, td, images[t], []))
+            with tempfile.TemporaryDirectory(prefix=t + '-', dir=root) as staging:
+                td = os.path.join(staging, 'task-data')
+                shutil.copytree(os.path.join(args.corpus, 'task-data', t), os.path.join(td, t), symlinks=True)
+                arm = asyncio.run(run_arm(t, td, images[t], []))
         except Exception as exc:  # noqa: BLE001
             arm = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
         verdict = classify(arm)
         rec = {"task_id": t, "verdict": verdict, "reward": arm.get("reward"),
                "artifact_id": fingerprints[t],
+               "metadata": arm.get('metadata') or {},
                "error": arm.get("error"),
                "observation": (arm.get("observation") or "")[:1500]}
         with lock:

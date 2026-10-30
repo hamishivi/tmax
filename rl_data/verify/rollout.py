@@ -13,6 +13,7 @@ The single most important thing here is that a zero is not a zero:
   infra           sandbox lost / OOM / backend died -> NO evidence either way
   no_submit       hit max steps without submitting  -> weak negative evidence
   error           harness threw                     -> NO evidence
+  invalid_reward  verifier produced no usable score -> NO evidence
 
 Only `solved` and `unsolved` are evidence. Counting an infra failure as "the model
 could not solve it" silently deletes good tasks from the filtered set, which is the
@@ -35,6 +36,7 @@ import sys
 import time
 import threading
 import traceback
+import math
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -90,6 +92,27 @@ BASH_TOOL = {
         },
     },
 }
+
+
+def step_failure(result) -> str | None:
+    """Separate missing measurements and execution failures from scored zeroes."""
+    metadata = getattr(result, 'metadata', None) or {}
+    if any(metadata.get(name) for name in ('sandbox_lost', 'infrastructure_failure',
+                                           'oom_killed', 'backend_unavailable')):
+        return 'infra'
+    if not result.done:
+        return None
+    if metadata.get('timeout'):
+        return 'timeout'
+    if metadata.get('invalid_reward'):
+        return 'invalid_reward'
+    try:
+        reward = float(result.reward)
+    except (TypeError, ValueError):
+        return 'invalid_reward'
+    if not math.isfinite(reward) or not 0 <= reward <= 1:
+        return 'invalid_reward'
+    return None
 
 
 def load_corpus(corpus: str) -> dict[str, str]:
@@ -246,13 +269,12 @@ async def run_one(task_id: str, corpus: str, image: str, model: str, key: str,
             else:
                 messages.append({"role": "user", "content": obs_text})
 
-            meta = getattr(result, "metadata", None) or {}
-            if meta.get("sandbox_lost") or meta.get("infrastructure_failure"):
-                rec["outcome"] = "infra"; rec["detail"] = "sandbox_lost"; break
-            if meta.get("oom_killed"):
-                rec["outcome"] = "infra"; rec["detail"] = "oom"; break
-            if meta.get("backend_unavailable"):
-                rec["outcome"] = "infra"; rec["detail"] = "backend_unavailable"; break
+            failure = step_failure(result)
+            if failure:
+                rec['outcome'] = failure
+                rec['detail'] = failure
+                rec['verifier_metadata'] = getattr(result, 'metadata', None) or {}
+                break
 
             if result.done:
                 r = float(result.reward or 0.0)

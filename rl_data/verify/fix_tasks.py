@@ -98,7 +98,7 @@ def repair_one(task: dict, label: dict, model: str, key: str, limiter, max_out: 
         "notes": rep["notes"],
         "leaked_paths": rep["leaked_paths"],
         "oracle_to_tests": rep["oracle_to_tests"],
-        "needs_image_rebuild": bool(rep["setup_sh"].strip()),
+        "needs_image_rebuild": bool(rep["leaked_paths"] or rep["setup_sh"].strip()),
         "_scripts": {"test.sh": rep["test_sh"], "setup.sh": rep["setup_sh"]},
         "model": model,
         "elapsed_sec": round(time.time() - t0, 2),

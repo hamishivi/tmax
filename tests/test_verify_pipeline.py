@@ -7,9 +7,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import asyncio
 from unittest.mock import patch
 
-from rl_data.verify import build_images, export_prefilter, export_verified, image_safety, materialise, repair
+from rl_data.verify import build_images, export_prefilter, export_verified, image_safety, materialise, repair, gate, rollout, sanity, fix_tasks
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -127,10 +128,12 @@ class CorpusTests(unittest.TestCase):
         (root / 'fixes/task_a').mkdir(parents=True)
         return task
 
-    def invoke(self, root, out):
+    def invoke(self, root, out, image_builds=None):
         argv = ['materialise.py', '--index', str(root / 'index.jsonl'), '--fixes', str(root / 'fixes'),
                 '--tasks', str(root / 'ids.json'), '--src-task-data', str(root / 'source'),
                 '--source-jsonl', str(root / 'original.jsonl'), '--out', str(out)]
+        if image_builds is not None:
+            argv.extend(['--image-builds', str(image_builds)])
         with patch.object(sys, 'argv', argv):
             return materialise.main()
 
@@ -145,6 +148,43 @@ class CorpusTests(unittest.TestCase):
             self.assertNotEqual(image_safety.corpus_fingerprints(out), before)
             with self.assertRaises(FileExistsError):
                 self.invoke(root, out)
+
+    def test_modes_links_and_empty_directories_invalidate_evidence(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); self.make_source(root)
+            corpus = root / 'corpus'; self.invoke(root, corpus)
+            tests = corpus / 'task-data/task_a/tests'
+            truth = tests / 'truth.json'
+            before = image_safety.corpus_fingerprints(corpus)
+            truth.chmod(0o600)
+            self.assertNotEqual(image_safety.corpus_fingerprints(corpus), before)
+            (tests / 'same-truth.json').write_bytes(truth.read_bytes())
+            link = tests / 'oracle'; link.symlink_to('truth.json')
+            before = image_safety.corpus_fingerprints(corpus)
+            link.unlink(); link.symlink_to('same-truth.json')
+            self.assertNotEqual(image_safety.corpus_fingerprints(corpus), before)
+            before = image_safety.corpus_fingerprints(corpus)
+            (tests / 'empty').mkdir()
+            self.assertNotEqual(image_safety.corpus_fingerprints(corpus), before)
+
+    def test_sanity_recheck_executes_only_final_task_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); self.make_source(root)
+            (root / 'source/task_a/tests/oracle').symlink_to('truth.json')
+            corpus = root / 'corpus'; self.invoke(root, corpus)
+            self.assertTrue((corpus / 'task-data/task_a/tests/oracle').is_symlink())
+            (corpus / 'artifacts.jsonl').write_text('{"task_id":"task_a","verifier_repaired":true}\n')
+            seen = []
+            async def fake_arm(tid, task_data, image, commands):
+                self.assertTrue((Path(task_data) / tid / 'tests/oracle').is_symlink())
+                seen.append((Path(task_data) / tid / 'tests/truth.json').exists())
+                return {'reward': 0, 'observation': '', 'error': None}
+            argv = ['sanity.py', '--corpus', str(corpus), '--out', str(root / 'sanity')]
+            with patch.object(sys, 'argv', argv), patch.object(sanity, 'run_arm', fake_arm):
+                sanity.main()
+                (corpus / 'task-data/task_a/tests/truth.json').unlink()
+                sanity.main()
+            self.assertEqual(seen, [True, False])
 
     def test_unbuilt_leak_repair_fails_before_output(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -162,6 +202,44 @@ class CorpusTests(unittest.TestCase):
             (root / 'fixes/task_a/test.sh').write_text('bad stale repair')
             self.invoke(root, root / 'corpus')
             self.assertNotIn('stale', (root / 'corpus/task-data/task_a/tests/test.sh').read_text())
+
+    def test_linked_tests_directory_cannot_overwrite_original_verifier(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); source = self.make_source(root)
+            protected = root / 'original-tests'
+            (source / 'tests').rename(protected)
+            (source / 'tests').symlink_to(protected, target_is_directory=True)
+            original = (protected / 'test.sh').read_bytes()
+            (root / 'fixes/task_a/repair.json').write_text('{"accepted":true,"action":"rewrite_verifier"}')
+            (root / 'fixes/task_a/test.sh').write_text('replacement verifier')
+            with self.assertRaises(ValueError):
+                self.invoke(root, root / 'corpus')
+            self.assertFalse((root / 'corpus').exists())
+            self.assertEqual((protected / 'test.sh').read_bytes(), original)
+
+    def test_oracle_overlay_replaces_link_without_changing_its_target(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); source = self.make_source(root)
+            protected = root / 'original-truth'; protected.write_text('original oracle')
+            (source / 'tests/truth.json').unlink()
+            (source / 'tests/truth.json').symlink_to(protected)
+            fix = root / 'fixes/task_a'
+            (fix / 'repair.json').write_text(json.dumps({'accepted': True, 'action': 'rewrite_verifier',
+                'leaked_paths': ['/app/truth.json'], 'oracle_to_tests': ['/app/truth.json']}))
+            (fix / 'test.sh').write_text('echo 0 > /logs/verifier/reward.txt')
+            (fix / 'tests_assets').mkdir()
+            (fix / 'tests_assets/truth.json').write_text('extracted oracle')
+            (fix / 'tests_assets/obsolete').write_text('stale asset')
+            image = root / 'derived.sif'; image.write_bytes(b'derived')
+            builds = {'task_a': {'image': str(image), 'registry_image': 'test:original',
+                                 'removed_paths': ['/app/truth.json']}}
+            with patch.object(materialise, 'checked_builds', return_value=builds):
+                self.invoke(root, root / 'corpus', image_builds=root / 'builds')
+            self.assertEqual(protected.read_text(), 'original oracle')
+            adopted = root / 'corpus/task-data/task_a/tests/truth.json'
+            self.assertFalse(adopted.is_symlink())
+            self.assertEqual(adopted.read_text(), 'extracted oracle')
+            self.assertFalse((adopted.parent / 'obsolete').exists())
 
     def test_label_retries_do_not_erase_success(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -214,6 +292,30 @@ class CorpusTests(unittest.TestCase):
         reason = repair.check_repair(proposal, {'instruction': 'read /app/input/data.csv', 'tests': ''})
         self.assertIn('instruction references', reason)
 
+    def test_hybrid_repairs_cannot_bypass_content_guards(self):
+        proposal = {'action': 'rewrite_verifier', 'setup_sh': 'rm -rf /app/input',
+                    'leaked_paths': ['/app/input'], 'oracle_to_tests': [],
+                    'test_sh': 'echo 0 > /logs/verifier/reward.txt'}
+        task = {'instruction': 'read /app/input/data.csv', 'tests': ''}
+        self.assertIn('instruction references', repair.check_repair(proposal, task))
+        proposal.update(leaked_paths=['/app/oracle'], setup_sh='rm -rf /app/oracle',
+                        test_sh='cat /app/oracle; echo 0 > /logs/verifier/reward.txt')
+        self.assertIn('verifier still reads', repair.check_repair(proposal, task))
+        proposal.update(action='remove_leak', test_sh='echo no reward')
+        self.assertIn('never writes', repair.check_repair(proposal, task))
+        proposal.update(test_sh='echo 0 > /logs/verifier/reward.txt')
+        self.assertIsNone(repair.check_repair(proposal, task))
+
+    def test_hybrid_removal_without_setup_rewrite_requests_image_build(self):
+        proposal = {'action': 'rewrite_verifier', 'setup_sh': '', 'test_sh': 'echo 0 > /logs/verifier/reward.txt',
+                    'leaked_paths': ['/app/oracle'], 'oracle_to_tests': [], 'notes': 'Remove the leaked oracle'}
+        response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(proposal)))])
+        task = {'task_id': 'task_a', 'instruction': 'Produce the result', 'setup': '', 'tests': 'old verifier'}
+        with patch.object(fix_tasks, 'complete', return_value=response):
+            result = fix_tasks.repair_one(task, {'label': 'VERIFIER-TOO-WEAK'}, 'test', 'test', None, 8192)
+        self.assertTrue(result['accepted'])
+        self.assertTrue(result['needs_image_rebuild'])
+
     def test_public_pipeline_exports_only_current_artifact_success(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder); self.make_source(root)
@@ -240,6 +342,62 @@ class CorpusTests(unittest.TestCase):
             with patch.object(sys, 'argv', argv), self.assertRaises(ValueError):
                 export_prefilter.main()
             self.assertFalse((root / 'stale-export').exists())
+
+
+class VerifierEvidenceTests(unittest.TestCase):
+    def run_result(self, reward, metadata):
+        result = SimpleNamespace(reward=reward, metadata=metadata, done=True, result='verifier response')
+        class FakeEnv:
+            def __init__(self, **kwargs):
+                pass
+            async def setup(self):
+                pass
+            async def reset(self, **kwargs):
+                return SimpleNamespace(result='task'), []
+            async def step(self, call):
+                return result
+            async def close(self):
+                pass
+        env_call = lambda **kwargs: SimpleNamespace(**kwargs)
+        with patch.object(gate, '_import_env', return_value=(FakeEnv, env_call)):
+            arm = asyncio.run(gate.run_arm('task_a', '/unused', 'fake.sif', []))
+        response = SimpleNamespace(choices=[SimpleNamespace(finish_reason='stop', message=SimpleNamespace(
+            content=f'```bash\n{rollout.SUBMIT_HINT}\n```', tool_calls=None))])
+        with patch.object(rollout, '_import_env', return_value=(FakeEnv, env_call)), patch.object(rollout, 'complete', return_value=response):
+            episode = asyncio.run(rollout.run_one('task_a', '/unused', 'fake.sif', 'test', 'test', None, 2, 0))
+        return arm, episode
+
+    def test_missing_reward_is_no_evidence_in_sanity_and_rollouts(self):
+        arm, episode = self.run_result(0, {'invalid_reward': True})
+        self.assertIsNone(arm['reward'])
+        self.assertEqual(sanity.classify(arm), 'NO_REWARD')
+        self.assertEqual(episode['outcome'], 'invalid_reward')
+        status, details = export_verified.classify([episode])
+        self.assertEqual(status, 'not_evaluable')
+        self.assertEqual(details['n_no_evidence'], 1)
+
+    def test_timeout_and_infrastructure_are_never_scored_zeroes(self):
+        for metadata, sanity_status, outcome, export_status in [
+                ({'timeout': True}, 'TIMEOUT', 'timeout', 'budget_limited'),
+                ({'infrastructure_failure': True}, 'INFRA', 'infra', 'not_evaluable')]:
+            with self.subTest(metadata=metadata):
+                arm, episode = self.run_result(0, metadata)
+                self.assertEqual(sanity.classify(arm), sanity_status)
+                self.assertEqual(episode['outcome'], outcome)
+                self.assertEqual(export_verified.classify([episode])[0], export_status)
+
+    def test_actual_scored_rejection_remains_negative_evidence(self):
+        arm, episode = self.run_result(0, {})
+        self.assertEqual(sanity.classify(arm), 'ok_rejects_empty')
+        self.assertEqual(episode['outcome'], 'unsolved')
+        self.assertEqual(export_verified.classify([episode])[0], 'unverified')
+
+    def test_missing_or_nonfinite_reward_is_not_a_score_without_metadata(self):
+        for reward in [None, float('nan'), float('inf'), -1, 2]:
+            with self.subTest(reward=reward):
+                arm, episode = self.run_result(reward, {})
+                self.assertEqual(sanity.classify(arm), 'NO_REWARD')
+                self.assertEqual(episode['outcome'], 'invalid_reward')
 
 
 class PublicationTests(unittest.TestCase):

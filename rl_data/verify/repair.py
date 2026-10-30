@@ -180,7 +180,9 @@ def check_repair(repair: dict, task: dict) -> str | None:
     if action == "rewrite_verifier":
         if not test_sh.strip():
             return "rewrite_verifier with empty test_sh"
-        # A verifier that writes no reward is a harness error, not a score.
+    # Actions describe the main repair, but hybrid proposals may change both
+    # the verifier and image. Validate every supplied change independently.
+    if test_sh.strip():
         if not _REWARD_RE.search(test_sh):
             return "replacement verifier never writes /logs/verifier/reward.txt"
 
@@ -189,6 +191,9 @@ def check_repair(repair: dict, task: dict) -> str | None:
             return "remove_leak with empty setup_sh (the fix is removal from the image)"
         if not leaked:
             return "remove_leak declares no leaked_paths"
+    if setup_sh.strip() and not leaked:
+        return "image rewrite declares no leaked_paths"
+    if leaked:
         # THE caveat: never remove something the instruction tells the agent to use.
         instr_paths = _paths_in(task["instruction"])
         for p in leaked:
@@ -202,8 +207,9 @@ def check_repair(repair: dict, task: dict) -> str | None:
                 return f"setup.sh still creates {p} and never removes it"
         # A path the verifier needs must be relocated, not merely deleted.
         verifier_text = test_sh if test_sh.strip() else task["tests"]
+        verifier_paths = _paths_in(verifier_text)
         for p in leaked:
-            if p in _paths_in(verifier_text) and p not in to_tests:
+            if any(q == p or q.startswith(p + "/") for q in verifier_paths) and p not in to_tests:
                 return f"verifier still reads {p} but it is not in oracle_to_tests"
         # Relocated oracles must actually be read from the tests-side path.
         for p in to_tests:
@@ -218,7 +224,7 @@ def check_repair(repair: dict, task: dict) -> str | None:
             r"(read\(\)\s*!=|!=\s*\w*oracle\w*|byte-identical|identical copy"
             r"|sha256\w*\s*!=|md5\w*\s*!=|filecmp\.cmp)", test_sh, re.I
         )
-        removed = bool(setup_sh.strip()) or bool(to_tests)
+        removed = bool(leaked)
         if anti_copy and not removed:
             return ("relies on byte/hash inequality to defend a leak; that is "
                     "bypassable by appending a comment. Remove the file from the image.")

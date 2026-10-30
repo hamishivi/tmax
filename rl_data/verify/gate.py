@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from rollout import SUBMIT_HINT, _import_env, load_corpus  # noqa: E402
+from rollout import SUBMIT_HINT, _import_env, load_corpus, step_failure  # noqa: E402
 
 B = os.path.abspath(os.getenv("VERIFY_ROOT", "rl_data/output/verification"))
 CONTROL = f"{B}/rl15k-verify/corpus-control"
@@ -114,13 +114,24 @@ async def run_arm(task_id: str, task_data: str, image: str, cmds: list[str]) -> 
         await env.reset(task_id=task_id, image=image)
         for i, c in enumerate(cmds):
             res = await env.step(EnvCall(id=f"g{i}", name="bash", args={"command": c}))
-            meta = getattr(res, "metadata", None) or {}
-            if meta.get("sandbox_lost") or meta.get("oom_killed"):
-                out["error"] = "infra"
+            failure = step_failure(res)
+            if failure:
+                out['metadata'] = dict(getattr(res, 'metadata', None) or {})
+                out['metadata'][failure] = True
+                out['observation'] = (res.result or '')[:2500]
+                if failure == 'infra':
+                    out['error'] = 'infra'
                 return out
         res = await env.step(EnvCall(id="s", name="bash", args={"command": SUBMIT_HINT}))
-        out["reward"] = float(res.reward or 0.0)
+        out['metadata'] = dict(getattr(res, 'metadata', None) or {})
         out["observation"] = (res.result or "")[:2500]
+        failure = step_failure(res)
+        if failure:
+            out['metadata'][failure] = True
+            if failure == 'infra':
+                out['error'] = 'infra'
+        else:
+            out["reward"] = float(res.reward)
     except Exception as exc:  # noqa: BLE001
         out["error"] = f"{type(exc).__name__}: {str(exc)[:250]}"
     finally:

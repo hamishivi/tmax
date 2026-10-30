@@ -71,8 +71,10 @@ def main() -> int:
         src, fix = args.src_task_data / tid, args.fixes / tid
         item = idx[tid]
         original = originals[tid]
+        if not (src / 'tests').is_dir() or (src / 'tests').is_symlink():
+            raise ValueError(f'Tests must be a real directory: {tid}')
         for name in ('instruction.md', 'setup.sh', 'tests/test.sh'):
-            if not (src / name).is_file():
+            if not (src / name).is_file() or (src / name).is_symlink():
                 raise ValueError(f'Missing source file: {tid}/{name}')
         p = fix / 'repair.json'
         repair = json.loads(p.read_text()) if p.exists() else {}
@@ -95,21 +97,30 @@ def main() -> int:
             asset = fix / 'tests_assets' / Path(path).name
             if not asset.is_file() or not asset.stat().st_size:
                 raise ValueError(f'Missing relocated oracle: {tid}/{asset.name}')
-            assets.append(asset.name)
-        if len(assets) != len(set(assets)) or 'test.sh' in assets:
+            destination = src / 'tests' / asset.name
+            if destination.is_dir() and not destination.is_symlink():
+                raise ValueError(f'Oracle asset collides with a directory: {tid}/{asset.name}')
+            assets.append(asset)
+        names = [asset.name for asset in assets]
+        if len(names) != len(set(names)) or 'test.sh' in names:
             raise ValueError(f'Oracle basename collision: {tid}')
-        prepared.append((tid, src, fix, accepted, str(Path(image).resolve()), original))
+        prepared.append((tid, src, fix, accepted, str(Path(image).resolve()), original, assets))
         artifact_rows.append({'task_id': tid, 'verifier_repaired': bool(accepted and (fix / 'test.sh').is_file()),
                               'image_rebuilt': bool(built), 'removed_paths': paths})
     args.out.mkdir(parents=True, exist_ok=False)
     records = []
-    for tid, src, fix, accepted, image, original in prepared:
+    for tid, src, fix, accepted, image, original, assets in prepared:
         dst = args.out / 'task-data' / tid
-        shutil.copytree(src, dst)
+        shutil.copytree(src, dst, symlinks=True)
         if accepted and (fix / 'test.sh').is_file():
             shutil.copy2(fix / 'test.sh', dst / 'tests/test.sh')
-        if accepted and (fix / 'tests_assets').is_dir():
-            shutil.copytree(fix / 'tests_assets', dst / 'tests', dirs_exist_ok=True)
+        for asset in assets:
+            destination = dst / 'tests' / asset.name
+            # The original test tree may contain a link with this basename.
+            # Replace that entry rather than following it into the input tree.
+            if destination.is_symlink():
+                destination.unlink()
+            shutil.copy2(asset, destination)
         (dst / 'tests/test.sh').chmod(0o755)
         rec = dict(original)
         env = rec['env_config']

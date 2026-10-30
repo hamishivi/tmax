@@ -6,6 +6,8 @@ import hashlib
 from pathlib import Path, PurePosixPath
 import re
 import json
+import os
+import stat
 
 
 def task_id(value: str) -> str:
@@ -66,10 +68,27 @@ def corpus_fingerprints(corpus: Path) -> dict[str, str]:
         if image not in images:
             images[image] = sha256_file(image)
         root = corpus / 'task-data' / tid
-        files = {str(p.relative_to(root)): sha256_file(p)
-                 for p in sorted(root.rglob('*')) if p.is_file()}
+        for name in ('tests', 'environment', 'environment/seeds'):
+            if (root / name).is_symlink():
+                raise ValueError(f'Upload directories must be real directories: {tid}/{name}')
+        files = {}
+        for path in sorted(root.rglob('*')):
+            entry_stat = path.lstat()
+            entry = {'mode': stat.S_IMODE(entry_stat.st_mode)}
+            if stat.S_ISLNK(entry_stat.st_mode):
+                entry.update(type='symlink', target=os.readlink(path))
+            elif stat.S_ISDIR(entry_stat.st_mode):
+                entry.update(type='directory')
+            elif stat.S_ISREG(entry_stat.st_mode):
+                entry.update(type='file', sha256=sha256_file(path))
+            else:
+                raise ValueError(f'Unsupported filesystem entry: {path}')
+            files[str(path.relative_to(root))] = entry
         if not {'instruction.md', 'setup.sh', 'tests/test.sh'}.issubset(files):
             raise ValueError(f'Incomplete task: {tid}')
+        for name in ('instruction.md', 'setup.sh', 'tests/test.sh'):
+            if files[name]['type'] != 'file':
+                raise ValueError(f'Required task file must be regular: {tid}/{name}')
         payload = json.dumps({'image_sha256': images[image], 'files': files}, sort_keys=True)
         result[tid] = hashlib.sha256(payload.encode()).hexdigest()
     return result

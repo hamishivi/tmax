@@ -37,7 +37,7 @@ except ImportError:
     from image_safety import corpus_fingerprints
 
 SCORED = ("solved", "unsolved", "no_submit")
-NO_EVIDENCE = ("error", "infra", "model_declined")
+NO_EVIDENCE = ("error", "infra", "model_declined", "invalid_reward")
 
 
 def load_rollouts(dirs: list[str], expected: dict | None = None) -> dict[str, list[dict]]:
