@@ -1,38 +1,26 @@
 # TMax v1.1 evaluation rollouts
 
-Evaluation conversations for the five [released TMax v1.1 models](https://huggingface.co/collections/TMaxxx/tmax-v11), using their `main` checkpoints selected on TB-Lite. The 15 runs contain **4,095 accepted trials**, with three trials per task.
+Terminal-Bench 2.0 evaluation conversations from the Daytona runs for the five [released TMax v1.1 models](https://huggingface.co/collections/TMaxxx/tmax-v11), using their `main` checkpoints selected on TB-Lite. The five runs contain **1,335 accepted trials**: all 89 tasks, with three trials per task for each model.
 
-| Model | Training step | TB-Lite | Terminal-Bench 2.1 | Terminal-Bench 2.0 |
-|---|---:|---:|---:|---:|
-| [2B](https://huggingface.co/TMaxxx/tmax-2b-v1.1) | 400 | 17.78% | 5.30% | 6.37% |
-| [4B](https://huggingface.co/TMaxxx/tmax-4b-v1.1) | 500 | 54.27% | 24.62% | 25.09% |
-| [8B](https://huggingface.co/TMaxxx/tmax-8b-v1.1) | 500 | 17.78% | 6.44% | 8.61% |
-| [9B](https://huggingface.co/TMaxxx/tmax-9b-v1.1) | 200 | 65.62% | 29.55% | 32.96% |
-| [27B](https://huggingface.co/TMaxxx/tmax-27b-v1.1) | 400 | 76.93% | 46.21% | 43.82% |
+| Model | Training step | Terminal-Bench 2.0 |
+|---|---:|---:|
+| [2B](https://huggingface.co/TMaxxx/tmax-2b-v1.1) | 400 | 6.37% |
+| [4B](https://huggingface.co/TMaxxx/tmax-4b-v1.1) | 500 | 25.09% |
+| [8B](https://huggingface.co/TMaxxx/tmax-8b-v1.1) | 500 | 8.61% |
+| [9B](https://huggingface.co/TMaxxx/tmax-9b-v1.1) | 200 | 32.96% |
+| [27B](https://huggingface.co/TMaxxx/tmax-27b-v1.1) | 400 | 43.82% |
 
 The teaser's 2B and 27B Terminal-Bench 2.0 scores come from separate evaluations that preserve thinking; the 27B teaser evaluation uses step 200. This table and the conversations here cover the released main checkpoints.
 
-These runs use Vanillux 0.2.3: Sandfleet for TB-Lite and Terminal-Bench 2.1, and Daytona for Terminal-Bench 2.0. TB-Lite has 96 tasks, Terminal-Bench 2.1 has 88 tasks (`configure-git-webserver` excluded), and Terminal-Bench 2.0 has 89 tasks. Terminal-Bench 2.0 agent-timeout attempts were retired and rerun at concurrency four.
+These runs use Vanillux 0.2.3 with the Daytona backend. Agent-timeout attempts were retired and rerun at concurrency four; only accepted scoring trials are included.
 
-## Task coverage and exclusions
+## Task coverage
 
-The following exclusions apply consistently to all five released models within each benchmark:
-
-| Benchmark | Excluded task | Reason |
-|---|---|---|
-| TB-Lite | `acl-permissions-inheritance` | Deferred before evaluation and absent from the prepared source snapshot. |
-| TB-Lite | `etl_checkpoint_resume_bug` | PostgreSQL could not start as its service account in the sandbox, including when running the reference solution; no verifier reward was produced. |
-| TB-Lite | `sales-data-csv-analysis` | The image's working directory was inaccessible under the sandbox's user mapping, so startup failed before agent execution. |
-| TB-Lite | `mlflow-register` | The background MLflow server encountered IPC failures and artifact-upload hangs under the sandbox's fakeroot runtime. |
-| Terminal-Bench 2.1 | `configure-git-webserver` | OpenSSH could not perform the irreversible privilege drop required by its privilege-separation checks in this sandbox; the reference solution also failed. |
-
-**Terminal-Bench 2.0 includes all 89 tasks**, including `configure-git-webserver`, using the Daytona backend. That task's exclusion applies only to the Terminal-Bench 2.1 runs above.
-
-Scores and standard errors use the retained task sets: **96 TB-Lite tasks, 88 Terminal-Bench 2.1 tasks, and 89 Terminal-Bench 2.0 tasks**, with three trials per task. Excluded tasks are omitted from the score denominator.
+All **89 Terminal-Bench 2.0 tasks** are included for every model, including `configure-git-webserver`; no tasks were excluded. Each model has **267 trials**, and scores and standard errors use the full 89-task set. This archive contains only the Daytona Terminal-Bench 2.0 runs.
 
 ## Archive contents
 
-Each `tmax-{size}b/` directory contains `tb-lite/`, `terminal-bench-2.1/`, and `terminal-bench-2.0/`. A benchmark directory has a `summary.json` and one directory per accepted trial:
+The `daytona/` directory groups the runs by model, following the v1.0 archive layout. Each `daytona/tmax-{size}b/terminal-bench-2-0/` directory has a `summary.json` and one directory per accepted trial:
 
 - `agent/trajectory.json`: conversation messages and tool calls.
 - `agent/usage.json`: token usage, cost, and step limit recorded by the harness.
