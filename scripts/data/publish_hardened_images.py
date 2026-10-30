@@ -27,7 +27,8 @@ from urllib.parse import urljoin
 import requests
 
 REGISTRY = "https://registry-1.docker.io"
-SOURCE = "TMaxxx/tmax-13k-v1.1-metadata"
+# This historical revision belongs to the original source repository.
+SOURCE = "wAI-org/swerl-tmax-15k-hardened-prefilter"
 SOURCE_REVISION = "6f62db2f3ed0b1ebf386de2009a3d649d13e5616"
 POOL = "TMaxxx/tmax-image-pool"
 POOL_REVISION = "0c4e432c59f9fb7daa7c58dcc43bf31a75230cc8"
