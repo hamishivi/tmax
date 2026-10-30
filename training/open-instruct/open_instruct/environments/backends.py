@@ -621,6 +621,8 @@ class ApptainerBackend(SandboxBackend):
 
     def start(self) -> None:
         self._ensure_binary()
+        # Environment resets can replace the image after construction.
+        self._image = _normalize_apptainer_image(self._image)
         # Stop any previous instance before starting a new one (supports the
         # "close then start" pattern used in SWERLSandboxEnv._do_reset).
         if self._name is not None:

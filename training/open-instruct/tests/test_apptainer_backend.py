@@ -174,6 +174,25 @@ class TestStartAndClose(unittest.TestCase):
         with patch("open_instruct.environments.backends.subprocess.run", side_effect=fake):
             backend.close()
 
+    def test_restart_normalizes_replacement_image(self):
+        fake = _FakeApptainer()
+        backend = _started_backend(fake)
+        with (
+            patch("open_instruct.environments.backends.subprocess.run", side_effect=fake),
+            patch("open_instruct.environments.backends.shutil.which", return_value="/usr/bin/apptainer"),
+        ):
+            try:
+                # Environment reset replaces the image before reusing the backend.
+                backend._image = "example/replacement:latest"
+                backend.restart()
+                starts = [
+                    call["argv"] for call in fake.calls if call["argv"][:3] == ["apptainer", "instance", "start"]
+                ]
+                self.assertEqual(len(starts), 2)
+                self.assertIn("docker://example/replacement:latest", starts[-1])
+            finally:
+                backend.close()
+
 
 class TestRunCommand(unittest.TestCase):
     def test_run_command_wraps_with_timeout_and_bash(self):
