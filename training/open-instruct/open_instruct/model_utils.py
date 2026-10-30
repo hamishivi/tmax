@@ -32,6 +32,7 @@ import transformers
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState
 from deepspeed.runtime.engine import DeepSpeedEngine
+from deepspeed.runtime.zero import GatheredParameters
 from huggingface_hub import HfApi
 from olmo_core.nn.attention import AttentionBackendName
 from rich import print as rprint
@@ -235,6 +236,19 @@ def disable_dropout_in_model(model: torch.nn.Module) -> None:
             module.p = 0
 
 
+class ReferencePolicyCorruption(RuntimeError):
+    """Raised when a reference-policy load failed AFTER it began mutating model state.
+
+    Pre-mutation rejection is safe to fall back from: nothing was touched, so the
+    base reference is genuinely what the model holds. A failure DURING application
+    is not -- load_state_dict copies tensors as it walks the module tree and can
+    still raise afterwards (incompatible layout, a load hook), leaving a mix of
+    saved and base weights that the outer handler would report as "base reference".
+    This is fatal on every rank so execution never continues on a purported base
+    reference that is actually a hybrid.
+    """
+
+
 def maybe_load_checkpoint(
     model: torch.nn.Module, checkpoint_path: str, device: torch.device, rank: int, throw_on_error: bool = True
 ) -> None:
@@ -249,18 +263,115 @@ def maybe_load_checkpoint(
     """
 
     def _load_checkpoint(path: str, dev: torch.device):
-        state_dict = torch.load(path, map_location=dev)
-        if hasattr(model, "module"):
-            # Needed if wrapped by DeepSpeed.
-            model.module.load_state_dict(state_dict)
+        # Every rank reads independently, so one rank hitting an I/O or
+        # deserialization error would take the outer fallback and return while the
+        # others entered GatheredParameters and blocked until walltime. Agree on the
+        # read BEFORE any collective: all_gather_object is itself collective and
+        # every rank enters it regardless of its own result, so there is no path
+        # where the ranks disagree about whether to proceed.
+        state_dict = None
+        read_error: str | None = None
+        try:
+            state_dict = torch.load(path, map_location=dev)
+        except Exception as e:
+            read_error = f"{type(e).__name__}: {e}"
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            gathered_errors: list[str | None] = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered_errors, read_error)
+            failed = [(i, e) for i, e in enumerate(gathered_errors) if e is not None]
+            if failed:
+                raise RuntimeError(f"reference policy read failed on rank(s) {[i for i, _ in failed]}: {failed[0][1]}")
+        elif read_error is not None:
+            raise RuntimeError(f"reference policy read failed: {read_error}")
+
+        inner = model.module if hasattr(model, "module") else model
+
+        # Under ZeRO-3 the DESTINATION parameters are partitioned and read as
+        # torch.Size([0]) until gathered, so a plain load_state_dict is wrong in two
+        # different directions, both measured on 2 ranks 2026-09-15:
+        #   - a correctly gathered artifact raises RuntimeError on every shape; and
+        #   - a sharded artifact whose tensors are ALSO [0] matches, loads with NO
+        #     error, and copies nothing -- a silent no-op reference.
+        # Production only ever saw the first because a few small tensors escape
+        # partitioning and trip the mismatch. Gather before loading so neither holds.
+        partitioned = any(getattr(p, "ds_status", None) is not None or p.numel() == 0 for p in inner.parameters())
+        if partitioned:
+            params = list(inner.parameters())
+            load_error: str | None = None
+            mutation_started = False
+            with GatheredParameters(params, modifier_rank=0):
+                if rank == 0:
+                    # NOTHING may raise inside this block. GatheredParameters.__exit__
+                    # is collective: if rank 0 leaves early via an exception, every
+                    # other rank blocks there forever. Measured -- an earlier version
+                    # of this patch let a shape-mismatch RuntimeError escape here and
+                    # the 2-rank test deadlocked at 420 s instead of failing.
+                    try:
+                        # VALIDATE THE WHOLE ARTIFACT BEFORE MUTATING ANYTHING.
+                        # load_state_dict copies every shape-matching tensor as it
+                        # walks the tree and only raises at the end, so a mixed
+                        # valid/invalid artifact would leave the reference partially
+                        # overwritten -- and GatheredParameters would then propagate
+                        # those writes to all ranks. Reference shapes come from the
+                        # model's own state_dict, which under this context manager is
+                        # full-size on rank 0 and already excludes non-persistent
+                        # buffers.
+                        ref = inner.state_dict()
+                        problems: list[str] = []
+                        for k, v in state_dict.items():
+                            if k not in ref:
+                                problems.append(f"unexpected:{k}")
+                            elif tuple(v.shape) != tuple(ref[k].shape):
+                                problems.append(f"shape:{k}{tuple(v.shape)}!={tuple(ref[k].shape)}")
+                        problems += [f"missing:{k}" for k in ref if k not in state_dict]
+                        if problems:
+                            load_error = (
+                                f"reference policy artifact rejected before load; "
+                                f"{len(problems)} problems, first 5: {problems[:5]}"
+                            )
+                        else:
+                            # from here on, state may have been written
+                            mutation_started = True
+                            inner.load_state_dict(state_dict)
+                    except Exception as e:
+                        load_error = f"reference policy load failed: {type(e).__name__}: {e}"
+            # Only rank 0 can see the result, but every rank must reach the same
+            # verdict -- otherwise rank>0 returns "loaded" while rank 0 raises, and
+            # the ranks diverge into the next collective. Caught by the 2-rank test:
+            # rank 1 reported a silent accept for a load rank 0 had rejected.
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                payload = [load_error, mutation_started]
+                torch.distributed.broadcast_object_list(payload, src=0)
+                load_error, mutation_started = payload[0], payload[1]
+            if load_error is not None:
+                if mutation_started:
+                    # unsafe to continue: the model is a hybrid of saved and base
+                    raise ReferencePolicyCorruption(
+                        f"{load_error} -- failure occurred AFTER mutation began; "
+                        f"model state is neither the saved reference nor the base"
+                    )
+                raise RuntimeError(load_error)
+
+            # GatheredParameters synchronises PARAMETERS only. Ordinary registered
+            # buffers loaded on rank 0 would stay stale on every other rank, giving a
+            # reference policy that differs by rank. Broadcast them explicitly; this
+            # is collective, so it runs on all ranks and only after we know the load
+            # succeeded everywhere.
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                for _, buf in inner.named_buffers():
+                    if buf is not None and buf.numel() > 0:
+                        torch.distributed.broadcast(buf.data, src=0)
         else:
-            # If a vanilla HF model.
-            model.load_state_dict(state_dict)
+            inner.load_state_dict(state_dict)
         logger.info(f"{rank=}: Loaded checkpoint from {path}")
 
     if not throw_on_error:
         try:
             _load_checkpoint(checkpoint_path, device)
+        except ReferencePolicyCorruption:
+            # never swallowed -- falling back here would log "base reference" over a
+            # model that is actually a partially overwritten hybrid
+            raise
         except Exception as e:
             logger.error(
                 f"{rank=}: Falling back to using base reference, Failed to load checkpoint from {checkpoint_path}: {e}"

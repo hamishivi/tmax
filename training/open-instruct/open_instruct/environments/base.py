@@ -57,6 +57,27 @@ class RLEnvironment(ABC):
         """Optional message to continue a rollout after malformed/missing tool calls."""
         return None
 
+    def get_grading_deadline(self) -> float | None:
+        """Wall-clock seconds the caller must allow a submission/grading step, or None.
+
+        Grading is not an ordinary tool call: it runs the task's verifier, whose budget is
+        a property of the task rather than of the agent's turn. An env that returns a
+        value here is telling the rollout loop "do not apply the ordinary tool-call
+        timeout to a submission step" -- without it, the caller abandons the grader
+        mid-run and the reward is lost to a step timeout rather than to the policy.
+        None keeps the ordinary tool-call timeout, which is the behaviour for every env
+        that does not grade.
+        """
+        return None
+
+    def get_submit_markers(self) -> tuple[str, ...]:
+        """Substrings in a tool call that mean "this call will trigger grading".
+
+        Returned to the rollout loop so it can recognise a submission cheaply and locally,
+        instead of a remote round-trip per step or a second copy of the marker constant.
+        """
+        return ()
+
     async def setup(self) -> None:
         """Called once at start of training for resource initialization."""
         return

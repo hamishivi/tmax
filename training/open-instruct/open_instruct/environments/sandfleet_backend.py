@@ -1,0 +1,431 @@
+"""Remote sandbox backend for the Sandfleet Slurm service."""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import random
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
+
+from docker import errors as docker_errors
+from docker import utils as docker_utils
+
+from open_instruct.environments.backend_base import ExecutionResult, SandboxBackend, SandboxLostError, SandboxOOMError
+
+_API_VERSION = "v1"
+_MAX_REQUEST_BYTES = 64 * 1024 * 1024
+_MIB = 1024 * 1024
+_SANDBOX_CPUS = 2
+_REQUEST_TIMEOUT_SECONDS = 300
+_ACQUIRE_TIMEOUT_SECONDS = 900
+_RETRY_WINDOW_SECONDS = 60
+_RETRY_INITIAL_DELAY_SECONDS = 0.5
+_RETRY_MAX_DELAY_SECONDS = 5
+_RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 502, 503, 504})
+_REMOTE_ERRORS: dict[str, type[Exception]] = {
+    "FileNotFoundError": FileNotFoundError,
+    "IsADirectoryError": IsADirectoryError,
+    "SandboxLostError": SandboxLostError,
+    "SandboxOOMError": SandboxOOMError,
+    "ValueError": ValueError,
+}
+
+
+def _memory_limit_mb(mem_limit: str | int) -> int:
+    try:
+        memory_bytes = docker_utils.parse_bytes(mem_limit)
+    except (TypeError, ValueError, docker_errors.DockerException) as error:
+        raise ValueError(f"Invalid mem_limit {mem_limit!r}") from error
+    memory_mb = (memory_bytes + _MIB - 1) // _MIB
+    if memory_mb < 64:
+        raise ValueError("mem_limit must be at least 64 MiB for Sandfleet")
+    return memory_mb
+
+
+def _sleep_before_retry(deadline: float, delay: float) -> float | None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    time.sleep(min(delay * random.uniform(0.9, 1.1), remaining))
+    return min(_RETRY_MAX_DELAY_SECONDS, delay * 2)
+
+
+class SandfleetBackend(SandboxBackend):
+    """Lease a sandbox from Sandfleet and expose the normal backend contract."""
+
+    def __init__(
+        self,
+        image: str = "python:3.12-slim",
+        timeout: int = 1800,
+        mem_limit: str | int = "4g",
+        pwd: str = "/workspace",
+        extra_start_flags: tuple[str, ...] = (),
+    ):
+        self._image = image
+        self._timeout = timeout
+        self._pwd = pwd
+        self._extra_start_flags = tuple(extra_start_flags)
+        self._url = os.getenv("SANDFLEET_URL", "").rstrip("/")
+        self._pool = os.getenv("SANDFLEET_POOL") or None
+        self._resources = (
+            None if self._pool is not None else {"cpus": _SANDBOX_CPUS, "memory_mb": _memory_limit_mb(mem_limit)}
+        )
+        self._token = os.getenv("SANDFLEET_CLIENT_TOKEN", "")
+        self._request_timeout = _REQUEST_TIMEOUT_SECONDS
+        self._acquire_timeout = _ACQUIRE_TIMEOUT_SECONDS
+
+        self._lease_id: str | None = None
+        self._lease_token: str | None = None
+        self._agent_url: str | None = None
+        self._worker_metadata: dict[str, Any] = {}
+        self._sandfleet_status: dict[str, Any] = {}
+        self._name: str | None = None
+        self._lease_ttl_seconds = 0
+        self._renew_stop = threading.Event()
+        self._renew_thread: threading.Thread | None = None
+        self._renewal_error: Exception | None = None
+
+    def _controller_url(self) -> str:
+        registry = os.getenv("SANDFLEET_REGISTRY")
+        if not registry:
+            return self._url
+        try:
+            payload = json.loads(Path(registry).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return self._url
+        if not isinstance(payload, dict) or not isinstance(payload.get("url"), str):
+            raise ValueError("Sandfleet registry must contain a string URL")
+        url = payload["url"]
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("Invalid Sandfleet registry URL")
+        return url.rstrip("/")
+
+    def _ensure_configured(self) -> None:
+        self._url = self._controller_url()
+        if not self._url:
+            raise RuntimeError("Sandfleet service URL is unset; set SANDFLEET_URL")
+        if not self._token:
+            raise RuntimeError("Sandfleet client token is unset")
+
+    @staticmethod
+    def _decode_error(error: HTTPError) -> tuple[str, str]:
+        raw = error.read()
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            payload = {}
+        detail = payload.get("error", {})
+        return detail.get("type", "RuntimeError"), detail.get(
+            "message", f"Sandfleet request failed with HTTP {error.code}"
+        )
+
+    @staticmethod
+    def _raise_remote_error(error_type: str, message: str, *, cause: Exception) -> None:
+        exception = _REMOTE_ERRORS.get(error_type)
+        if exception is not None:
+            raise exception(message) from cause
+        raise RuntimeError(f"Sandfleet {error_type}: {message}") from cause
+
+    def _request(
+        self,
+        base_url: str,
+        path: str,
+        *,
+        token: str,
+        method: str = "GET",
+        payload: dict[str, Any] | None = None,
+        timeout: float | None = None,
+        retry: bool | None = None,
+        controller: bool = False,
+        retry_window: float = _RETRY_WINDOW_SECONDS,
+        stop: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        body = None if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        if body is not None and len(body) > _MAX_REQUEST_BYTES:
+            raise ValueError(f"Sandfleet request exceeds {_MAX_REQUEST_BYTES} bytes")
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        retry = method in {"GET", "DELETE"} if retry is None else retry
+        retry_deadline = time.monotonic() + retry_window
+        delay = _RETRY_INITIAL_DELAY_SECONDS
+        while True:
+            if stop is not None and stop.is_set():
+                raise InterruptedError("Controller request stopped")
+            current_url = self._controller_url() if controller else base_url
+            request = Request(current_url.rstrip("/") + path, data=body, headers=headers, method=method)
+            try:
+                request_timeout = self._request_timeout if timeout is None else timeout
+                if retry and controller:
+                    request_timeout = min(request_timeout, max(0.001, retry_deadline - time.monotonic()))
+                with urlopen(request, timeout=request_timeout) as response:  # noqa: S310
+                    raw = response.read()
+                    return json.loads(raw) if raw else {}
+            except HTTPError as error:
+                if retry and error.code in _RETRYABLE_HTTP_STATUSES:
+                    next_delay = _sleep_before_retry(retry_deadline, delay)
+                    if next_delay is not None:
+                        error.close()
+                        delay = next_delay
+                        continue
+                error_type, message = self._decode_error(error)
+                self._raise_remote_error(error_type, message, cause=error)
+            except OSError as error:
+                refused = isinstance(getattr(error, "reason", error), ConnectionRefusedError)
+                if retry or (controller and refused):
+                    next_delay = _sleep_before_retry(retry_deadline, delay)
+                    if next_delay is not None:
+                        delay = next_delay
+                        continue
+                reason = error.reason if isinstance(error, URLError) else str(error)
+                raise ConnectionError(f"Could not reach Sandfleet endpoint {base_url!r}: {reason}") from error
+
+    def _agent_request(
+        self,
+        operation: str,
+        *,
+        method: str = "POST",
+        payload: dict[str, Any] | None = None,
+        timeout: float | None = None,
+        retry: bool | None = None,
+    ) -> dict[str, Any]:
+        if self._lease_id is None or self._lease_token is None or self._agent_url is None:
+            raise RuntimeError("Sandfleet lease is not active. Call start() first.")
+        if self._renewal_error is not None:
+            raise SandboxLostError(f"Sandfleet lease renewal failed: {self._renewal_error}") from self._renewal_error
+        try:
+            return self._request(
+                self._agent_url,
+                f"/{_API_VERSION}/leases/{self._lease_id}/{operation}",
+                token=self._lease_token,
+                method=method,
+                payload=payload,
+                timeout=timeout,
+                retry=retry,
+            )
+        except ConnectionError as error:
+            reason = str(error)
+            try:
+                status = self._request(
+                    self._url,
+                    f"/{_API_VERSION}/leases/{self._lease_id}",
+                    controller=True,
+                    token=self._token,
+                    timeout=self._request_timeout,
+                )
+                reason = status.get("lost_reason") or reason
+            except Exception as controller_error:
+                error.add_note(f"Controller could not explain the lost agent connection: {controller_error}")
+            raise SandboxLostError(reason) from error
+
+    def _acquire(self) -> dict[str, Any]:
+        deadline = time.monotonic() + self._acquire_timeout
+        selection = {"pool": self._pool} if self._resources is None else {"resources": self._resources}
+        result = self._request(
+            self._url,
+            f"/{_API_VERSION}/lease-requests",
+            controller=True,
+            token=self._token,
+            method="POST",
+            payload={**selection, "timeout_seconds": self._acquire_timeout},
+        )
+        request_id = str(result["request_id"])
+        delay = max(0.0, float(result["poll_after_seconds"]))
+        try:
+            while result["status"] == "pending":
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Timed out waiting for Sandfleet selection {selection!r}")
+                base_delay = max(delay, float(result["poll_after_seconds"]))
+                time.sleep(min(base_delay * random.uniform(0.9, 1.1), remaining))
+                delay = min(10.0, max(0.1, base_delay * 1.5))
+                result = self._request(
+                    self._url, f"/{_API_VERSION}/lease-requests/{request_id}", token=self._token, controller=True
+                )
+            if result["status"] != "assigned":
+                raise TimeoutError(result["error"] or f"Could not acquire from Sandfleet selection {selection!r}")
+            return result["lease"]
+        except Exception as error:
+            try:
+                self._request(
+                    self._url,
+                    f"/{_API_VERSION}/lease-requests/{request_id}",
+                    token=self._token,
+                    method="DELETE",
+                    controller=True,
+                )
+            except Exception as cleanup_error:
+                error.add_note(f"Could not cancel Sandfleet lease request {request_id}: {cleanup_error}")
+            raise
+
+    def _renew_once(self) -> None:
+        lease_id = self._lease_id
+        if lease_id is None:
+            return
+        self._request(
+            self._url,
+            f"/{_API_VERSION}/leases/{lease_id}/renew",
+            controller=True,
+            token=self._token,
+            method="POST",
+            payload={},
+            retry=True,
+            timeout=10,
+            retry_window=min(300.0, self._lease_ttl_seconds / 2) if self._lease_ttl_seconds else 300,
+            stop=self._renew_stop,
+        )
+
+    def _renew_loop(self) -> None:
+        interval = max(0.1, min(30.0, self._lease_ttl_seconds / 3))
+        while not self._renew_stop.wait(interval * random.uniform(0.9, 1.1)):
+            try:
+                self._renew_once()
+            except InterruptedError:
+                return
+            except Exception as error:
+                self._renewal_error = error
+                return
+
+    def _start_renewal(self, ttl_seconds: int) -> None:
+        self._lease_ttl_seconds = ttl_seconds
+        self._renewal_error = None
+        self._renew_stop.clear()
+        if ttl_seconds <= 0:
+            return
+        self._renew_thread = threading.Thread(
+            target=self._renew_loop, name=f"sandfleet-renew-{str(self._lease_id)[:8]}", daemon=True
+        )
+        self._renew_thread.start()
+
+    def _start_payload(self) -> dict[str, Any]:
+        return {
+            "image": self._image,
+            "timeout": self._timeout,
+            "pwd": self._pwd,
+            "extra_start_flags": list(self._extra_start_flags),
+        }
+
+    def start(self) -> None:
+        self._ensure_configured()
+        if self._lease_id is not None:
+            self.close()
+        lease = self._acquire()
+        self._lease_id = lease["lease_id"]
+        self._lease_token = lease["lease_token"]
+        self._agent_url = lease["agent_url"]
+        self._start_renewal(int(lease["ttl_seconds"]))
+        try:
+            result = self._agent_request("start", payload=self._start_payload(), timeout=max(1800, self._timeout + 60))
+        except Exception as error:
+            try:
+                self.close()
+            except Exception as close_error:
+                error.add_note(f"Sandfleet lease release also failed: {close_error}")
+            raise
+        self._name = result["instance_name"]
+        self._worker_metadata = result["cgroup"]
+        self._sandfleet_status = result
+
+    def restart(self) -> None:
+        if self._lease_id is None:
+            self.start()
+            return
+        result = self._agent_request("restart", payload=self._start_payload(), timeout=max(1800, self._timeout + 60))
+        self._name = result["instance_name"]
+        self._worker_metadata = result["cgroup"]
+        self._sandfleet_status = result
+
+    def run_command(self, command: str, timeout: int | None = None) -> ExecutionResult:
+        effective_timeout = self._timeout if timeout is None else timeout
+        command_id = uuid.uuid4().hex
+        try:
+            result = self._agent_request(
+                "exec",
+                payload={"command": command, "timeout": timeout, "command_id": command_id},
+                timeout=effective_timeout + 30,
+            )
+        except BaseException as error:
+            # A failed/interrupted client request must not leave this command
+            # executing. The separate control route bypasses the exec lock.
+            try:
+                cancellation = self._request(
+                    self._agent_url,
+                    f"/{_API_VERSION}/leases/{self._lease_id}/exec-cancel",
+                    token=self._lease_token,
+                    method="POST",
+                    payload={"command_id": command_id},
+                    timeout=30,
+                    retry=False,
+                )
+                if cancellation.get("error") or cancellation["state"] not in {
+                    "pending",
+                    "running",
+                    "already_finished",
+                }:
+                    raise RuntimeError(f"Command cancellation failed: {cancellation}")
+                if cancellation["state"] == "running" and not cancellation["interrupted"]:
+                    raise RuntimeError("Sandfleet could not interrupt the command")
+            except Exception as cancel_error:
+                # Keep typed worker-loss/OOM exceptions visible to the environment;
+                # cancellation commonly fails because that same worker is gone.
+                error.add_note(f"Sandfleet command cancellation also failed: {cancel_error}")
+            raise
+        raw_timed_out = result.get("timed_out")
+        return ExecutionResult(
+            stdout=str(result["stdout"]),
+            stderr=str(result["stderr"]),
+            exit_code=int(result["exit_code"]),
+            timed_out=None if raw_timed_out is None else bool(raw_timed_out),
+        )
+
+    def write_file(self, path: str, content: str | bytes) -> None:
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+        self._agent_request(
+            "write-file", payload={"path": path, "content_b64": base64.b64encode(content).decode("ascii")}, timeout=120
+        )
+
+    def read_file(self, path: str, binary: bool = False) -> str | bytes:
+        result = self._agent_request("read-file", payload={"path": path}, timeout=120, retry=True)
+        content = base64.b64decode(result["content_b64"].encode("ascii"), validate=True)
+        return content if binary else content.decode("utf-8", errors="replace")
+
+    def put_archive(self, root: str, tar_bytes: bytes) -> None:
+        self._agent_request(
+            "put-archive",
+            payload={"root": root, "content_b64": base64.b64encode(tar_bytes).decode("ascii")},
+            timeout=300,
+        )
+
+    def close(self) -> None:
+        lease_id = self._lease_id
+        self._renew_stop.set()
+        if self._renew_thread is not None:
+            self._renew_thread.join(timeout=16)
+            self._renew_thread = None
+        if lease_id is not None:
+            self._request(
+                self._url,
+                f"/{_API_VERSION}/leases/{lease_id}",
+                controller=True,
+                token=self._token,
+                method="DELETE",
+                timeout=max(120, self._request_timeout),
+            )
+        self._lease_id = None
+        self._lease_token = None
+        self._agent_url = None
+        self._name = None
+        self._worker_metadata = {}
+        self._sandfleet_status = {}
+        self._lease_ttl_seconds = 0
+        self._renewal_error = None

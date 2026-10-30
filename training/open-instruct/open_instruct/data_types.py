@@ -9,6 +9,16 @@ class ShutdownSentinel:
     """Sentinel value to signal thread shutdown via queue."""
 
 
+@dataclass(frozen=True)
+class FatalGenerationError:
+    """Unrecoverable background generation failure sent to the trainer."""
+
+    request_id: str
+    error_type: str
+    message: str
+    traceback: str
+
+
 @dataclass
 class TokenStatistics:
     """Container for token statistics from inference."""

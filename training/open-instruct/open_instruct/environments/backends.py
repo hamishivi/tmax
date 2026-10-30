@@ -13,12 +13,24 @@ import subprocess
 import tarfile
 import time
 import uuid
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
 
 import docker as docker_sdk
 
 from open_instruct import logger_utils
+from open_instruct.environments.backend_base import ExecutionResult, SandboxBackend, SandboxLostError, SandboxOOMError
+from open_instruct.environments.sandfleet_backend import SandfleetBackend
+
+__all__ = [
+    "ApptainerBackend",
+    "DockerBackend",
+    "ExecutionResult",
+    "SandboxBackend",
+    "SandboxLostError",
+    "SandboxOOMError",
+    "SandfleetBackend",
+    "create_backend",
+    "is_docker_host_connectivity_error",
+]
 
 logger = logger_utils.setup_logger(__name__)
 
@@ -107,56 +119,6 @@ class _FileSlotSemaphore:
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             handle.close()
-
-
-@dataclass
-class ExecutionResult:
-    """Result from code or command execution."""
-
-    stdout: str
-    stderr: str
-    exit_code: int
-
-
-class SandboxOOMError(RuntimeError):
-    """Raised when the sandbox container was killed by the OOM reaper.
-
-    Callers should treat this as a terminal condition for the current
-    episode (reward 0, done=True) rather than retrying, because the
-    agent's next command will almost certainly trip the same limit.
-    """
-
-
-class SandboxBackend(ABC):
-    """Abstract interface for code/command execution backends."""
-
-    @abstractmethod
-    def start(self) -> None:
-        """Initialize the sandbox. Must be called before other operations."""
-
-    @abstractmethod
-    def run_command(self, command: str, timeout: int | None = None) -> ExecutionResult:
-        """Execute a shell command in the sandbox."""
-
-    @abstractmethod
-    def write_file(self, path: str, content: str | bytes) -> None:
-        """Write a file to the sandbox filesystem."""
-
-    @abstractmethod
-    def read_file(self, path: str, binary: bool = False) -> str | bytes:
-        """Read a file from the sandbox filesystem."""
-
-    @abstractmethod
-    def put_archive(self, root: str, tar_bytes: bytes) -> None:
-        """Extract a tar archive inside the sandbox, rooted at ``root``.
-
-        ``tar_bytes`` is the raw bytes of a tar archive whose entries are
-        interpreted as paths relative to ``root`` inside the sandbox.
-        """
-
-    @abstractmethod
-    def close(self) -> None:
-        """Cleanup sandbox resources."""
 
 
 class DockerBackend(SandboxBackend):
@@ -774,7 +736,7 @@ def create_backend(backend_type: str, **kwargs) -> SandboxBackend:
     """Factory function to create a sandbox backend.
 
     Args:
-        backend_type: ``"docker"`` or ``"apptainer"``.
+        backend_type: ``"docker"``, ``"apptainer"``, or ``"sandfleet"``.
         **kwargs: Backend-specific arguments.
 
     Returns:
@@ -784,4 +746,6 @@ def create_backend(backend_type: str, **kwargs) -> SandboxBackend:
         return DockerBackend(**kwargs)
     if backend_type == "apptainer":
         return ApptainerBackend(**kwargs)
-    raise ValueError(f"Unknown backend type: {backend_type}. Supported: 'docker', 'apptainer'.")
+    if backend_type == "sandfleet":
+        return SandfleetBackend(**kwargs)
+    raise ValueError(f"Unknown backend type: {backend_type}. Supported: 'docker', 'apptainer', 'sandfleet'.")

@@ -189,3 +189,9 @@ If you use this codebase or models in your research, please cite our paper:
       url={https://arxiv.org/abs/2606.23321}, 
 }
 ```
+
+## Training and evaluation implementation
+
+See [training and sandbox behavior](docs/training-fixes.md) and
+[offline evaluation dependency repairs](eval-repairs/README.md) for the portable
+training implementation and evaluation preparation tools.

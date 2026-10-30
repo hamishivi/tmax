@@ -1,0 +1,111 @@
+diff --git a/sandfleet/step_worker.py b/sandfleet/step_worker.py
+index 50d53bf..3651abf 100644
+--- a/sandfleet/step_worker.py
++++ b/sandfleet/step_worker.py
+@@ -687,6 +687,11 @@ class ApptainerInstance:
+         return self._command_pidfile(command_id) + ".stop"
+
+     def _wrap_for_in_instance_cancel(self, command_id: str, wrapped: str) -> str:
++        return "exec " + shlex.join(
++            self._argv_for_in_instance_cancel(command_id, wrapped)
++        )
++
++    def _argv_for_in_instance_cancel(self, command_id: str, wrapped: str) -> list[str]:
+         # Run the command in its own in-container session (setsid => the shell is
+         # a session/group leader, pgid == its pid) and publish that in-namespace
+         # pgid atomically before exec'ing the command. A cancel that lands before
+@@ -706,7 +711,7 @@ class ApptainerInstance:
+         # setsid -w: the child bash is the new session/group leader ($$ == pgid),
+         # and -w makes setsid WAIT and propagate its exit status (plain setsid
+         # forks and returns 0 immediately, which would break capture).
+-        return f"exec setsid -w bash -c {shlex.quote(inner)}"
++        return ["setsid", "-w", "bash", "-c", inner]
+
+     def cancel_command_group(self, command_id: str) -> tuple[bool, str | None]:
+         """Kill a command's in-container process group inside the instance.
+@@ -848,17 +853,30 @@ class ApptainerInstance:
+                 f"timeout --signal=TERM --kill-after=10 {shlex.quote(str(effective_timeout))} "
+                 f"bash -c {shlex.quote(command)}"
+             )
++        argv = ["bash", "-c", wrapped]
+         if command_id is not None and self.uses_pid_namespace:
+             # PID-namespace instance: publish the in-namespace pgid so the cancel
+             # path can reap descendants a host killpg cannot reach.
+-            wrapped = self._wrap_for_in_instance_cancel(str(command_id), wrapped)
++            # Pass the launch script directly: another shell-quoting layer can
++            # exceed Linux's per-argument limit for valid, quote-heavy commands.
++            command_argv = ["bash", "-c", command]
++            if not worker_deadline:
++                command_argv = [
++                    "timeout",
++                    "--signal=TERM",
++                    "--kill-after=10",
++                    str(effective_timeout),
++                    *command_argv,
++                ]
++            argv = self._argv_for_in_instance_cancel(str(command_id), '"$@"')
++            argv.extend(["bash", *command_argv])
+         # Command output is capped HERE, not in the shared exec path.
+         # +1 so the existing output_truncated comparison still fires.
+         options = {} if env is None else {"command_env": validate_command_env(env)}
+         if on_complete is not None:
+             options["on_complete"] = on_complete
+         result = self.exec(
+-            ["bash", "-c", wrapped],
++            argv,
+             max_capture=MAX_OUTPUT_BYTES + 1,
+             on_start=on_start,
+             **options,
+diff --git a/tests/test_step_worker_cancel.py b/tests/test_step_worker_cancel.py
+index b97f88f..6acd540 100644
+--- a/tests/test_step_worker_cancel.py
++++ b/tests/test_step_worker_cancel.py
+@@ -471,8 +471,8 @@ def test_default_tmpfs_command_publishes_in_namespace_cancellation_identity(
+     monkeypatch.setattr(inst, "exec", fake_exec)
+     result = inst.run_command("sleep 30", 30, command_id="tmpfs-command")
+     assert result["exit_code"] == 0
+-    assert "setsid -w" in captured["argv"][-1]
+-    assert inst._command_pidfile("tmpfs-command") in captured["argv"][-1]
++    assert captured["argv"][:4] == ["setsid", "-w", "bash", "-c"]
++    assert inst._command_pidfile("tmpfs-command") in captured["argv"][4]
+
+
+ def test_cancel_command_group_absent_pidfile_fails_loud_not_gone(monkeypatch):
+@@ -763,3 +763,37 @@ def test_capture_process_returns_despite_background_pipe_holder():
+
+ if __name__ == "__main__":
+     raise SystemExit(pytest.main([__file__, "-v"]))
++
++
++def test_quote_heavy_command_avoids_outer_argument_expansion(monkeypatch):
++    import shlex
++    import shutil
++    import uuid
++    from pathlib import Path
++
++    if shutil.which("setsid") is None:
++        pytest.skip("requires Linux setsid")
++    inst = _disk_apptainer_instance("sandfleet-long-" + uuid.uuid4().hex[:8])
++    command_id = "long-quotes"
++    command = ": #" + "x" * 54000 + "'" * 6000 + '\nprintf "%s" "$0"; exit 7'
++    # Include Harbor's cwd/subshell layer, not only a direct worker call.
++    command = "cd -- /tmp && " + shlex.join(["bash", "-c", command])
++    wrapped = "bash -c " + shlex.quote(command)
++    assert len(inst._wrap_for_in_instance_cancel(command_id, wrapped).encode()) > 131072
++    captured = []
++
++    def real_exec(argv, **kwargs):
++        captured.append(argv)
++        return subprocess.run(argv, input=b"", capture_output=True, timeout=10)
++
++    monkeypatch.setattr(inst, "exec", real_exec)
++    try:
++        result = inst.run_command(
++            command, 10, command_id=command_id, worker_deadline=True
++        )
++        assert result["exit_code"] == 7
++        assert result["stdout"] == "bash"
++        assert max(len(arg.encode()) for arg in captured[0]) < 131072
++    finally:
++        for suffix in ("", ".tmp", ".stop"):
++            Path(inst._command_pidfile(command_id) + suffix).unlink(missing_ok=True)

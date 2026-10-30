@@ -268,6 +268,7 @@ def main(
         tool_stop_sequences=tool_stop_sequences,
         max_steps=tools_config.max_steps,
         per_turn_max_tokens=tools_config.per_turn_max_tokens,
+        seed_per_turn=vllm_config.vllm_seed_per_turn,
         mask_tool_use=streaming_config.mask_tool_use,
         pools=pools,
         prompt_queue=prompt_Q,

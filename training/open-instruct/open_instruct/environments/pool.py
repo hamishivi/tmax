@@ -1,6 +1,7 @@
 """Pool of Ray actors with acquire/release semantics."""
 
 import asyncio
+import contextlib
 import os
 import random
 import time
@@ -13,11 +14,14 @@ from open_instruct.environments.backends import is_docker_host_connectivity_erro
 
 logger = logger_utils.setup_logger(__name__)
 
-DEFAULT_ACQUIRE_TIMEOUT_S = 7200
+DEFAULT_ACQUIRE_TIMEOUT_S = float(os.getenv("SWERL_POOL_ACQUIRE_TIMEOUT_S", "86400"))
 ACQUIRE_CONCURRENCY = 1000
 RELEASE_CONCURRENCY = 128
 DEFAULT_PODMAN_HOST_COOLDOWN_S = 300.0
 DEFAULT_PODMAN_HOST_COOLDOWN_JITTER_S = 30.0
+DEFAULT_ENV_ACTOR_CREATE_BATCH_SIZE = 64
+DEFAULT_ENV_ACTOR_CREATE_BATCH_SLEEP_S = 0.0
+DEFAULT_ENV_ACTOR_SETUP_MAX_RETRIES = 5
 
 
 def _podman_docker_hosts_from_env() -> list[str]:
@@ -34,6 +38,24 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         logger.warning("Invalid float for %s=%r; using default %s", name, value, default)
         return default
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid int for %s=%r; using default %s", name, value, default)
+        return default
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _actor_key(actor: ray.actor.ActorHandle) -> str:
@@ -70,7 +92,8 @@ class EnvironmentPool:
         **actor_kwargs: Any,
     ):
         self._acquire_timeout = acquire_timeout
-        remote_class = ray.remote(actor_class)
+        self._remote_class = ray.remote(actor_class)
+        self._actor_kwargs = dict(actor_kwargs)
         docker_hosts = _podman_docker_hosts_from_env()
         self._docker_hosts = (
             docker_hosts if actor_kwargs.get("backend") == "docker" and "docker_host" not in actor_kwargs else []
@@ -83,8 +106,21 @@ class EnvironmentPool:
         self._host_cooldown_jitter_s = _env_float(
             "SWERL_PODMAN_HOST_COOLDOWN_JITTER_S", DEFAULT_PODMAN_HOST_COOLDOWN_JITTER_S
         )
+        self._close_on_release = _env_flag("SWERL_ENV_CLOSE_ON_RELEASE", False)
 
-        logger.info(f"Creating pool of {pool_size} {actor_class.__name__} actors")
+        create_batch_size = max(1, _env_int("SWERL_ENV_ACTOR_CREATE_BATCH_SIZE", DEFAULT_ENV_ACTOR_CREATE_BATCH_SIZE))
+        create_batch_sleep_s = max(
+            0.0, _env_float("SWERL_ENV_ACTOR_CREATE_BATCH_SLEEP_S", DEFAULT_ENV_ACTOR_CREATE_BATCH_SLEEP_S)
+        )
+        setup_max_retries = max(1, _env_int("SWERL_ENV_ACTOR_SETUP_MAX_RETRIES", DEFAULT_ENV_ACTOR_SETUP_MAX_RETRIES))
+        logger.info(
+            "Creating pool of %s %s actors (batch_size=%s, batch_sleep_s=%s, setup_max_retries=%s)",
+            pool_size,
+            actor_class.__name__,
+            create_batch_size,
+            create_batch_sleep_s,
+            setup_max_retries,
+        )
         if self._docker_hosts:
             logger.info(
                 "Balancing %s %s actors across %s Podman Docker hosts at reset time",
@@ -92,15 +128,60 @@ class EnvironmentPool:
                 actor_class.__name__,
                 len(self._docker_hosts),
             )
-        self._actors = [remote_class.remote(**actor_kwargs) for _ in range(pool_size)]
-
-        setup_tasks = [actor.setup.remote() for actor in self._actors]
-        ray.get(setup_tasks)
+        if self._close_on_release:
+            logger.info("EnvironmentPool will close actor backends on release to free idle sandbox resources.")
+        self._actors = []
+        for batch_start in range(0, pool_size, create_batch_size):
+            batch_end = min(pool_size, batch_start + create_batch_size)
+            self._actors.extend(self._create_actor_batch(batch_end - batch_start, setup_max_retries))
+            logger.info("Created %s/%s %s actors", len(self._actors), pool_size, actor_class.__name__)
+            if create_batch_sleep_s > 0 and batch_end < pool_size:
+                time.sleep(create_batch_sleep_s)
 
         self._available: asyncio.Queue[ray.actor.ActorHandle] = asyncio.Queue()
         for actor in self._actors:
             self._available.put_nowait(actor)
-        logger.info(f"Pool ready: {pool_size} {actor_class.__name__} actors")
+        logger.info("Pool ready: %s %s actors", pool_size, actor_class.__name__)
+
+    def _create_actor_batch(self, count: int, max_retries: int) -> list[ray.actor.ActorHandle]:
+        actors: list[ray.actor.ActorHandle] = []
+        last_error: BaseException | None = None
+        attempt = 0
+        while len(actors) < count and attempt < max_retries:
+            attempt += 1
+            needed = count - len(actors)
+            candidates = [self._remote_class.remote(**self._actor_kwargs) for _ in range(needed)]
+            setup_refs = [actor.setup.remote() for actor in candidates]
+            failed = 0
+            for actor, setup_ref in zip(candidates, setup_refs):
+                try:
+                    ray.get(setup_ref)
+                    actors.append(actor)
+                except Exception as e:
+                    failed += 1
+                    last_error = e
+                    with contextlib.suppress(Exception):
+                        ray.kill(actor, no_restart=True)
+            if failed:
+                logger.warning(
+                    "Environment actor setup failed during pool creation (attempt %s/%s, failed=%s, ready=%s/%s): %s",
+                    attempt,
+                    max_retries,
+                    failed,
+                    len(actors),
+                    count,
+                    last_error,
+                )
+                time.sleep(min(5.0, 0.5 * attempt))
+        if len(actors) != count:
+            for actor in actors:
+                with contextlib.suppress(Exception):
+                    ray.kill(actor, no_restart=True)
+            raise RuntimeError(
+                f"Failed to create {count} environment actors after {max_retries} attempts; "
+                f"created {len(actors)}: {last_error}"
+            ) from last_error
+        return actors
 
     async def _acquire_actor(self) -> ray.actor.ActorHandle:
         try:
@@ -126,13 +207,21 @@ class EnvironmentPool:
             if _actor_reusable_after_error(e):
                 await self._release_actor(actor)
             else:
-                logger.warning("Not returning crashed environment actor to pool after reset failure: %s", e)
+                # a crashed actor previously
+                # stayed in self._actors but never re-entered the available queue —
+                # a silent capacity leak. Discard it (kill + deregister) and spawn a
+                # replacement off-loop so pool capacity stays stable across failures.
+                await self._discard_actor(actor, reason=f"reset failure: {e}")
             raise
         return actor, target_tools
 
     @ray.method(concurrency_group="release")
     async def release(self, actor: ray.actor.ActorHandle) -> None:
         await self._release_actor(actor)
+
+    @ray.method(concurrency_group="release")
+    async def discard(self, actor: ray.actor.ActorHandle, reason: str = "") -> None:
+        await self._discard_actor(actor, reason)
 
     def size(self) -> int:
         return len(self._actors)
@@ -142,7 +231,41 @@ class EnvironmentPool:
         host = self._actor_host_leases.pop(actor_key, None)
         if host is not None:
             self._release_host(host)
+        if self._close_on_release:
+            try:
+                await actor.close.remote()
+            except Exception as e:
+                await self._discard_actor(actor, reason=f"close-on-release failure: {e}")
+                return
         await self._available.put(actor)
+
+    async def _discard_actor(self, actor: ray.actor.ActorHandle, reason: str = "") -> None:
+        actor_key = _actor_key(actor)
+        if not any(_actor_key(candidate) == actor_key for candidate in self._actors):
+            return
+        host = self._actor_host_leases.pop(actor_key, None)
+        if host is not None:
+            self._release_host(host)
+
+        self._actors = [candidate for candidate in self._actors if _actor_key(candidate) != actor_key]
+        with contextlib.suppress(Exception):
+            ray.kill(actor, no_restart=True)
+
+        logger.warning(
+            "Discarded environment actor %s. reason=%s pool_size=%s available=%s",
+            actor_key,
+            reason,
+            len(self._actors),
+            self._available.qsize(),
+        )
+        # Every discard path must restore capacity, not only failed resets.
+        # Remove the old actor before yielding so duplicate discards cannot
+        # create multiple replacements. Setup failures remain visible.
+        loop = asyncio.get_running_loop()
+        replacement = await loop.run_in_executor(None, self._create_actor_batch, 1, 2)
+        for new_actor in replacement:
+            self._actors.append(new_actor)
+            self._available.put_nowait(new_actor)
 
     async def _reset_actor(self, actor: ray.actor.ActorHandle, reset_kwargs: dict[str, Any]) -> list[dict]:
         if not self._docker_hosts:

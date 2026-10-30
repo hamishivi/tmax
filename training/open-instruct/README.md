@@ -16,3 +16,10 @@ For general documentation, usage, and the upstream codebase, refer to the [main 
 
 - `uv` for dependency management (deps pinned in the repo-root `pyproject.toml` / `uv.lock`).
 - A Dockerhub login and personal access token (PAT). In particular, you probably need a business account to pull images from Dockerhub at large scale.
+
+
+## Portable sandbox training
+
+See [training and sandbox behavior](../../docs/training-fixes.md) for capped DPPO,
+distributed padding, reward validity, Sandfleet configuration, independent grading
+deadlines, and pretokenized SFT input.
