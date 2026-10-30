@@ -165,23 +165,35 @@ successful (pass) trajectories form the SFT corpus used to warm-start RL.
 
 ## Evaluating on the published Harbor dataset
 
-The full 15k corpus is published on the [Harbor](https://www.harborframework.com/docs/datasets)
-registry as **[`tmax/TMax-15K-Harbor`](https://hub.harborframework.com/datasets/tmax/TMax-15K-Harbor/latest)**
-(public). Each task ships as a self-contained Harbor environment with a
-programmatic verifier, so you can evaluate any agent/model on it without
-regenerating anything.
+The **TMax v1.1 13K corpus (13,565 tasks)** is available in
+[Harbor](https://docs.harborframework.com/datasets/datasets) format on Hugging Face:
+**[`TMaxxx/tmax-13-v1.1-harbor`](https://huggingface.co/datasets/TMaxxx/tmax-13-v1.1-harbor)**.
+It packages the hardened and prefiltered
+[v1.1 training dataset](https://huggingface.co/datasets/TMaxxx/tmax-13-v1.1/tree/8d47de78dc85ae7f8cf4853b6777a0917e49fad9),
+preserving the released instructions, verifiers, supporting assets, and public
+Linux/AMD64 environment images. You do not need to regenerate the tasks.
 
-Evaluate an agent on the dataset with `harbor run -d` ([run docs](https://www.harborframework.com/docs/datasets)):
+Download the pinned release and extract it with executable permissions preserved:
+
+```bash
+uvx --from huggingface_hub hf download TMaxxx/tmax-13-v1.1-harbor \
+    tasks.zip extract_tasks.py dataset_release.json --repo-type dataset \
+    --revision 40d3c355374af7e3361f614950da52fd5fe63bb0 \
+    --local-dir tmax-13-v1.1-harbor
+python3 tmax-13-v1.1-harbor/extract_tasks.py
+```
+
+Run Harbor 0.25.0 against the extracted task directory ([run docs](https://docs.harborframework.com/datasets/datasets)):
 
 ```bash
 # full dataset
-uv run harbor run -d "tmax/TMax-15K-Harbor@latest" \
+uvx --from harbor==0.25.0 harbor run --path tmax-13-v1.1-harbor/tasks \
     --agent terminus-2 --model "<model>" --env docker
 
 # a quick subset: cap the number of tasks (-l) and/or filter by name (-i / -x)
-uv run harbor run -d "tmax/TMax-15K-Harbor@latest" \
+uvx --from harbor==0.25.0 harbor run --path tmax-13-v1.1-harbor/tasks \
     --agent terminus-2 --model "<model>" --env docker \
-    -i "task_00000*" -l 10
+    -i "*task_00000*" -l 10
 ```
 
 Results (per-task reward, agent/verifier logs) are written under `jobs/<job-name>/`.
@@ -190,9 +202,18 @@ Results (per-task reward, agent/verifier logs) are written under `jobs/<job-name
 locally — set `DAYTONA_API_KEY` and pass `--env daytona`:
 
 ```bash
-uv run harbor run -d "tmax/TMax-15K-Harbor@latest" \
+uvx --from harbor==0.25.0 harbor run --path tmax-13-v1.1-harbor/tasks \
     --agent terminus-2 --model "<model>" \
     --env daytona --n-concurrent 10
+```
+
+The v1.1 bundle is distributed on Hugging Face in Harbor format. To evaluate the
+original 14,601-task release from Harbor Hub instead, use
+[`tmax/TMax-15K-Harbor@2`](https://hub.harborframework.com/datasets/tmax/TMax-15K-Harbor/2):
+
+```bash
+uvx --from harbor==0.25.0 harbor run -d "tmax/TMax-15K-Harbor@2" \
+    --agent terminus-2 --model "<model>" --env docker
 ```
 
 ## Requirements
@@ -203,7 +224,7 @@ uv run harbor run -d "tmax/TMax-15K-Harbor@latest" \
   endpoints are supported via env vars — see `scripts/README.md`.
 - `apptainer` on PATH for building/running task containers.
 - `HF_TOKEN` for the upload stage.
-- To evaluate on the published `tmax/TMax-15K-Harbor` dataset: the `harbor` CLI
-  (a project dep, run via `uv run harbor …`), a model API key for your chosen
+- To evaluate the Harbor-format task data: Harbor 0.25.0
+  (run via `uvx --from harbor==0.25.0 harbor …`), a model API key for your chosen
   agent, and a container runtime — Docker locally, or `DAYTONA_API_KEY` for the
   Daytona sandbox on Docker-less hosts.
