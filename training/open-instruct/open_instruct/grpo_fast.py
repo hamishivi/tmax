@@ -3269,7 +3269,11 @@ def _discover_tools_from_datasets(dataset_mixer_list: list[str], dataset_mixer_l
         dataset_name = dataset_mixer_list[i]
         split = splits[i // 2]
         try:
-            ds = datasets.load_dataset(dataset_name, split=split)
+            if os.path.isfile(dataset_name) and dataset_name.endswith((".jsonl", ".parquet")):
+                file_format = "json" if dataset_name.endswith(".jsonl") else "parquet"
+                ds = datasets.load_dataset(file_format, data_files=dataset_name, split=split)
+            else:
+                ds = datasets.load_dataset(dataset_name, split=split)
         except Exception as e:
             if _hf_offline_mode_enabled() or "OfflineModeIsEnabled" in repr(e):
                 logger.warning(
