@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 
 ### Changed
+- Release capped DPPO, distributed padding and reference checkpoints, explicit reward validity, reliable rollouts, Sandfleet execution, independent grading deadlines, aligned prompts, pretokenized SFT input, and offline evaluation dependency repairs (https://github.com/hamishivi/tmax/pull/11).
 - Fix GRPO policy gradient scaling with ZeRO-3 sequence parallelism and tiled loss normalization for uneven or empty response shards (https://github.com/hamishivi/tmax/pull/9).
 - Fix Qwen3.5 packing logprob mismatch: call `patch_qwen3_5_packing()` inside `PolicyTrainerRayProcess.from_pretrained()` so the GatedDeltaNet sequence-isolation patch is applied in the Ray worker process, not only in the main process. Without this, packed rows leaked state between sub-sequences, causing `vllm_vs_local_logprob_diff_mean` ~0.21 instead of the expected ~0.02.
 - Build FLA CP context per-batch with `fla.ops.cp.build_cp_context` so Qwen3.5 hybrid linear-attention correctly starts fresh state for packed sub-sequences that don't cross Ulysses SP rank boundaries; threads un-sharded `global_position_ids` through `UlyssesSPSplitter` → `CollatedBatchData` → `compute_logprobs` / `forward_for_logprobs`.
