@@ -90,16 +90,26 @@ TOOL_CONFIGS='{"backend":"sandfleet","task_data_dir":"/data/task-data","pwd":"/"
 The launcher uses the backend in `TOOL_CONFIGS` to select sandbox setup. Sandfleet
 requires `SANDFLEET_URL` and a client token. Beaker recipes accept `SANDFLEET_CLIENT_TOKEN_SECRET` as the name of
 a secret to expose as `SANDFLEET_CLIENT_TOKEN`; the local debug recipe reads the
-token directly from its environment. `SANDFLEET_POOL` is optional.
+token directly from its environment. `SANDFLEET_POOL` is optional. Install the
+controller and workers from [Sandfleet](https://github.com/hamishivi/sandfleet)
+at matching revisions; the training client uses the HTTP API directly.
 
 The full RL recipes forward operator-provided `SANDFLEET_URL`, `SANDFLEET_POOL`,
 `SANDFLEET_REGISTRY`, `SWERL_APPTAINER_SIF_DIR`, `SWERL_ROLLOUT_TIMEOUT_S`,
 `SWERL_SANDBOX_PWD_MAP`, `SWERL_SANDBOX_VERIFIER_TIMEOUT_MAP`, and
-`SWERL_SANDBOX_MAX_VERIFIER_TIMEOUT_S`. Referenced
+`SWERL_SANDBOX_MAX_VERIFIER_TIMEOUT_S`, plus `NO_PROXY` and `no_proxy`. Set proxy
+bypasses for both the controller and the worker-agent addresses. Full and
+minimal Ray runtime environments preserve sandbox connection settings. Referenced
 files must be visible on the nodes that use them. A local SIF pool is required
 for Apptainer/Sandfleet image resolution; missing images fail explicitly.
 See [Sandfleet recovery](../../../../docs/sandfleet-restart-recovery.md) and
 [optional dataset setup](../../../../docs/dataset-setup.md).
+
+The debug recipe creates 16 environment actors. Size a named Sandfleet pool for
+that lease demand and its intended CPU/RAM profile. Without a named pool, enable
+declarative resources on the controller; the adapter requests two CPUs and
+4096 MiB by default. Sandboxes run offline, so task dependencies belong in the
+prepared images.
 
 For Docker/Podman, full recipes retain the existing Podman setup. Supply
 `DOCKERHUB_USERNAME` and optionally `DOCKER_PAT_SECRET` for authenticated image

@@ -199,8 +199,22 @@ def _ray_runtime_env_from_environment() -> dict[str, Any] | None:
             "RAY_TMPDIR",
             "NCCL_CUMEM_ENABLE",
             "NCCL_SOCKET_IFNAME",
+            "SANDFLEET_URL",
+            "SANDFLEET_POOL",
+            "SANDFLEET_CLIENT_TOKEN",
+            "SANDFLEET_REGISTRY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
         }
-        env_vars = {k: v for k, v in os.environ.items() if k in keep and k not in EXCLUDED_ENV_VARS}
+        env_vars = {
+            k: v for k, v in os.environ.items() if (k in keep or k.startswith("SWERL_")) and k not in EXCLUDED_ENV_VARS
+        }
     else:
         if mode != "full":
             logger.warning("Unknown OPEN_INSTRUCT_RAY_RUNTIME_ENV=%s; using full runtime_env", mode)
