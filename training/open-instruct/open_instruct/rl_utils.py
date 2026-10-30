@@ -5,7 +5,7 @@ import os
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 from typing import Any, Generic, TypeVar
 
@@ -507,6 +507,11 @@ def save_rollouts_to_disk(
         total_samples_written: Total samples written so far, used for sharding.
     """
     shard_idx = total_samples_written // ROLLOUT_SHARD_SIZE
+    # DataPreparationActor replaces result's per-sample lists when masking
+    # completions after this call. Keep the original fields for the background
+    # writer so they remain aligned with the unfiltered batch and advantages.
+    # A shallow snapshot suffices: masking replaces lists, not their contents.
+    result = replace(result)
     future = _rollout_executor.submit(
         _save_rollouts, save_path, run_name, step, batch, result, advantages, num_samples_per_prompt, shard_idx
     )
@@ -570,6 +575,36 @@ class PackedSequences(Generic[T]):
     """
     rewards: list[torch.Tensor] | None = None
     """packed rewards (batch_size, pack_length)"""
+
+
+def pad_packed_sequences(packed: PackedSequences, multiple: int) -> PackedSequences:
+    """Balance DP workers without dropping real packs or adding training signal.
+
+    Reuse the shortest pack's valid input/attention/position structure so padding
+    still runs the model and distributed collectives. Clear all supervision and
+    rollout identities. The original packs and rollout records are not mutated.
+    """
+    if multiple < 1:
+        raise ValueError("Packed batch multiple must be positive")
+    count = len(packed.query_responses)
+    padding = (-count) % multiple
+    if not padding:
+        return packed
+    template_index = min(range(count), key=lambda i: packed.query_responses[i].numel())
+    model_fields = {"query_responses", "attention_masks", "position_ids", "packed_seq_lens"}
+    identity_fields = {"rollout_sample_ids", "model_steps"}
+    padded_fields = {}
+    for f in fields(packed):
+        values = getattr(packed, f.name)
+        if values is None or f.name == "original_responses":
+            continue
+        template = values[template_index]
+        if f.name in model_fields:
+            dummy = template
+        else:
+            dummy = torch.full_like(template, -1 if f.name in identity_fields else 0)
+        padded_fields[f.name] = [*values, *(dummy.clone() for _ in range(padding))]
+    return replace(packed, **padded_fields)
 
 
 def reset_position_ids(attention_mask):

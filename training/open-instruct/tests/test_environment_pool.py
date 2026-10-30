@@ -1,4 +1,12 @@
-from open_instruct.environments.pool import _is_podman_host_failure
+from open_instruct.environments.pool import EnvironmentPool, _is_podman_host_failure
+
+
+def test_pool_exposes_dead_actor_lifecycle_helpers():
+    pool_class = EnvironmentPool.__ray_metadata__.modified_class
+
+    assert hasattr(pool_class, "discard")
+    assert hasattr(pool_class, "_discard_actor")
+    assert hasattr(pool_class, "_create_actor_batch")
 
 
 def test_is_podman_host_failure_detects_unresponsive_socket():

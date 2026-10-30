@@ -8,7 +8,7 @@
 
 <p align="center">
   💻 <a href="https://github.com/hamishivi/tmax">Code</a> ·
-  🤗 <a href="https://huggingface.co/collections/allenai/tmax">Models &amp; Data</a> ·
+  🤗 <a href="https://huggingface.co/collections/TMaxxx/tmax-v11">Models &amp; Data</a> ·
   📜 <a href="https://arxiv.org/abs/2606.23321">Paper</a> ·
   📓 <a href="https://wai-org.com/blog/tmax/">Blog</a>
 </p>
@@ -20,13 +20,15 @@ We use this to train our 'tmax' series of models, with strong performance as sho
 
 
 <p align="center">
-  <img src="scripts/plot/output/teaser_terminal_bench.png" alt="Tmax" width="640">
+  <img src="scripts/plot/output/teaser_terminal_bench.png" alt="TMax v1.1 Terminal-Bench 2.0 performance versus model size" width="960">
 </p>
 
 
 Below, we give a quick overview of the codebase and how to use it.
 
 ### News
+
+- [3/11/26] **TMax v1.1 released!** We have updated the codebase to improve stability and our overall recipe. Please consult [PR #11](https://github.com/hamishivi/tmax/pull/11) for the full set of changes. To reproduce TMax v1.0 training, please use commit [`6d3d606`](https://github.com/hamishivi/tmax/tree/6d3d606c0f9de6ceec9481f9ccc793936818fef0).
 - Initial release of the codebase and models! Please read [our paper](https://arxiv.org/abs/2606.23321) for more details.
 
 
@@ -82,22 +84,24 @@ Launch scripts for the tmax models live under `training/open-instruct/scripts/tm
 (`SFT/` and `RL/`):
 
 ```bash
-# from training/open-instruct/, e.g. RL on Qwen3.5-4B
+# from training/open-instruct/, with BEAKER_CLUSTER configured, e.g. Qwen3.5-4B
 bash scripts/tmax/RL/qwen35_4b.sh <beaker-image>
 ```
 
 See [`training/open-instruct/scripts/tmax/README.md`](training/open-instruct/scripts/tmax/README.md)
-for how to read the scripts (`mason.py` launcher vs. the underlying training command)
-and how to run them off-cluster.
+for runtime configuration, Sandfleet execution, dataset overrides, and pretokenized SFT input.
 
 ### Evaluate a model
 
-Run a Harbor dataset against a locally served model on Beaker:
+Run a Harbor dataset against a locally served model on Beaker, with
+`BEAKER_CLUSTER` configured for your environment:
 
 ```bash
-./beaker_configs/launch_eval.sh allenai/open_instruct_dev \
-    --revision sft_qwen3_4b_tmax_4node \
-    --name sft-4b \
+./beaker_configs/launch_eval.sh TMaxxx/tmax-9b-v1.1 \
+    --revision main \
+    --name tmax-v1.1-9b \
+    --tool-call-parser qwen3_xml \
+    --cluster "$BEAKER_CLUSTER" \
     --dataset terminal-bench@2.0
 ```
 
@@ -111,12 +115,12 @@ vLLM and point Harbor at it:
 
 ```bash
 # 1. serve the model on localhost:8008 (a separate shell/process)
-uvx vllm==0.19.1 serve allenai/tmax-9b \
-    --served-model-name tmax-9b \
+uvx vllm==0.19.1 serve TMaxxx/tmax-9b-v1.1 \
+    --served-model-name tmax-v1.1-9b \
     --enable-auto-tool-choice --tool-call-parser qwen3_xml \
     --tensor-parallel-size 8 --port 8008
 
-# set daytona key
+# 2. set the Daytona API key
 export DAYTONA_API_KEY='xxx'
 
 # 3. run a Harbor dataset against the local vLLM endpoint
@@ -124,12 +128,11 @@ uv run harbor run \
   --dataset terminal-bench@2.0 \
   --env daytona \
   --agent-import-path Vanillux2Agent:Vanillux2Agent \
-  --model openai/tmax-9b \
+  --model openai/tmax-v1.1-9b \
   --agent-kwarg api_base=http://localhost:8008/v1 \
-  --agent-kwarg max_format_errors=64 \
   --n-concurrent 16 \
   -k 5 \
-  --job-name swerl-qwen32-2b-tmax-step100-vanillux2-daytona-tblite
+  --job-name tmax-v1.1-9b-terminal-bench-2.0
 ```
 
 Feel free to swap out daytona for your sandboxing backend of choice.
@@ -164,11 +167,21 @@ for the full set of run options.
 - An **LLM API key** for the configured model (e.g. `GEMINI_API_KEY`); local
   vLLM / Ollama / OpenAI-compatible endpoints are also supported via env vars.
 - (for data generation) **`apptainer`** on PATH for building and running task containers.
-- (for training) A **Dockerhub login** and personal access token (PAT). In particular, you probably need a business account to pull images from Dockerhub at large scale.
+- (for training) A configured **Docker/Podman**, **Apptainer**, or **Sandfleet** backend. Docker Hub credentials may be needed for authenticated or high-volume image pulls; Apptainer and Sandfleet can use prepared SIF images. See the [training recipes](training/open-instruct/scripts/tmax/README.md) for setup.
 - **`HF_TOKEN`** for the Hugging Face upload stage and for pulling gated models.
 - (to evaluate on the published `tmax/TMax-15K-Harbor` dataset) a model API key
   for your chosen agent plus a container runtime — Docker locally, or
   `DAYTONA_API_KEY` for the Daytona sandbox on Docker-less hosts.
+
+## TMax Releases
+
+- **V1.1:**
+  - Models and data: [TMax v1.1 collection](https://huggingface.co/collections/TMaxxx/tmax-v11).
+  - Evaluation rollouts: [`evaluation_assets/v1.1/`](evaluation_assets/v1.1/) (coming later).
+- **V1.0:**
+  - Models and data: [Ai2 TMax collection](https://huggingface.co/collections/allenai/tmax).
+  - Evaluation rollouts: [`evaluation_assets/v1.0/`](evaluation_assets/v1.0/).
+  - Training code: [`6d3d606`](https://github.com/hamishivi/tmax/tree/6d3d606c0f9de6ceec9481f9ccc793936818fef0).
 
 ## Licensing
 

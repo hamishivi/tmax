@@ -21,8 +21,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from queue import Empty
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
+import docker as docker_sdk
 import numpy as np
 import ray
 import torch
@@ -33,7 +34,7 @@ from ray.util import queue as ray_queue
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
-from open_instruct import data_types, padding_free_collator, utils
+from open_instruct import data_types, padding_free_collator, population_reward_metrics, utils
 from open_instruct.data_types import EnvConfig, EnvConfigEntry
 from open_instruct.dataset_transformation import (
     ENV_CONFIG_KEY,
@@ -48,6 +49,7 @@ from open_instruct.model_utils import Batch
 from open_instruct.rl_utils import (
     PackedSequences,
     pack_sequences,
+    pad_packed_sequences,
     save_filtered_rollouts_to_disk,
     save_rollout_metadata,
     save_rollouts_to_disk,
@@ -125,8 +127,6 @@ class ImagePrewarmActor:
             return dict(self._stats) | {"seen": len(self._seen), "inflight": len(self._inflight)}
 
     def _pull_image(self, image: str) -> None:
-        import docker as docker_sdk
-
         client = docker_sdk.from_env(timeout=300)
         try:
             client.images.get(image)
@@ -547,6 +547,8 @@ class VLLMConfig:
     vllm_gpu_memory_utilization: float = 0.9
     vllm_enable_prefix_caching: bool = False
     vllm_top_p: float = 1.0
+    vllm_seed_per_turn: bool = False
+    """Send a distinct deterministic seed for each tool-rollout generation turn."""
     # Manually override the per-engine concurrency (number of in-flight requests).
     # If None (default), it's auto-computed from KV cache capacity via `get_kv_cache_info()`.
     vllm_inference_batch_size: int | None = None
@@ -560,6 +562,7 @@ class StreamingDataLoaderConfig:
     pack_length: int = 512
 
     # Batching
+    # Set to 0 for synchronous, learner-driven rollout collection.
     async_steps: int = 8
     num_samples_per_prompt_rollout: int = 4
     num_unique_prompts_rollout: int = 16
@@ -706,11 +709,6 @@ class StreamingDataLoaderConfig:
             logger.warning("num_samples_per_prompt_rollout is 1. This reduces GRPO to REINFORCE.")
 
         if self.active_sampling:
-            assert self.async_steps > 1, (
-                "With active_sampling, you should set async_steps > 1 to account for filtering of the first batch. "
-                "Otherwise, your generator only generates only one batch worth of prompts and a single filtered "
-                "prompt will cause the trainer to stall waiting for more data  . "
-            )
             assert self.filter_zero_std_samples, (
                 "filter_zero_std_samples must be True when active_sampling is True. "
                 "Active sampling requires filtering to work correctly."
@@ -720,8 +718,8 @@ class StreamingDataLoaderConfig:
                 "`filter_zero_std_samples` cannot be True when `num_samples_per_prompt_rollout` is 1, "
                 "as the reward standard deviation will always be 0, causing all samples to be filtered."
             )
-        if self.async_steps < 1:
-            raise ValueError("`async_steps` must be greater than 0. Fully synchronous training is not supported.")
+        if self.async_steps < 0:
+            raise ValueError("`async_steps` must be greater than or equal to 0.")
         if not 0.0 <= self.mask_non_submitting_completions_percent < 1.0:
             raise ValueError("`mask_non_submitting_completions_percent` must be in [0.0, 1.0).")
         if self.mask_non_submitting_completions_percent > 0.0 and not self.mask_non_submitting_completions:
@@ -866,16 +864,19 @@ class BatchStatistics:
     total_prompts: int
 
 
-def _compute_avg_group_performance(n_solved: int, n_zero: int, n_kept: int, batch_avg_score: float) -> float:
-    total_groups = n_solved + n_zero + n_kept
-    if total_groups == 0:
-        return 0.0
-    return float((n_solved + n_kept * batch_avg_score) / total_groups)
+def rollout_reward_is_valid(state: dict) -> bool:
+    info = state.get("info", {})
+    return not (info.get("invalid_reward") or info.get("infrastructure_failure"))
 
 
 def compute_group_advantages(
-    scores: np.ndarray, num_samples_per_prompt: int, advantage_normalization_type: str
+    scores: np.ndarray,
+    num_samples_per_prompt: int,
+    advantage_normalization_type: str,
+    valid_mask: np.ndarray | None = None,
 ) -> np.ndarray:
+    # Keep original positions until packing so rollout IDs still identify their
+    # prompt. Invalid siblings contribute neither to group statistics nor loss.
     if num_samples_per_prompt <= 0:
         raise ValueError(f"num_samples_per_prompt must be positive, got {num_samples_per_prompt}.")
     scores = np.asarray(scores)
@@ -886,24 +887,26 @@ def compute_group_advantages(
 
     score_dtype = np.result_type(scores.dtype, np.float32)
     scores_per_prompt = scores.astype(score_dtype, copy=False).reshape(-1, num_samples_per_prompt)
-    mean_grouped_rewards = scores_per_prompt.mean(axis=-1, keepdims=True)
+    valid = np.ones(scores.shape, dtype=bool) if valid_mask is None else np.asarray(valid_mask, dtype=bool)
+    if valid.shape != scores.shape:
+        raise ValueError("Reward validity mask must match scores")
+    valid = valid.reshape(scores_per_prompt.shape)
+    counts = valid.sum(axis=-1, keepdims=True)
+    denominator = np.maximum(counts, 1)
+    mean_grouped_rewards = np.where(valid, scores_per_prompt, 0).sum(axis=-1, keepdims=True) / denominator
+    centered = np.where(valid, scores_per_prompt - mean_grouped_rewards, 0)
 
     if advantage_normalization_type == "standard":
-        std_grouped_rewards = scores_per_prompt.std(axis=-1, keepdims=True)
-        advantages = (scores_per_prompt - mean_grouped_rewards) / (std_grouped_rewards + 1e-8)
+        std_grouped_rewards = np.sqrt((centered**2).sum(axis=-1, keepdims=True) / denominator)
+        advantages = centered / (std_grouped_rewards + 1e-8)
     elif advantage_normalization_type == "centered":
-        advantages = scores_per_prompt - mean_grouped_rewards
+        advantages = centered
     elif advantage_normalization_type == "maxrl":
         advantages = np.zeros_like(scores_per_prompt, dtype=score_dtype)
-        np.divide(
-            scores_per_prompt - mean_grouped_rewards,
-            mean_grouped_rewards,
-            out=advantages,
-            where=mean_grouped_rewards > 0.0,
-        )
+        np.divide(centered, mean_grouped_rewards, out=advantages, where=mean_grouped_rewards > 0.0)
     else:
         raise ValueError(f"Invalid advantage normalization type: {advantage_normalization_type}")
-    return advantages.reshape(-1)
+    return np.where(valid & (counts >= 2), advantages, 0).astype(score_dtype).reshape(-1)
 
 
 def single_example_collator(examples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -954,7 +957,7 @@ def _aggregate_env_metrics(rollout_states: list[dict]) -> dict[str, float]:
         ename = info.get("env_name", "unknown")
         bucket = env_metrics.setdefault(ename, {})
         for k, v in info.items():
-            if k != "env_name" and isinstance(v, (int, float)):
+            if k != "env_name" and isinstance(v, int | float):
                 bucket.setdefault(k, []).append(float(v))
 
     return {
@@ -1022,16 +1025,38 @@ def accumulate_inference_batches(
     save_filtered_rollouts: bool = False,
     filtered_rollouts_save_path: str | None = None,
     run_name: str | None = None,
+    replenish_accepted_prompts: bool = True,
+    population_metrics: population_reward_metrics.PopulationRewardMetrics | None = None,
+    min_valid_group_size: int = 2,
 ) -> (
     tuple[data_types.GenerationResult, Batch, dict, BatchStatistics]
     | tuple[data_types.ShutdownSentinel | None, None, None, None]
 ):
-    if no_resampling_pass_rate is not None:
-        assert iter_dataloader is not None, "no_resampling requires the iter_dataloader passed"
+    """Collect one training batch, optionally maintaining a prompt prefetch window.
 
-    if replenish_prompts:
-        assert param_prompt_Q is not None and iter_dataloader is not None and dataset is not None, (
-            "replenish_prompts requires param_prompt_Q and iter_dataloader and dataset"
+    When ``replenish_accepted_prompts`` is false, only results rejected before
+    counting toward the batch are replaced.
+    """
+    if no_resampling_pass_rate is not None and iter_dataloader is None:
+        raise ValueError("no_resampling requires iter_dataloader")
+
+    if replenish_prompts and (param_prompt_Q is None or iter_dataloader is None):
+        raise ValueError("replenish_prompts requires param_prompt_Q and iter_dataloader")
+
+    prompt_dataloader = cast(HFDataLoader, iter_dataloader)
+    prompt_queue = cast(ray_queue.Queue, param_prompt_Q)
+
+    def enqueue_next_prompt() -> None:
+        example = next(prompt_dataloader)
+        add_prompt_to_generator(
+            example,
+            prompt_dataloader._epoch,
+            prompt_queue,
+            generation_config,
+            is_eval=False,
+            base_env_config=base_env_config,
+            ground_truth_overrides=ground_truth_overrides,
+            image_prewarm_actors=image_prewarm_actors,
         )
 
     results = []
@@ -1084,6 +1109,11 @@ def accumulate_inference_batches(
 
         if isinstance(result, data_types.ShutdownSentinel):
             return result, None, None, None
+        if isinstance(result, data_types.FatalGenerationError):
+            raise RuntimeError(
+                f"Fatal generation failure for {result.request_id}: "
+                f"{result.error_type}: {result.message}\n{result.traceback}"
+            )
 
         if (
             max_result_age_steps is not None
@@ -1104,19 +1134,7 @@ def accumulate_inference_batches(
                 max_result_age_steps,
             )
             if replenish_prompts:
-                assert iter_dataloader is not None
-                assert param_prompt_Q is not None
-                example = next(iter_dataloader)
-                add_prompt_to_generator(
-                    example,
-                    iter_dataloader._epoch,
-                    param_prompt_Q,
-                    generation_config,
-                    is_eval=False,
-                    base_env_config=base_env_config,
-                    ground_truth_overrides=ground_truth_overrides,
-                    image_prewarm_actors=image_prewarm_actors,
-                )
+                enqueue_next_prompt()
             continue
 
         collected_results.append(result)
@@ -1134,20 +1152,8 @@ def accumulate_inference_batches(
         raw_query = example[RAW_PROMPT_KEY]
         sample_active_tools = example.get(TOOLS_COLUMN_KEY)
 
-        if replenish_prompts:
-            assert iter_dataloader is not None
-            assert param_prompt_Q is not None
-            example = next(iter_dataloader)
-            add_prompt_to_generator(
-                example,
-                iter_dataloader._epoch,
-                param_prompt_Q,
-                generation_config,
-                is_eval=False,
-                base_env_config=base_env_config,
-                ground_truth_overrides=ground_truth_overrides,
-                image_prewarm_actors=image_prewarm_actors,
-            )
+        if replenish_prompts and replenish_accepted_prompts:
+            enqueue_next_prompt()
 
         for i in range(len(result.finish_reasons)):
             if result.finish_reasons[i] == "stop" and len(result.responses[i]) == 0:
@@ -1169,8 +1175,34 @@ def accumulate_inference_batches(
             else repeat_each([result.model_step], generation_config.n)
         )
 
-        percent_solved = np.mean(result.reward_scores).item() / max_possible_score
-        if no_resampling_pass_rate is not None and percent_solved >= no_resampling_pass_rate:
+        # Count every fresh sampled group, including those about to be removed
+        # for zero variance. Their per-completion lengths are unavailable later.
+        states = result.request_info.rollout_states
+        invalid_rewards = [not rollout_reward_is_valid(state) for state in states]
+        if len(invalid_rewards) != len(result.responses):
+            raise ValueError("Rollout validity metadata does not match completion count")
+        valid_indices = [i for i, invalid in enumerate(invalid_rewards) if not invalid]
+        if population_metrics is not None:
+            assert result.reward_scores is not None
+            population_metrics.add_group(
+                [result.reward_scores[i] for i in valid_indices],
+                [result.finish_reasons[i] for i in valid_indices],
+                [len(result.responses[i]) for i in valid_indices],
+            )
+
+        valid_rewards = [result.reward_scores[i] for i in valid_indices]
+        if any(invalid_rewards) and len(valid_rewards) < min_valid_group_size:
+            logger.warning("Dropping group with insufficient scored rollouts: %s", result.prompt_id)
+            if replenish_prompts and not replenish_accepted_prompts:
+                enqueue_next_prompt()
+            continue
+
+        percent_solved = np.mean(valid_rewards).item() / max_possible_score if valid_rewards else None
+        if (
+            no_resampling_pass_rate is not None
+            and percent_solved is not None
+            and percent_solved >= no_resampling_pass_rate
+        ):
             assert iter_dataloader is not None
             iter_dataloader.exclude_index(result.index)
             total_no_resampled += 1
@@ -1178,7 +1210,7 @@ def accumulate_inference_batches(
                 f"[Data Preparation Thread] Prompt solved at {percent_solved}, will be excluded from resampling, total no resampled: {total_no_resampled}"
             )
 
-        if filter_zero_std_samples and np.std(result.reward_scores) == 0:
+        if filter_zero_std_samples and valid_rewards and np.std(valid_rewards) == 0:
             if not active_sampling:
                 num_prompts_sampled += 1
                 progress_bar.update(1)
@@ -1206,15 +1238,17 @@ def accumulate_inference_batches(
                 )
 
             total_filtered_prompts += 1
-            if result.reward_scores[0] == 0:
+            if valid_rewards[0] == 0:
                 filtered_prompt_zero += 1
-            elif result.reward_scores[0] >= max_possible_score - 1e-8:
+            elif valid_rewards[0] >= max_possible_score - 1e-8:
                 filtered_prompt_solved += 1
             else:
                 filtered_prompt_nonzero += 1
             logging.debug(
                 f"[Data Preparation Thread] Filtered prompt with reward std 0, total filtered {total_filtered_prompts}"
             )
+            if active_sampling and replenish_prompts and not replenish_accepted_prompts:
+                enqueue_next_prompt()
             continue
         else:
             num_prompts_sampled += 1
@@ -1231,7 +1265,8 @@ def accumulate_inference_batches(
         all_decoded_responses.extend(decoded_responses)
         all_scores.extend(result.reward_scores)
         all_reward_metrics.append(result.reward_metrics)
-        all_percent_solved.append(percent_solved)
+        if percent_solved is not None:
+            all_percent_solved.append(percent_solved)
         if result.model_step is not None:
             all_model_steps.append(result.model_step)
 
@@ -1334,7 +1369,14 @@ def accumulate_inference_batches(
         active_tools=all_active_tools if all_active_tools else None,
     )
 
-    combined_reward_metrics = combine_reward_metrics(all_reward_metrics)
+    # These upstream means include every sibling and cannot be corrected after
+    # aggregation. Omit the entire batch's diagnostics rather than silently
+    # reporting a different population made up only of complete groups.
+    if all(rollout_reward_is_valid(state) for state in combined_rollout_states):
+        combined_reward_metrics = combine_reward_metrics(all_reward_metrics)
+    else:
+        combined_reward_metrics = {}
+        logger.warning("Batch has unscored rollouts; omitting aggregated reward diagnostics.")
     combined_reward_metrics["stale_results_dropped"] = float(stale_results_dropped)
     if all_model_steps:
         model_steps_array = np.array(all_model_steps, dtype=float)
@@ -1395,14 +1437,8 @@ def prepare_collated_data_for_workers(
         for query_responses, attention_masks, position_ids,
         advantages, response_masks, and vllm_logprobs.
     """
-    total_sequences = len(packed_sequences.query_responses)
-    if total_sequences % dp_world_size != 0:
-        new_total = (total_sequences // dp_world_size) * dp_world_size
-        logger.warning(
-            f"Total packed sequences ({total_sequences}) is not evenly divisible by dp_world_size ({dp_world_size}). "
-            f"Truncating to {new_total} sequences (dropping {total_sequences - new_total})."
-        )
-    B = total_sequences // dp_world_size
+    packed_sequences = pad_packed_sequences(packed_sequences, dp_world_size)
+    B = len(packed_sequences.query_responses) // dp_world_size
     collated_data = []
     assert packed_sequences.position_ids is not None
     assert packed_sequences.advantages is not None
@@ -1509,9 +1545,9 @@ def prepare_collated_data_for_workers(
 class DataPreparationActor:
     """Ray actor singleton that handles centralized data preparation for all ranks.
 
-    This actor runs a background thread that continuously prepares training data,
-    ensuring all ranks receive the same number of micro-batches (preventing deadlock
-    from uneven filtering).
+    A background thread prepares data ahead of the learner when ``async_steps`` is
+    positive and prepares one requested step at a time when it is zero. Centralized
+    preparation ensures all ranks receive the same number of micro-batches.
     """
 
     def __init__(
@@ -1576,6 +1612,8 @@ class DataPreparationActor:
         self.current_prepared_step = -1
         self._last_consumed_step = -1
         self.lock = threading.Lock()
+        self._preparation_requested = threading.Condition(self.lock)
+        self._requested_step = -1
         self.training_step = 0
         self.total_samples_written = 0
         self.metadata_saved = False
@@ -1599,6 +1637,18 @@ class DataPreparationActor:
         self._prep_future = self._executor.submit(self._data_preparation_loop)
         logger.info(f"[DataPreparationActor] Started preparation loop from training_step={self.training_step}")
 
+    def _enqueue_next_prompt(self) -> None:
+        add_prompt_to_generator(
+            next(self.iter_dataloader),
+            self.iter_dataloader._epoch,
+            self.param_prompt_Q,
+            self.generation_config,
+            is_eval=False,
+            base_env_config=self.base_env_config,
+            ground_truth_overrides=self.ground_truth_overrides,
+            image_prewarm_actors=self.image_prewarm_actors,
+        )
+
     def _data_preparation_loop(self):
         logger.info("[DataPreparationActor] Starting _data_preparation_loop")
 
@@ -1608,30 +1658,35 @@ class DataPreparationActor:
             self.metadata_saved = True
 
         num_initial_prompts = self.config.async_steps * self.global_batch_size
-        logger.info(f"[DataPreparationActor] Pushing {num_initial_prompts} initial prompts to param_prompt_Q")
-        for _ in range(num_initial_prompts):
-            add_prompt_to_generator(
-                next(self.iter_dataloader),
-                self.iter_dataloader._epoch,
-                self.param_prompt_Q,
-                self.generation_config,
-                is_eval=False,
-                base_env_config=self.base_env_config,
-                ground_truth_overrides=self.ground_truth_overrides,
-                image_prewarm_actors=self.image_prewarm_actors,
-            )
+        if num_initial_prompts:
+            logger.info(f"[DataPreparationActor] Pushing {num_initial_prompts} initial prompts to param_prompt_Q")
+            for _ in range(num_initial_prompts):
+                self._enqueue_next_prompt()
 
         for step in range(self.training_step, self.num_training_steps):
             generation_idle_wait_start_time = time.perf_counter()
-            while step - self._last_consumed_step > self.config.async_steps:
-                logger.info(
-                    f"[DataPreparationActor] Step {step}: waiting for step {self._last_consumed_step + self.config.async_steps} to be consumed. Consider increasing training compute."
-                )
-                time.sleep(0.1)
+            if self.config.async_steps == 0:
+                with self._preparation_requested:
+                    while self._requested_step < step:
+                        self._preparation_requested.wait()
+                logger.info(f"[DataPreparationActor] Step {step}: dispatching synchronous rollout batch")
+                for _ in range(self.global_batch_size):
+                    self._enqueue_next_prompt()
+            else:
+                while step - self._last_consumed_step > self.config.async_steps:
+                    logger.info(
+                        f"[DataPreparationActor] Step {step}: waiting for step {self._last_consumed_step + self.config.async_steps} to be consumed. Consider increasing training compute."
+                    )
+                    time.sleep(0.1)
             generation_idle_wait_time = time.perf_counter() - generation_idle_wait_start_time
 
             logger.info(
                 f"[DataPreparationActor] Step {step}: calling accumulate_inference_batches for {self.global_batch_size} prompts"
+            )
+            population_metrics = population_reward_metrics.PopulationRewardMetrics(
+                max_possible_score=self.config.max_possible_score,
+                mask_truncated_completions=self.config.mask_truncated_completions,
+                response_length=self.config.response_length,
             )
             result, batch, reward_metrics, batch_stats = accumulate_inference_batches(
                 self.inference_results_Q,
@@ -1644,19 +1699,21 @@ class DataPreparationActor:
                 active_sampling=self.config.active_sampling,
                 filter_zero_std_samples=self.config.filter_zero_std_samples,
                 replenish_prompts=True,
+                replenish_accepted_prompts=self.config.async_steps > 0,
                 no_resampling_pass_rate=self.config.no_resampling_pass_rate,
                 iter_dataloader=self.iter_dataloader,
                 param_prompt_Q=self.param_prompt_Q,
                 training_step=step,
                 verbose=self.verbose,
                 max_possible_score=self.config.max_possible_score,
-                max_result_age_steps=self.config.async_steps,
+                max_result_age_steps=self.config.async_steps if self.config.async_steps > 0 else None,
                 base_env_config=self.base_env_config,
                 ground_truth_overrides=self.ground_truth_overrides,
                 image_prewarm_actors=self.image_prewarm_actors,
                 save_filtered_rollouts=self.config.save_filtered_rollouts,
                 filtered_rollouts_save_path=os.path.join(self.config.rollouts_save_path, "filtered"),
                 run_name=self.run_name,
+                population_metrics=population_metrics,
             )
             logger.info(
                 f"[DataPreparationActor] Step {step}: accumulate_inference_batches returned, result type: {type(result).__name__}"
@@ -1681,7 +1738,10 @@ class DataPreparationActor:
                 ]
                 with self.lock:
                     self.prepared_data[step] = empty_data
-                    self.metrics[step] = {"time/generation_idle_waiting_for_trainer": generation_idle_wait_time}
+                    self.metrics[step] = {
+                        "time/generation_idle_waiting_for_trainer": generation_idle_wait_time,
+                        **population_metrics.as_metrics(),
+                    }
                     self.current_prepared_step = step
                 continue
 
@@ -1700,7 +1760,7 @@ class DataPreparationActor:
 
             scores = np.array(batch.scores)
             raw_scores = scores.copy()
-            pre_filtering_batch_avg_score = float(raw_scores.mean() / self.config.max_possible_score)
+            valid_rewards = np.array([rollout_reward_is_valid(s) for s in result.request_info.rollout_states])
 
             concave_length_metrics: dict[str, Any] = {}
             if self.config.add_concave_length_penalty and len(scores) > 0:
@@ -1718,7 +1778,8 @@ class DataPreparationActor:
                 )
                 scores = scores - concave_length_penalties
 
-                solved_mask_raw = raw_scores >= (self.config.max_possible_score - 1e-8)
+                solved_mask_raw = valid_rewards & (raw_scores >= (self.config.max_possible_score - 1e-8))
+                unsolved_mask_raw = valid_rewards & ~solved_mask_raw
                 concave_length_metrics = {
                     "concave_length_penalty/x_mean": float(concave_length_x.mean()),
                     "concave_length_penalty/x_max": float(concave_length_x.max()),
@@ -1728,8 +1789,8 @@ class DataPreparationActor:
                     "concave_length_penalty/penalty_max": float(concave_length_penalties.max()),
                     "concave_length_penalty/penalty_min": float(concave_length_penalties.min()),
                     "concave_length_penalty/penalty_hist": concave_length_penalties,
-                    "concave_length_penalty/shaped_score_mean": float(scores.mean()),
-                    "concave_length_penalty/raw_score_mean": float(raw_scores.mean()),
+                    "concave_length_penalty/shaped_score_mean": float(scores[valid_rewards].mean()),
+                    "concave_length_penalty/raw_score_mean": float(raw_scores[valid_rewards].mean()),
                 }
                 if solved_mask_raw.any():
                     concave_length_metrics["concave_length_penalty/penalty_solved_mean"] = float(
@@ -1738,9 +1799,9 @@ class DataPreparationActor:
                     concave_length_metrics["concave_length_penalty/penalty_solved_max"] = float(
                         concave_length_penalties[solved_mask_raw].max()
                     )
-                if (~solved_mask_raw).any():
+                if unsolved_mask_raw.any():
                     concave_length_metrics["concave_length_penalty/penalty_unsolved_mean"] = float(
-                        concave_length_penalties[~solved_mask_raw].mean()
+                        concave_length_penalties[unsolved_mask_raw].mean()
                     )
 
                 # Within-group spread of penalties among solved rollouts — measures the
@@ -1767,6 +1828,7 @@ class DataPreparationActor:
                 scores=scores,
                 num_samples_per_prompt=self.config.num_samples_per_prompt_rollout,
                 advantage_normalization_type=self.config.advantage_normalization_type,
+                valid_mask=valid_rewards,
             )
 
             if self.config.save_traces and self.config.rollouts_save_path:
@@ -1798,17 +1860,14 @@ class DataPreparationActor:
             #    tool-using rollouts.
             num_before_filter = len(result.finish_reasons)
             response_length_cap = self.config.response_length
-
-            def _is_truncated(i: int) -> bool:
-                return result.finish_reasons[i] != "stop" or len(result.responses[i]) >= response_length_cap
-
-            def _is_non_submitting(i: int) -> bool:
-                states = result.request_info.rollout_states
-                if i >= len(states):
-                    return False
-                return not states[i].get("done", True)
-
-            truncated_idxes = [i for i in range(num_before_filter) if _is_truncated(i)]
+            rollout_states = result.request_info.rollout_states
+            truncated_idxes = [
+                i
+                for i in range(num_before_filter)
+                if population_reward_metrics.is_overlong(
+                    result.finish_reasons[i], len(result.responses[i]), response_length_cap
+                )
+            ]
             num_truncated_completion = len(truncated_idxes)
             truncated_completion_correct_count = (
                 int(sum(1 for i in truncated_idxes if raw_scores[i] > 0)) if num_truncated_completion else 0
@@ -1817,28 +1876,36 @@ class DataPreparationActor:
                 [len(result.responses[i]) for i in truncated_idxes], dtype=np.int64
             )
 
-            non_submitting_idxes = [i for i in range(num_before_filter) if _is_non_submitting(i)]
+            non_submitting_idxes = [
+                i
+                for i in range(min(num_before_filter, len(rollout_states)))
+                if not rollout_states[i].get("done", True)
+            ]
             num_non_submitting_completion = len(non_submitting_idxes)
             num_unmasked_non_submitting_completion = 0
+            non_submitting_idxes_set = set(non_submitting_idxes)
 
-            do_mask_filter = self.config.mask_truncated_completions or self.config.mask_non_submitting_completions
+            invalid_reward_idxes = set(np.flatnonzero(~valid_rewards))
+            do_mask_filter = (
+                self.config.mask_truncated_completions
+                or self.config.mask_non_submitting_completions
+                or bool(invalid_reward_idxes)
+            )
             if do_mask_filter:
-                truncated_drop_idxes = {
-                    i for i in range(num_before_filter) if self.config.mask_truncated_completions and _is_truncated(i)
-                }
-                non_submitting_drop_idxes = [
-                    i
-                    for i in range(num_before_filter)
+                mandatory_drop_idxes = invalid_reward_idxes | (
+                    set(truncated_idxes) if self.config.mask_truncated_completions else set()
+                )
+                non_submitting_drop_idxes = (
+                    [i for i in non_submitting_idxes if i not in mandatory_drop_idxes]
                     if self.config.mask_non_submitting_completions
-                    and _is_non_submitting(i)
-                    and i not in truncated_drop_idxes
-                ]
+                    else []
+                )
                 unmasked_non_submitting_idxes: set[int] = set()
                 if self.config.mask_non_submitting_completions_percent > 0.0:
                     submitting_keep_count = sum(
                         1
                         for i in range(num_before_filter)
-                        if i not in truncated_drop_idxes and not _is_non_submitting(i)
+                        if i not in mandatory_drop_idxes and i not in non_submitting_idxes_set
                     )
                     unmasked_non_submitting_idxes = _sample_non_submitting_unmask_idxes(
                         submitting_count=submitting_keep_count,
@@ -1848,7 +1915,7 @@ class DataPreparationActor:
                     )
                     num_unmasked_non_submitting_completion = len(unmasked_non_submitting_idxes)
 
-                drop_idxes = truncated_drop_idxes | (set(non_submitting_drop_idxes) - unmasked_non_submitting_idxes)
+                drop_idxes = mandatory_drop_idxes | (set(non_submitting_drop_idxes) - unmasked_non_submitting_idxes)
                 keep_idxes_list = [i for i in range(num_before_filter) if i not in drop_idxes]
                 num_dropped = num_before_filter - len(keep_idxes_list)
                 if num_dropped > 0:
@@ -1923,23 +1990,13 @@ class DataPreparationActor:
                 step_metrics = {
                     "time/generation_idle_waiting_for_trainer": generation_idle_wait_time,
                     "scores": raw_scores.mean(),
-                    "val/avg_group_performance_pre_filter": _compute_avg_group_performance(
-                        n_solved=batch_stats.filtered_prompts_solved,
-                        n_zero=batch_stats.filtered_prompts_zero,
-                        n_kept=batch_stats.total_prompts,
-                        batch_avg_score=pre_filtering_batch_avg_score,
-                    ),
-                    "val/avg_group_performance_post_filter": _compute_avg_group_performance(
-                        n_solved=batch_stats.filtered_prompts_solved,
-                        n_zero=batch_stats.filtered_prompts_zero,
-                        n_kept=batch_stats.total_prompts,
-                        batch_avg_score=float(raw_scores.mean() / self.config.max_possible_score),
-                    ),
                     "real_batch_size_ratio": real_num_responses / expected_num_responses,
                     "unsolved_batch_size_ratio": unsolved_num_responses / real_num_responses,
                     "packed_ratio": len(packed_sequences.query_responses) / real_num_responses,
                     "val/solve_rate_hist": batch_stats.percent_solved_hist,
-                    "val/total_reward_groups": real_num_responses / self.config.num_samples_per_prompt_rollout,
+                    "val/total_reward_groups": len(
+                        {i // self.config.num_samples_per_prompt_rollout for i in rollout_sample_ids}
+                    ),
                     "val/sequence_lengths": sequence_lengths.mean(),
                     "val/sequence_lengths_min": sequence_lengths.min(),
                     "val/sequence_lengths_max": sequence_lengths.max(),
@@ -1992,6 +2049,10 @@ class DataPreparationActor:
                 step_metrics["val/actor_tokens_per_second"] = total_tokens / result.token_statistics.generation_time
                 step_metrics["time/getting_response"] = result.token_statistics.generation_time
 
+            # Population reward is independent of the selected batch, even if
+            # all training completions were subsequently masked out.
+            step_metrics.update(population_metrics.as_metrics())
+
             with self.lock:
                 self.prepared_data[step] = collated_data
                 self.metrics[step] = step_metrics
@@ -1999,8 +2060,20 @@ class DataPreparationActor:
 
     def get_data(self, rank: int, step: int) -> dict:
         """Called by each rank's StreamingDataLoader. Blocks until data ready."""
+        if not 0 <= step < self.num_training_steps:
+            raise IndexError(f"Requested training step {step}, but valid steps are [0, {self.num_training_steps})")
         if self._prep_future is None:
             self.start()
+        if self.config.async_steps == 0:
+            with self._preparation_requested:
+                if step > self.current_prepared_step:
+                    expected_step = max(self.current_prepared_step + 1, self.training_step)
+                    if step != expected_step:
+                        raise RuntimeError(
+                            f"Synchronous data preparation expected step {expected_step}, but rank {rank} requested {step}"
+                        )
+                    self._requested_step = step
+                self._preparation_requested.notify()
         logger.info(
             f"[DataPreparationActor.get_data] rank={rank} requesting step={step}, current_prepared_step={self.current_prepared_step}"
         )

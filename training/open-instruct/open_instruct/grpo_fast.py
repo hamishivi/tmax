@@ -181,6 +181,47 @@ WEIGHT_SYNC_TIMEOUT_S = 7200.0
 EXCLUDED_ENV_VARS = {"CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"}
 
 
+def _ray_runtime_env_from_environment() -> dict[str, Any] | None:
+    mode = os.environ.get("OPEN_INSTRUCT_RAY_RUNTIME_ENV", "full").strip().lower()
+    if mode in {"0", "false", "none", "off", "disabled", "disable-gcs-runtime-env"}:
+        logger.info("Skipping Ray runtime_env because OPEN_INSTRUCT_RAY_RUNTIME_ENV=%s", mode)
+        return None
+    if mode == "minimal":
+        keep = {
+            "PATH",
+            "PYTHONPATH",
+            "UV_PROJECT_ENVIRONMENT",
+            "HF_HOME",
+            "HF_HUB_CACHE",
+            "HF_DATASETS_CACHE",
+            "TRANSFORMERS_CACHE",
+            "RAY_ADDRESS",
+            "RAY_TMPDIR",
+            "NCCL_CUMEM_ENABLE",
+            "NCCL_SOCKET_IFNAME",
+            "SANDFLEET_URL",
+            "SANDFLEET_POOL",
+            "SANDFLEET_CLIENT_TOKEN",
+            "SANDFLEET_REGISTRY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        }
+        env_vars = {
+            k: v for k, v in os.environ.items() if (k in keep or k.startswith("SWERL_")) and k not in EXCLUDED_ENV_VARS
+        }
+    else:
+        if mode != "full":
+            logger.warning("Unknown OPEN_INSTRUCT_RAY_RUNTIME_ENV=%s; using full runtime_env", mode)
+        env_vars = {k: v for k, v in os.environ.items() if k not in EXCLUDED_ENV_VARS}
+    return {"excludes": [".git/"], "env_vars": env_vars}
+
+
 def _build_vlm_name_mapper(model_name: str):
     """Sometimes we have different weight names btw vLLM and HF, so we build
     a mapping. E.g., Qwen3.5/3.6 have 'language_model.' prefixed in vLLM but not HF."""
@@ -717,13 +758,9 @@ class PolicyTrainerRayProcess(RayProcess):
     def update_ref_policy(self):
         if not self.args.load_ref_policy:
             return
-        for ref_param, param in zip(self.ref_policy.parameters(), self.model.parameters()):
-            if self.args.deepspeed_stage == 3:
-                with deepspeed.zero.GatheredParameters([param, ref_param], modifier_rank=0):
-                    if deepspeed.comm.get_rank() == 0:
-                        ref_param.data.mul_(1.0 - self.args.alpha).add_(param.data, alpha=self.args.alpha)
-            else:
-                ref_param.data.mul_(1.0 - self.args.alpha).add_(param.data, alpha=self.args.alpha)
+        grpo_utils.update_reference_policy(
+            self.model, self.ref_policy, self.args.alpha, deepspeed_stage_3=self.args.deepspeed_stage == 3
+        )
 
     def calculate_token_counts(
         self, accumulation_steps: int, data_BT: data_types.CollatedBatchData
@@ -750,25 +787,6 @@ class PolicyTrainerRayProcess(RayProcess):
         self.local_metrics["_token_count"] = token_counts.sum().item()
         self.local_metrics["lr"] = self.scheduler.get_last_lr()[0]
 
-    def _record_vllm_local_logprob_debug(
-        self, local_logprobs: torch.Tensor, vllm_logprobs: torch.Tensor, response_mask: torch.Tensor
-    ) -> None:
-        valid_mask = response_mask & ~torch.isnan(vllm_logprobs)
-        logprob_diff = (local_logprobs - vllm_logprobs).abs()
-        masked_diff = torch.masked_fill(logprob_diff, ~valid_mask, 0.0)
-        mean_diff = masked_diff.sum() / valid_mask.sum() if valid_mask.sum() > 0 else 0.0
-        max_diff = masked_diff.max()
-        std_diff = masked_diff[valid_mask].std() if valid_mask.sum() > 1 else 0.0
-
-        self.local_metrics["debug/vllm_vs_local_logprob_diff_mean"] = float(mean_diff)
-        self.local_metrics["debug/vllm_vs_local_logprob_diff_max"] = float(max_diff)
-        self.local_metrics["debug/vllm_vs_local_logprob_diff_std"] = float(std_diff)
-
-        reverse_kl = torch.exp(vllm_logprobs) * (vllm_logprobs - local_logprobs)
-        masked_reverse_kl = torch.masked_fill(reverse_kl, ~valid_mask, 0.0)
-        mean_reverse_kl = masked_reverse_kl.sum() / valid_mask.sum() if valid_mask.sum() > 0 else 0.0
-        self.local_metrics["debug/vllm_local_reverse_kl"] = float(mean_reverse_kl)
-
     def _compute_tiled_dapo_loss(
         self,
         query_responses: torch.Tensor,
@@ -778,6 +796,7 @@ class PolicyTrainerRayProcess(RayProcess):
         old_logprobs: torch.Tensor,
         ref_logprobs: torch.Tensor | None,
         policy_mask: torch.Tensor | None,
+        kl_mask: torch.Tensor | None,
         policy_freeze_mask: torch.Tensor | None,
         loss_denominator: float,
         loss_denominator_mode: str,
@@ -809,16 +828,16 @@ class PolicyTrainerRayProcess(RayProcess):
             rollout_sample_ids,
             self._sp_group,
         )
-        # Drain queued device work and keep ranks entering ZeRO-3 backward
-        # with bounded skew, without averaging their distinct local normalizers.
+        # Bound rank skew without averaging their distinct local normalizers.
         dist.barrier()
         torch.cuda.synchronize()
-        loss, kl_avg, clipfrac, ratio_avg = grpo_utils.tiled_grpo_lm_head_loss(
+        tiled_outputs = grpo_utils.tiled_grpo_lm_head_loss(
             lm_head=lm_head,
             hidden_states=hidden_states,
             selected_token_ids=selected_token_ids,
             response_mask=response_mask,
             policy_mask=policy_mask,
+            kl_mask=kl_mask,
             advantages=advantages,
             old_logprobs=old_logprobs,
             ref_logprobs=ref_logprobs,
@@ -831,15 +850,22 @@ class PolicyTrainerRayProcess(RayProcess):
             loss_fn=self.args.loss_fn,
             dppo_divergence_type=self.args.dppo_divergence_type,
             dppo_divergence_threshold=self.args.dppo_divergence_threshold,
+            dppo_ratio_cap=self.args.dppo_ratio_cap,
             tvpo_truncation_cap=self.args.tvpo_truncation_cap,
             loss_denominator=loss_denominator_mode,
             rollout_sample_ids=rollout_sample_ids,
             sequence_process_group=self._sp_group,
             policy_freeze_mask=policy_freeze_mask,
+            record_entropy=self.args.record_entropy,
         )
+        if self.args.record_entropy:
+            loss, kl_avg, clipfrac, ratio_avg, entropy_avg = tiled_outputs
+        else:
+            loss, kl_avg, clipfrac, ratio_avg = tiled_outputs
+            entropy_avg = None
         if ref_logprobs is not None:
-            return loss, (kl_avg, clipfrac, ratio_avg)
-        return loss, (clipfrac, ratio_avg)
+            return loss, (kl_avg, clipfrac, ratio_avg, entropy_avg)
+        return loss, (clipfrac, ratio_avg, entropy_avg)
 
     def _compute_logprobs(
         self, model: torch.nn.Module, data_BT: data_types.CollatedBatchData, cp_contexts_BT: list[Any]
@@ -983,6 +1009,9 @@ class PolicyTrainerRayProcess(RayProcess):
         # This only needs to be done once since response_masks don't change across epochs
         token_counts_per_sample = torch.stack([mask[:, 1:].sum().float() for mask in data_BT.response_masks])
         device = token_counts_per_sample.device
+        policy_drift = grpo_utils.PolicyDriftAccumulator(
+            device=device, max_staleness=self.streaming_config.async_steps
+        )
         grad_norms: list[float] = []  # May include nan/inf values reported by DeepSpeed.
         value_loss_inputs: list[dict[str, torch.Tensor]] | None = None
         value_step_metrics: dict[str, float] = {}
@@ -1065,13 +1094,15 @@ class PolicyTrainerRayProcess(RayProcess):
                 value_step_metrics["value/predictions_mean"] = float(np.mean(preds_np))
                 value_step_metrics["value/predictions_std"] = float(np.std(preds_np))
                 value_step_metrics["value/explained_variance"] = 1.0 - float(np.var(residuals)) / (return_var + 1e-8)
+        sequence_tis_mask_enabled = self.args.sequence_tis_mask_lower > 0.0 or self.args.sequence_tis_mask_upper > 0.0
         tis_mask_enabled = (
-            self.args.tis_mask_lower > 0.0
-            or self.args.tis_mask_upper > 0.0
-            or self.args.sequence_tis_mask_log_ratio_threshold > 0.0
+            self.args.tis_mask_lower > 0.0 or self.args.tis_mask_upper > 0.0 or sequence_tis_mask_enabled
         )
         tis_mask_kept_tokens = torch.zeros((), device=device)
         tis_mask_total_tokens = torch.zeros((), device=device)
+        sequence_tis_lower_masked = torch.zeros((), device=device)
+        sequence_tis_upper_masked = torch.zeros((), device=device)
+        sequence_tis_total = torch.zeros((), device=device)
         dppo_enabled = self.args.loss_fn == grpo_utils.GRPOLossType.dppo
         dppo_mask_kept_tokens = torch.zeros((), device=device)
         dppo_mask_total_tokens = torch.zeros((), device=device)
@@ -1111,6 +1142,7 @@ class PolicyTrainerRayProcess(RayProcess):
                     if self.args.use_liger_grpo_loss:
                         vllm_logprobs_BT = grpo_utils.mask_logprobs(data_BT.vllm_logprobs[i][:, 1:], response_mask_BT)
                         tvpo_policy_freeze_mask_BT = None
+                        debug_dppo_mask_BT = None
                         with torch.no_grad():
                             debug_logprobs_BT, _ = grpo_utils.forward_for_logprobs(
                                 self.model,
@@ -1145,21 +1177,22 @@ class PolicyTrainerRayProcess(RayProcess):
                                 self.args.tis_mask_lower,
                                 self.args.tis_mask_upper,
                             )
-                            sequence_tis_mask_BT = grpo_utils.compute_sequence_tis_mask(
-                                debug_logprobs_BT,
-                                vllm_logprobs_BT,
-                                advantages_BT,
-                                response_mask_BT,
-                                self.args.sequence_tis_mask_log_ratio_threshold,
-                                self.args.sequence_tis_mask_negative_advantages_only,
-                                data_BT.rollout_sample_ids[i][:, 1:]
-                                if data_BT.rollout_sample_ids is not None
-                                else None,
-                                self._sp_group,
+                            (sequence_tis_mask_BT, sequence_lower_masked, sequence_upper_masked, sequence_total) = (
+                                grpo_utils.compute_sequence_tis_mask(
+                                    debug_logprobs_BT,
+                                    vllm_logprobs_BT,
+                                    response_mask_BT,
+                                    data_BT.rollout_sample_ids[i][:, 1:]
+                                    if data_BT.rollout_sample_ids is not None
+                                    else None,
+                                    self._sp_group,
+                                    self.args.sequence_tis_mask_lower,
+                                    self.args.sequence_tis_mask_upper,
+                                )
                             )
-                            self._record_vllm_local_logprob_debug(
-                                debug_logprobs_BT, vllm_logprobs_BT, response_mask_BT
-                            )
+                            sequence_tis_lower_masked += sequence_lower_masked
+                            sequence_tis_upper_masked += sequence_upper_masked
+                            sequence_tis_total += sequence_total
                             effective_tis_mask_BT = grpo_utils.combine_tis_terms(tis_mask_BT, sequence_tis_mask_BT)
                             combined_tis_BT = grpo_utils.combine_tis_terms(
                                 tis_clamped_BT, tis_mask_BT, sequence_tis_mask_BT
@@ -1202,9 +1235,31 @@ class PolicyTrainerRayProcess(RayProcess):
                                 tvpo_mask_total_tokens += response_mask_BT.sum()
                                 tvpo_tv_weighted_sum += (debug_tvpo_prompt_tv_BT * response_mask_BT).sum()
                                 tvpo_tv_weight += response_mask_BT.sum()
+                            logging_policy_weight_BT = grpo_utils.combine_tis_terms(
+                                combined_tis_BT, debug_dppo_mask_BT
+                            )
+                            policy_gradient_weights_BT = grpo_utils.compute_policy_gradient_weights(
+                                debug_logprobs_BT - old_logprob_BT,
+                                advantages_BT,
+                                self.args,
+                                policy_weight=logging_policy_weight_BT,
+                                policy_freeze_mask=tvpo_policy_freeze_mask_BT,
+                            )
+                            policy_drift.update(
+                                new_logprobs=debug_logprobs_BT,
+                                rollout_logprobs=vllm_logprobs_BT,
+                                response_mask=response_mask_BT,
+                                policy_gradient_weights=policy_gradient_weights_BT,
+                                model_steps=(
+                                    data_BT.model_steps[i][:, 1:] if data_BT.model_steps is not None else None
+                                ),
+                                # Rollout model versions count completed updates;
+                                # training_step labels the update about to run.
+                                training_step=training_step - 1,
+                            )
                         is_accumulation_boundary = (local_step + 1) % accumulation_steps == 0
                         self.model.set_gradient_accumulation_boundary(is_accumulation_boundary)
-                        loss, tiled_metrics = self._compute_tiled_dapo_loss(
+                        loss_kwargs = dict(
                             query_responses=data_BT.query_responses[i],
                             position_ids=data_BT.position_ids[i],
                             response_mask=response_mask_BT,
@@ -1212,6 +1267,7 @@ class PolicyTrainerRayProcess(RayProcess):
                             old_logprobs=old_logprob_BT,
                             ref_logprobs=ref_logprobs_BT[i] if self.args.load_ref_policy else None,
                             policy_mask=combined_tis_BT,
+                            kl_mask=sequence_tis_mask_BT,
                             policy_freeze_mask=tvpo_policy_freeze_mask_BT,
                             loss_denominator=loss_denominator,
                             loss_denominator_mode=self.args.loss_denominator,
@@ -1222,6 +1278,7 @@ class PolicyTrainerRayProcess(RayProcess):
                             ),
                             cp_context=cp_contexts_BT[i],
                         )
+                        loss, tiled_metrics = self._compute_tiled_dapo_loss(**loss_kwargs)
 
                         torch.cuda.empty_cache()
                         self.model.backward(loss)
@@ -1248,6 +1305,8 @@ class PolicyTrainerRayProcess(RayProcess):
                             loss_stats_B["policy/clipfrac_avg"][i] = clip_metric
                             loss_stats_B["loss/total_avg"][i] = loss.detach()
                             loss_stats_B["val/ratio"][i] = ratio_metric
+                            if self.args.record_entropy:
+                                loss_stats_B["policy/entropy_avg"][i] = tiled_metrics[-1]
                         continue
 
                     local_logprobs_BT, entropy_BT = grpo_utils.forward_for_logprobs(
@@ -1262,9 +1321,6 @@ class PolicyTrainerRayProcess(RayProcess):
                     )
                     local_logprobs_BT = grpo_utils.mask_logprobs(local_logprobs_BT, response_mask_BT)
                     vllm_logprobs_BT = grpo_utils.mask_logprobs(data_BT.vllm_logprobs[i][:, 1:], response_mask_BT)
-
-                    with torch.no_grad():
-                        self._record_vllm_local_logprob_debug(local_logprobs_BT, vllm_logprobs_BT, response_mask_BT)
 
                     new_logprobs_BT = local_logprobs_BT
 
@@ -1284,7 +1340,11 @@ class PolicyTrainerRayProcess(RayProcess):
                     # the trust-region anchor μ_θ' from Takeaway 2 in
                     # arXiv:2602.04879 without a separate code path.
                     logprobs_diff_BT = new_logprobs_BT - old_logprob_BT
-                    ratio_BT = torch.exp(logprobs_diff_BT)
+                    ratio_BT = (
+                        grpo_utils.compute_dppo_ratio(logprobs_diff_BT)
+                        if self.args.loss_fn == grpo_utils.GRPOLossType.dppo
+                        else torch.exp(logprobs_diff_BT)
+                    )
                     tis_clamped_BT, tis_unclamped_BT = grpo_utils.compute_tis_weights(
                         old_logprob_BT,
                         vllm_logprobs_BT,
@@ -1298,16 +1358,20 @@ class PolicyTrainerRayProcess(RayProcess):
                         self.args.tis_mask_lower,
                         self.args.tis_mask_upper,
                     )
-                    sequence_tis_mask_BT = grpo_utils.compute_sequence_tis_mask(
-                        new_logprobs_BT,
-                        vllm_logprobs_BT,
-                        advantages_BT,
-                        response_mask_BT,
-                        self.args.sequence_tis_mask_log_ratio_threshold,
-                        self.args.sequence_tis_mask_negative_advantages_only,
-                        data_BT.rollout_sample_ids[i][:, 1:] if data_BT.rollout_sample_ids is not None else None,
-                        self._sp_group,
+                    (sequence_tis_mask_BT, sequence_lower_masked, sequence_upper_masked, sequence_total) = (
+                        grpo_utils.compute_sequence_tis_mask(
+                            new_logprobs_BT,
+                            vllm_logprobs_BT,
+                            response_mask_BT,
+                            data_BT.rollout_sample_ids[i][:, 1:] if data_BT.rollout_sample_ids is not None else None,
+                            self._sp_group,
+                            self.args.sequence_tis_mask_lower,
+                            self.args.sequence_tis_mask_upper,
+                        )
                     )
+                    sequence_tis_lower_masked += sequence_lower_masked
+                    sequence_tis_upper_masked += sequence_upper_masked
+                    sequence_tis_total += sequence_total
                     if self.args.loss_fn == grpo_utils.GRPOLossType.dppo:
                         dppo_mask_BT, _ = grpo_utils.compute_dppo_mask(
                             new_logprobs=new_logprobs_BT,
@@ -1361,6 +1425,22 @@ class PolicyTrainerRayProcess(RayProcess):
                             tis_mask_kept_tokens += effective_tis_mask_BT.sum()
                             tis_mask_total_tokens += response_mask_BT.sum()
 
+                    policy_gradient_weights_BT = grpo_utils.compute_policy_gradient_weights(
+                        logprobs_diff_BT,
+                        advantages_BT,
+                        self.args,
+                        policy_weight=combined_tis_BT,
+                        policy_freeze_mask=tvpo_mask_BT,
+                    )
+                    policy_drift.update(
+                        new_logprobs=new_logprobs_BT,
+                        rollout_logprobs=vllm_logprobs_BT,
+                        response_mask=response_mask_BT,
+                        policy_gradient_weights=policy_gradient_weights_BT,
+                        model_steps=data_BT.model_steps[i][:, 1:] if data_BT.model_steps is not None else None,
+                        training_step=training_step - 1,
+                    )
+
                     pg_losses_BT, pg_losses2_BT, pg_loss_max_BT, kl_BT = grpo_utils.compute_grpo_loss(
                         new_logprobs=new_logprobs_BT,
                         ratio=ratio_BT,
@@ -1369,6 +1449,7 @@ class PolicyTrainerRayProcess(RayProcess):
                         config=self.args,
                         tis_weights=combined_tis_BT,
                         policy_freeze_mask=tvpo_mask_BT,
+                        kl_mask=sequence_tis_mask_BT,
                     )
 
                     per_token_loss_BT = pg_loss_max_BT + self.args.beta * kl_BT
@@ -1464,6 +1545,8 @@ class PolicyTrainerRayProcess(RayProcess):
             batch_metrics = batch_data["metrics"]
             with torch.no_grad():
                 self._compute_loss_metrics(loss_stats_B, token_counts_per_sample)
+                for key, value in policy_drift.compute_metrics().items():
+                    self.local_metrics[key] = value
                 if tis_mask_enabled:
                     frac_kept = (
                         tis_mask_kept_tokens / tis_mask_total_tokens
@@ -1471,6 +1554,18 @@ class PolicyTrainerRayProcess(RayProcess):
                         else torch.zeros((), device=device)
                     )
                     self.local_metrics["debug/tis_mask_frac_kept"] = float(frac_kept)
+                if sequence_tis_mask_enabled:
+                    if sequence_tis_total > 0:
+                        sequence_lower_frac = sequence_tis_lower_masked / sequence_tis_total
+                        sequence_upper_frac = sequence_tis_upper_masked / sequence_tis_total
+                        sequence_kept_frac = 1.0 - sequence_lower_frac - sequence_upper_frac
+                    else:
+                        sequence_lower_frac = torch.zeros((), device=device)
+                        sequence_upper_frac = torch.zeros((), device=device)
+                        sequence_kept_frac = torch.zeros((), device=device)
+                    self.local_metrics["debug/sequence_tis_mask_lower_frac"] = float(sequence_lower_frac)
+                    self.local_metrics["debug/sequence_tis_mask_upper_frac"] = float(sequence_upper_frac)
+                    self.local_metrics["debug/sequence_tis_mask_frac_kept"] = float(sequence_kept_frac)
                 if dppo_enabled:
                     dppo_frac_kept = (
                         dppo_mask_kept_tokens / dppo_mask_total_tokens
@@ -1572,13 +1667,8 @@ class PolicyTrainerRayProcess(RayProcess):
 
             # For reference policy, we save just the model weights
             # We can't use save_checkpoint because it would try to save DummyOptim
-            # which doesn't have state_dict
-            if self.rank == 0:
-                # Only rank 0 saves the model state
-                model_to_save = self.ref_policy.module if hasattr(self.ref_policy, "module") else self.ref_policy
-                # Save the state dict
-                torch.save(model_to_save.state_dict(), os.path.join(ref_policy_dir, "pytorch_model.bin"))
-                logger.info(f"Saved reference policy model to {ref_policy_dir}")
+            # which doesn't have state_dict. Collective -- see the helper's docstring.
+            gather_and_write_ref_policy(self.ref_policy, ref_policy_dir, self.rank, self.args.deepspeed_stage)
 
             client_state["ref_policy_saved"] = True
 
@@ -2072,7 +2162,12 @@ def create_model_and_optimizer(
 ]:
     """Create the model, optimizer, and vLLM engines."""
     # Create placement group
-    bundles = [{"GPU": actor_num_gpus, "CPU": actor_num_gpus * 10} for actor_num_gpus in args.num_learners_per_node]
+    trainer_cpus_per_gpu = float(os.environ.get("GRPO_TRAINER_CPUS_PER_GPU", "10"))
+    bundles = [
+        {"GPU": actor_num_gpus, "CPU": actor_num_gpus * trainer_cpus_per_gpu}
+        for actor_num_gpus in args.num_learners_per_node
+    ]
+    logger.info("Trainer placement group bundles: %s", bundles)
     pg = placement_group(bundles, strategy="STRICT_SPREAD")
     ray_get_with_progress([pg.ready()], desc="Waiting for placement group")
 
@@ -2175,6 +2270,7 @@ def create_model_and_optimizer(
         tool_stop_sequences=tool_stop_sequences,
         max_steps=tools_config.max_steps if tools_config else 5,
         per_turn_max_tokens=tools_config.per_turn_max_tokens if tools_config else None,
+        seed_per_turn=vllm_config.vllm_seed_per_turn,
         mask_tool_use=streaming_config.mask_tool_use,
         pools=pools,
         prompt_queue=prompt_Q,
@@ -2267,12 +2363,14 @@ def create_generation_configs(
 
 
 class WeightSyncTrigger:
-    """Event-like trigger that also carries the latest target model step."""
+    """Carry the latest requested model step and acknowledge completed synchronization."""
 
     def __init__(self) -> None:
         self._event = threading.Event()
         self._lock = threading.Lock()
+        self._completion_condition = threading.Condition(self._lock)
         self._step: int | None = None
+        self._completed_step = -1
 
     def notify(self, step: int | None = None) -> None:
         with self._lock:
@@ -2289,6 +2387,19 @@ class WeightSyncTrigger:
             step = self._step
             self._event.clear()
             return step
+
+    def mark_complete(self, step: int) -> None:
+        with self._completion_condition:
+            if step < self._completed_step:
+                raise RuntimeError(
+                    f"Weight synchronization completed out of order: step {step} after {self._completed_step}"
+                )
+            self._completed_step = step
+            self._completion_condition.notify_all()
+
+    def wait_until_complete(self, step: int, timeout: float | None = None) -> bool:
+        with self._completion_condition:
+            return self._completion_condition.wait_for(lambda: self._completed_step >= step, timeout=timeout)
 
 
 def weight_sync_thread(
@@ -2380,6 +2491,9 @@ def weight_sync_thread(
         except Full:
             logger.warning("[Weight Sync Thread] weight sync metrics queue full, skipping metric")
 
+        if target_model_step is not None:
+            weight_sync_trigger.mark_complete(target_model_step)
+
     logger.info("[Weight Sync Thread] 🛑 Stopping weight sync thread")
 
 
@@ -2401,7 +2515,6 @@ def one_training_step(
     actor_manager: ActorManager | None = None,
 ) -> tuple[int, int]:
     """Train the model for one step. Returns tokens processed and the updated episode count."""
-    update_ref_policy_future = []
     with Timer("[Main Thread] 🗡️ Training") as train_timer:
         results, _ = ray_get_with_progress(
             [policy_group.models[i].step.remote(training_step) for i in range(args.world_size)],
@@ -2417,10 +2530,10 @@ def one_training_step(
             and training_step % args.ref_policy_update_freq == 0
             and args.alpha > 0
         ):
-            update_ref_policy_future.extend(
-                [policy_group.models[i].update_ref_policy.remote() for i in range(args.world_size)]
+            ray_get_with_progress(
+                [policy_group.models[i].update_ref_policy.remote() for i in range(args.world_size)],
+                desc=f"Updating reference policy at step {training_step}",
             )
-            ray_get_with_progress(update_ref_policy_future, desc=f"Updating reference policy at step {training_step}")
 
     save_time = maybe_save_checkpoint(args, training_step, policy_group, chat_template_name, tokenizer, wandb_url)
 
@@ -2443,6 +2556,9 @@ def one_training_step(
         "val/ratio",
         "val/ratio_var",
         "debug/tis_mask_frac_kept",
+        "debug/sequence_tis_mask_lower_frac",
+        "debug/sequence_tis_mask_upper_frac",
+        "debug/sequence_tis_mask_frac_kept",
         "debug/dppo_mask_frac_kept",
         "debug/tvpo_mask_frac_kept",
         "actor/ppo_tv",
@@ -2518,6 +2634,58 @@ def one_training_step(
         wandb.log(metrics_to_log, step=training_step)
 
     return num_step_tokens, episode
+
+
+def gather_and_write_ref_policy(ref_policy, ref_policy_dir: str, rank: int, deepspeed_stage: int) -> None:
+    """Gather a possibly ZeRO-3 partitioned reference policy and write it on rank 0.
+
+    COLLECTIVE: every rank must call this. Extracted so production and the
+    distributed tests exercise exactly the same code rather than a reproduction.
+
+    Under ZeRO-3 each rank holds only its own partition, so calling state_dict()
+    inside an `if rank == 0` branch writes a SHARD, not a model: observed
+    2,277,903 bytes / 1,061,376 total numel for a 9B policy, 250 of 427 tensors at
+    numel=0. The reload then fails every shape check and silently falls back to the
+    base reference. `_zero3_consolidated_16bit_state_dict()` is collective, so it
+    must be called outside the rank guard; only the write stays rank-0.
+
+    Raises RuntimeError on EVERY rank if rank 0 could not validate or write, so a
+    failure is symmetric and no rank is stranded in the next collective.
+    """
+    state_to_save = None
+    if deepspeed_stage == 3 and hasattr(ref_policy, "_zero3_consolidated_16bit_state_dict"):
+        # all ranks participate; only rank 0 receives a populated dict
+        state_to_save = ref_policy._zero3_consolidated_16bit_state_dict()
+    elif rank == 0:
+        model_to_save = ref_policy.module if hasattr(ref_policy, "module") else ref_policy
+        state_to_save = model_to_save.state_dict()
+
+    # Validation and the write happen on rank 0, but the OUTCOME must reach every
+    # rank. Raising only on rank 0 would leave the others to walk into the next
+    # collective and block until walltime -- a hang is worse than the bad save it
+    # guards against. ALL of rank 0's preparation sits inside the try, because
+    # state_to_save may be None or a non-mapping if the gather misbehaved.
+    save_error: str | None = None
+    if rank == 0:
+        try:
+            empty = sum(1 for v in state_to_save.values() if hasattr(v, "numel") and v.numel() == 0)
+            if empty:
+                save_error = (
+                    f"refusing to save reference policy: {empty}/{len(state_to_save)} tensors "
+                    f"have numel=0, so the gather did not produce a full model"
+                )
+            else:
+                torch.save(state_to_save, os.path.join(ref_policy_dir, "pytorch_model.bin"))
+                logger.info(f"Saved reference policy model to {ref_policy_dir}")
+        except Exception as e:  # gather returned junk, disk full, truncated write
+            save_error = f"reference policy save failed: {type(e).__name__}: {e}"
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        payload = [save_error]
+        torch.distributed.broadcast_object_list(payload, src=0)
+        save_error = payload[0]
+    if save_error is not None:
+        raise RuntimeError(save_error)
 
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=3)
@@ -2608,6 +2776,7 @@ def maybe_evaluate(
             active_sampling=False,
             filter_zero_std_samples=False,
             replenish_prompts=False,
+            min_valid_group_size=0,  # Eval consumes every dispatched group, including unscored groups.
             max_possible_score=max_possible_score,
         )
 
@@ -2620,9 +2789,20 @@ def maybe_evaluate(
         eval_reward_metrics = {f"eval/{key}": val for key, val in eval_reward_metrics.items()}
         eval_pass_at_k_metrics: dict[str, float] = {}
         scores = np.array(eval_batch.scores)
+        valid_rewards = np.array(
+            [data_loader_lib.rollout_reward_is_valid(state) for state in eval_result.request_info.rollout_states],
+            dtype=bool,
+        )
+        if valid_rewards.shape != scores.shape:
+            raise ValueError("Eval reward validity metadata does not match score count")
         eval_k = eval_generation_config.n
 
-        if scores.size and scores.size % eval_k == 0:
+        if not valid_rewards.all():
+            # Aggregated reward diagnostics cannot be corrected from their means.
+            # Likewise, dropping failed measurements changes the pass@k population.
+            eval_reward_metrics = {}
+            logger.warning("Eval has unscored rollouts; omitting pass@k and aggregated reward diagnostics.")
+        elif scores.size and scores.size % eval_k == 0:
             scores_per_prompt = scores.reshape(-1, eval_k)
             correct_per_prompt = scores_per_prompt >= max_possible_score - 1e-8
             eval_pass_at_k_metrics.update(grpo_utils.compute_pass_at_k_metrics(correct_per_prompt))
@@ -2631,7 +2811,8 @@ def maybe_evaluate(
                 "Eval scores size %s is not divisible by eval_k %s; skipping pass@k metrics.", scores.size, eval_k
             )
         eval_metrics = {
-            "eval/scores": scores.mean(),
+            "eval/scored_rollouts": int(valid_rewards.sum()),
+            "eval/unscored_rollouts": int((~valid_rewards).sum()),
             "eval/sequence_lengths": eval_sequence_lengths.mean(),
             "eval/sequence_lengths_min": eval_sequence_lengths.min(),
             "eval/sequence_lengths_max": eval_sequence_lengths.max(),
@@ -2639,6 +2820,8 @@ def maybe_evaluate(
             **eval_reward_metrics,
             **eval_pass_at_k_metrics,
         }
+        if valid_rewards.any():
+            eval_metrics["eval/scores"] = scores[valid_rewards].mean()
 
         total_tokens = (
             eval_result.token_statistics.num_prompt_tokens + eval_result.token_statistics.num_response_tokens
@@ -2651,7 +2834,7 @@ def maybe_evaluate(
         table["prompt"] = tokenizer.batch_decode(eval_batch.queries if eval_batch else [])
         table["response"] = eval_batch.decoded_responses
         table["response"] = [item.replace(tokenizer.pad_token, "") for item in table["response"]]
-        table["scores"] = eval_batch.scores
+        table["scores"] = [score if valid else None for score, valid in zip(eval_batch.scores, valid_rewards)]
         table["ground_truth"] = eval_batch.ground_truths if eval_batch else []
         if eval_batch.active_tools is not None:
             table["active_tools"] = [str(tools) if tools is not None else "all" for tools in eval_batch.active_tools]
@@ -2850,7 +3033,18 @@ def run_training(
             enable=False,
         )
 
-    def initialize_weight_sync() -> tuple[futures.Future, WeightSyncTrigger]:
+    def wait_for_weight_sync_completion(
+        trigger: WeightSyncTrigger, weight_sync_future: futures.Future, step: int
+    ) -> None:
+        start = time.perf_counter()
+        while not trigger.wait_until_complete(step, timeout=0.1):
+            if weight_sync_future.done():
+                weight_sync_future.result()
+                raise RuntimeError(f"Weight sync thread exited before completing step {step}")
+            if time.perf_counter() - start > WEIGHT_SYNC_TIMEOUT_S:
+                raise RuntimeError(f"Weight sync timed out after {WEIGHT_SYNC_TIMEOUT_S}s for step {step}")
+
+    def initialize_weight_sync(initial_model_step: int) -> tuple[futures.Future, WeightSyncTrigger]:
         logger.info("[Main Thread] Initializing native vLLM weight sync.")
 
         ray_get_with_progress(
@@ -2878,7 +3072,7 @@ def run_training(
         )
 
         logger.info("[Main Thread] Triggering initial native vLLM weight sync.")
-        trigger.notify(step=resume_training_step)
+        trigger.notify(step=initial_model_step)
         health_check_fn(future, expect_new_weight_sync=True)
         return future, trigger
 
@@ -2899,7 +3093,9 @@ def run_training(
     if args.deepspeed_stage == 3:
         logger.info("[Main Thread] ZeRO-3: running dummy optimizer step to prime NCCL state.")
         ray_get_with_progress([m.dummy_optimizer_step.remote() for m in policy_group.models], desc="ZeRO-3 dummy step")
-        weight_sync_thread_future, weight_sync_trigger = initialize_weight_sync()
+        # The next real optimizer step has not run yet, so the synced policy is
+        # the checkpoint from the preceding completed training step.
+        weight_sync_thread_future, weight_sync_trigger = initialize_weight_sync(resume_training_step - 1)
     ray_get_with_progress([_data_prep_actor.start.remote()], desc="Starting data prep actor")
 
     if eval_dataset is not None:
@@ -3021,7 +3217,12 @@ def run_training(
             # Non-ZeRO-3 runs initialise weight sync after the first training
             # step. ZeRO-3 is handled pre-loop via a dummy step, so
             # weight_sync_trigger is already set in that case.
-            weight_sync_thread_future, weight_sync_trigger = initialize_weight_sync()
+            weight_sync_thread_future, weight_sync_trigger = initialize_weight_sync(training_step)
+
+        if streaming_config.async_steps == 0:
+            if weight_sync_trigger is None or weight_sync_thread_future is None:
+                raise RuntimeError("Synchronous rollout collection requires an active weight synchronization thread")
+            wait_for_weight_sync_completion(weight_sync_trigger, weight_sync_thread_future, training_step)
 
         last_eval_collected = maybe_evaluate(
             args,
@@ -3050,6 +3251,13 @@ def run_training(
     save_final_model(args, policy_group, tokenizer, training_step, wandb_url, tc.chat_template_name)
 
 
+def _hf_offline_mode_enabled() -> bool:
+    return any(
+        os.environ.get(var, "").lower() in {"1", "true", "yes", "on"}
+        for var in ("HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE")
+    )
+
+
 def _discover_tools_from_datasets(dataset_mixer_list: list[str], dataset_mixer_list_splits: list[str]) -> set[str]:
     """Scan datasets for tool names referenced in 'tools' and 'env_config' columns."""
     tool_names: set[str] = set()
@@ -3062,7 +3270,23 @@ def _discover_tools_from_datasets(dataset_mixer_list: list[str], dataset_mixer_l
     for i in range(0, len(dataset_mixer_list), 2):
         dataset_name = dataset_mixer_list[i]
         split = splits[i // 2]
-        ds = datasets.load_dataset(dataset_name, split=split)
+        try:
+            if os.path.isfile(dataset_name) and dataset_name.endswith((".jsonl", ".parquet")):
+                file_format = "json" if dataset_name.endswith(".jsonl") else "parquet"
+                ds = datasets.load_dataset(file_format, data_files=dataset_name, split=split)
+            else:
+                ds = datasets.load_dataset(dataset_name, split=split)
+        except Exception as e:
+            if _hf_offline_mode_enabled() or "OfflineModeIsEnabled" in repr(e):
+                logger.warning(
+                    "Skipping dataset tool auto-discovery for %s (%s) because the dataset "
+                    "could not be resolved while HF offline mode is enabled: %s",
+                    dataset_name,
+                    split,
+                    e,
+                )
+                continue
+            raise
         if TOOLS_COLUMN_KEY in ds.column_names:
             for tools in ds[TOOLS_COLUMN_KEY]:
                 if tools:
@@ -3204,8 +3428,11 @@ def main(
     hf_cache = os.environ.get("HF_HUB_CACHE", os.path.expanduser("~/.cache/huggingface/hub"))
     barrier_file = os.path.join(hf_cache, f".model_download_done_{os.environ.get('BEAKER_JOB_ID', 'local')}")
     if rank == 0:
-        logger.info(f"Pre-downloading model {model_config.model_name_or_path}...")
-        snapshot_download(model_config.model_name_or_path, revision=model_config.model_revision)
+        if os.path.exists(model_config.model_name_or_path):
+            logger.info(f"Using local model path {model_config.model_name_or_path}; skipping HF pre-download.")
+        else:
+            logger.info(f"Pre-downloading model {model_config.model_name_or_path}...")
+            snapshot_download(model_config.model_name_or_path, revision=model_config.model_revision)
         open(barrier_file, "w").close()
         logger.info("Model pre-download complete.")
     else:
@@ -3227,12 +3454,11 @@ def main(
     beaker_config, wandb_url = setup_experiment_tracking(args, tc, model_config, streaming_config, vllm_config)
 
     # We have to initialize ray earlier for constructing Tools (they are implemented as ray actors).
-    ray.init(
-        runtime_env={
-            "excludes": [".git/"],
-            "env_vars": {k: v for k, v in os.environ.items() if k not in EXCLUDED_ENV_VARS},
-        }
-    )
+    runtime_env = _ray_runtime_env_from_environment()
+    if runtime_env is None:
+        ray.init()
+    else:
+        ray.init(runtime_env=runtime_env)
 
     pool_size = tools_config.pool_size
     if pool_size is None:
@@ -3349,7 +3575,7 @@ def main(
         logger.info(f"Restored episode count: {episode}")
 
     # Create additional queues (main queues already created above)
-    weight_sync_metrics_Q = Queue(maxsize=streaming_config.async_steps)
+    weight_sync_metrics_Q = Queue(maxsize=max(streaming_config.async_steps, 1))
 
     stop_event = threading.Event()
     executor = futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="grpo")

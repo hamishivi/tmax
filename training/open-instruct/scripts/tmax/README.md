@@ -1,111 +1,135 @@
-# tmax training scripts
+# Tmax training recipes
 
-These are the training launch scripts for the tmax fork (Qwen 3.5 + terminal agent training).
+Run these scripts from `training/open-instruct/`. They use the current trainer,
+including capped DPPO, valid-sibling reward handling, distributed batch padding,
+and independent grading deadlines.
 
-I recommend starting with the 1 GPU RL debug script (`qwen35_2b_1gpu.sh`), and then scaling up to the full-size scripts.
-The debug script should run, take 3 steps, and exit without errors if everything is working.
-
-**Important**: For people at ai2, you should run in beaker session with `BEAKER_ALLOW_SUBCONTAINERS=1` and `BEAKER_SKIP_DOCKER_SOCKET=1` set to avoid using beaker's own docker instance, which is not allowed. For podman to work, you should also use an image with ubuntu 24.04 or newer (e.g., one interactive session command that works is `beaker session create --gpus 1 --remote --bare --cluster ai2/saturn --image beaker://hamishivi/hamishivi-interactive --host-networking --mount src=weka,ref=oe-adapt-default,subpath=hamishi,dst=/root --mount src=weka,ref=oe-training-default,dst=/weka/oe-training-default --mount src=weka,ref=oe-adapt-default,dst=/weka/oe-adapt-default   --workspace ai2/olmo-instruct --workdir /root  --priority urgent --env BEAKER_ALLOW_SUBCONTAINERS=1 --env BEAKER_SKIP_DOCKER_SOCKET=1 -- bash`). You also might need to run `unset LD_LIBRARY_PATH` to avoid conflicts with the system libraries when running stuff in interactives.
-
-### Podman setup
-
-Before running the script, you should install podman and crun by running the following command.
-If you already have podman and crun installed, you can skip this step.
+Start with the single-GPU debug recipe after configuring a Docker/Podman service
+or a remote sandbox backend:
 
 ```bash
-bash scripts/docker/setup_podman.sh
+bash scripts/tmax/RL/qwen35_2b_1gpu.sh
 ```
 
-This script is made for Ai2 machines, so you may need to modify it to work on your own infrastructure.
+It uses the Tmax task dataset, synchronous collection (`ASYNC_STEPS=0`), and
+24 episodes in groups of eight for three learner steps. Full RL recipes retain
+asynchronous collection (`ASYNC_STEPS=4`). All RL recipes explicitly set
+`--dppo_ratio_cap 10.0`.
 
-## Scripts here
+## Recipes
 
-Scripts are split into two folders by training stage:
-
-### `SFT/` — supervised finetuning (`open_instruct/finetune.py`)
-
-| Script | What it does |
+| Script | Model / input |
 | --- | --- |
-| `sft_qwen3_8b_small.sh` | SFT of Qwen3-8B on just the tmax SFT data |
-| `sft_qwen3_8b_big.sh` | SFT of Qwen3-8B on the full SFT blob (all subsets) |
-| `sft_qwen35_9b_small.sh` | SFT of Qwen3.5-9B on just the tmax SFT data |
-| `sft_qwen35_9b_big.sh` | SFT of Qwen3.5-9B on the full SFT blob (all subsets) |
+| `RL/qwen35_2b_1gpu.sh` | Qwen3.5-2B, single-GPU debug run |
+| `RL/qwen35_2b.sh` | Qwen3.5-2B |
+| `RL/qwen35_4b.sh` | Qwen3.5-4B |
+| `RL/qwen35_9b.sh` | Qwen3.5-9B |
+| `RL/qwen36_27b.sh` | Qwen3.6-27B |
+| `RL/qwen3_8b.sh` | Qwen3-8B with the SFT warm start |
+| `SFT/sft_qwen3_8b_small.sh` | Qwen3-8B on Tmax SFT data |
+| `SFT/sft_qwen3_8b_big.sh` | Qwen3-8B on the full SFT mixture |
+| `SFT/sft_qwen35_9b_small.sh` | Qwen3.5-9B on Tmax SFT data |
+| `SFT/sft_qwen35_9b_big.sh` | Qwen3.5-9B on the full SFT mixture |
 
-### `RL/` — DPPO RL (`open_instruct/grpo_fast.py`)
+The full recipes keep their existing GPU layouts: the 2B/4B RL recipes request
+four nodes, the 9B/27B/8B RL recipes eight, and SFT four, each with eight GPUs.
+The 27B recipe also uses `--gather_whole_model false --deepspeed_zpg 1`.
 
-| Script | What it does |
+## Launching full recipes
+
+Full recipes use the existing `mason.py` Beaker launcher. Supply a container image
+as the first argument and set `BEAKER_CLUSTER` in your environment.
+`BEAKER_WORKSPACE` and `BEAKER_BUDGET` are optional; when omitted, Beaker uses
+its configured defaults. The scripts contain no site addresses or secret names.
+
+```bash
+bash scripts/tmax/RL/qwen35_9b.sh <beaker-image>
+bash scripts/tmax/SFT/sft_qwen35_9b_small.sh <beaker-image>
+```
+
+Arguments before the bare `--` configure Mason; those after it configure training.
+To use another scheduler, adapt that prefix to your own launcher and preserve the
+GPU/Ray topology. For SFT, Mason expands the per-node `--num_processes 8` into the
+world size and sets Accelerate's node rendezvous arguments.
+
+Each recipe passes `--no_auto_dataset_cache` before `--` so submission does not
+import vLLM locally. Dataset preparation happens on the training nodes.
+`OUTPUT_DIR` defaults to `/output` for full recipes; checkpoints and traces should
+be placed on storage retained by your launcher. Set `ROLLOUTS_SAVE_PATH` to override
+the default `$OUTPUT_DIR/rollouts` in any RL recipe. Reference-policy state is
+saved alongside trainer checkpoints under `$OUTPUT_DIR/checkpoint_state`.
+
+## RL data and execution
+
+| Variable | Behavior |
 | --- | --- |
-| `qwen35_2b_1gpu.sh` | DPPO RL on Qwen3.5-2B with `swerl-tmax-15k` (1 GPU, for debugging) |
-| `qwen35_2b.sh` | DPPO RL on Qwen3.5-2B with `swerl-tmax-15k` |
-| `qwen35_4b.sh` | DPPO RL on Qwen3.5-4B with `swerl-tmax-15k` |
-| `qwen35_9b.sh` | DPPO RL on Qwen3.5-9B with `swerl-tmax-15k` |
-| `qwen36_27b.sh` | DPPO RL on Qwen3.6-27B with `swerl-tmax-15k` |
-| `qwen3_8b.sh` | DPPO RL on Qwen3-8B (SFTed version) with `swerl-tmax-15k` |
+| `DATASET` | Dataset mixer and task-data repository; defaults to `allenai/tmax-15k-open-instruct` |
+| `ASYNC_STEPS` | Zero selects synchronous collection; positive values enable prefetching |
+| `VLLM_SEED_PER_TURN` | Defaults to `false`; set `true` to use distinct deterministic seeds for generation turns |
+| `SANDBOX_BACKEND` | Defaults to `docker`; also supports `apptainer` and `sandfleet` |
+| `TOOL_CONFIGS` | Optional complete JSON override for the sandbox configuration |
 
-The RL scripts mostly share the same args; the per-size differences are model name,
-node/engine counts, rollout shape, and a few memory/perf flags (e.g. the 27b adds
-`--gather_whole_model false` / `--deepspeed_zpg 1` to be able to fit the model during training).
+Select the dataset and generation-seed setting recorded for the run you want to
+reproduce. The v1.1 size/SFT-warm-start runs used per-turn seeding. Changing only
+the model or dataset does not reproduce all historical run settings.
 
-## Reading a script: `mason.py` vs. the regular training command
+By default, the generated tool config follows `DATASET`, sets ordinary command
+timeout to 120 seconds and verifier timeout to 600 seconds, and uses `/` as the
+initial cwd for Apptainer/Sandfleet Tmax images. Recognized submissions receive
+the verifier budget plus 120 seconds of transport/cleanup overhead, independently
+of the ordinary tool and remaining rollout deadlines.
 
-Every script has the same two-part shape, split by a bare `--`:
-
-```bash
-uv run python mason.py \
-    <mason / Beaker scheduling args> \
-    -- \
-    <the actual command that runs on the cluster>
-```
-
-### Part 1 — `mason.py` (the launcher)
-
-`mason.py` is Ai2's Beaker job launcher. Everything **before** the `--` configures
-*where and how* the job runs on the cluster, not the training itself. Common args:
-
-- `--cluster` / `--workspace` / `--budget` — which Beaker cluster, workspace, and budget
-- `--image` — the Docker image to run in (passed as `$1` to the script)
-- `--num_nodes` / `--gpus` — how much hardware to request
-- `--priority` / `--preemptible` / `--max_retries` — scheduling behavior
-- `--pure_docker_mode`, `--mount_docker_socket`, `--env`, `--secret` — container/runtime setup
-
-`mason.py` also does extra bookkeeping for known `open_instruct` commands (e.g.
-`finetune.py`, `grpo_fast.py`): caching, auto-resume for GRPO, etc.
-
-If you aren't at Ai2, then you can remove this part of the command. But note how many GPUs and nodes are requested, since you need to match that!
-
-### Part 2 — the regular training command (after `--`)
-
-Everything **after** the `--` is the command mason actually executes on each node.
-This is the "regular script" you would run locally if you weren't using Beaker:
-
-- SFT scripts: `accelerate launch ... open_instruct/finetune.py <training args>`
-- RL scripts: `... python open_instruct/grpo_fast.py <training args>`
-
-These args (`--model_name_or_path`, `--dataset_mixer_list`, `--learning_rate`,
-`--max_seq_length`, `--response_length`, `--tools`, etc.) are the actual
-hyperparameters and are documented by `finetune.py` / `grpo_fast.py` themselves.
-
-## Running locally vs. on Beaker
-
-To run without Beaker, drop the `uv run python mason.py ... --` prefix and run the
-command after the `--` directly (adjusting `--num_processes`/node settings for your
-hardware). To launch on the cluster, just run the script with a Beaker image:
+For a separately prepared local corpus, override both the mixer and task data:
 
 ```bash
-bash scripts/tmax/SFT/sft_qwen3_8b_small.sh <beaker-image>
+DATASET=your-org/task-dataset \
+TOOL_CONFIGS='{"backend":"sandfleet","task_data_dir":"/data/task-data","pwd":"/","timeout":120,"test_timeout":600}' \
+    bash scripts/tmax/RL/qwen35_9b.sh <beaker-image>
 ```
 
-For people at Ai2, you can just run the script with a Beaker image. I recommend using the build and launch scripts, e.g.:
+The launcher uses the backend in `TOOL_CONFIGS` to select sandbox setup. Sandfleet
+requires `SANDFLEET_URL` and a client token. Beaker recipes accept `SANDFLEET_CLIENT_TOKEN_SECRET` as the name of
+a secret to expose as `SANDFLEET_CLIENT_TOKEN`; the local debug recipe reads the
+token directly from its environment. `SANDFLEET_POOL` is optional. Use Sandfleet
+0.16.1 or later for its pool-deletion and recovery fixes, with the controller and
+workers at matching revisions. Follow the
+[Sandfleet TMAX setup guide](https://github.com/hamishivi/sandfleet/blob/main/docs/tmax.md)
+for worker Python requirements, prepared images, resource sizing, and a backend
+smoke test. The training client uses the HTTP API directly.
+
+The full RL recipes forward operator-provided `SANDFLEET_URL`, `SANDFLEET_POOL`,
+`SANDFLEET_REGISTRY`, `SWERL_APPTAINER_SIF_DIR`, `SWERL_ROLLOUT_TIMEOUT_S`,
+`SWERL_SANDBOX_PWD_MAP`, `SWERL_SANDBOX_VERIFIER_TIMEOUT_MAP`, and
+`SWERL_SANDBOX_MAX_VERIFIER_TIMEOUT_S`, plus `NO_PROXY` and `no_proxy`. Set proxy
+bypasses for both the controller and the worker-agent addresses. Full and
+minimal Ray runtime environments preserve sandbox connection settings. Referenced
+files must be visible on the nodes that use them. A local SIF pool is required
+for Apptainer/Sandfleet image resolution; missing images fail explicitly.
+See [Sandfleet recovery](../../../../docs/sandfleet-restart-recovery.md) and
+[optional dataset setup](../../../../docs/dataset-setup.md).
+
+The debug recipe creates 16 environment actors. Size a named Sandfleet pool for
+that lease demand and its intended CPU/RAM profile. Without a named pool, enable
+declarative resources on the controller; the adapter requests two CPUs and
+4096 MiB by default. Sandboxes run offline, so task dependencies belong in the
+prepared images.
+
+For Docker/Podman, full recipes retain the existing Podman setup. Supply
+`DOCKERHUB_USERNAME` and optionally `DOCKER_PAT_SECRET` for authenticated image
+pulls; `MIRROR_URL` is optional. The local debug recipe expects an already
+configured Docker/Podman service and credentials.
+
+## Pretokenized SFT input
+
+SFT recipes normally use their published dataset mixtures. To load saved token
+trajectories directly, set `PRETOKENIZED_JSONL` to a file visible on every training
+node. This replaces the dataset mixer/config arguments:
+
 ```bash
-bash scripts/train/build_image_and_launch.sh training/open-instruct/scripts/tmax/RL/qwen35_2b.sh
+PRETOKENIZED_JSONL=/data/trajectories.jsonl \
+    bash scripts/tmax/SFT/sft_qwen35_9b_small.sh <beaker-image>
 ```
 
-## General Tips
-
-Training terminal agents is tough, painful, and requires a lot of patience. Here are some useful tips I found for this stack:
-
-- Sometimes nodes go down because of 'running hot', since we run podman on the same nodes (unideal, but avoids paying money to big sandbox). Hence, turning off the podman janitor/lowering the pool size/lowering the start and exec concurrency can help preventing nodes from going down on restarts, if you repeatedly hit it.
-- Increasing group size and output length helps a lot with stability (we show this a bit in the paper). In particular, training with ~65k output length seems quite important for the 9B and 4B model, otherwise the model has too many 'overlong negatives' and too much negative gradient.
-- 2 nodes is all you need for training max, and put as much extra as you need for inference.
-- Counterintuitively, training larger models can be more stable and just as fast as the smaller models, since often you are bottlenecked on sandbox memory/setup, and so have 'gpu wiggle room' for running slower, larger models.
-- Instabilities seem to arise from the model getting into insane entropy states. Adding well-formedness rewards on language / tool calls may help in training stability.
+Each JSONL record must contain equal-length `input_ids` and `labels`. The loader
+adds an all-ones attention mask and filters records exceeding `max_seq_length`,
+without retokenizing tool or special-token boundaries.

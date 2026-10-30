@@ -12,7 +12,7 @@ from openenv.core.env_server.types import State
 
 from open_instruct import logger_utils
 
-from .backends import SandboxBackend, create_backend
+from .backends import SandboxBackend, SandboxLostError, create_backend
 from .base import BaseEnvConfig, EnvCall, RLEnvironment, StepResult
 from .tools.utils import coerce_args
 
@@ -23,12 +23,16 @@ class _EditorError(Exception):
     """Raised by editor sub-commands to signal a user-visible error."""
 
 
+class _EditorTimeout(Exception):
+    """Raised when an editor helper command hits the backend timeout."""
+
+
 _BASH_WRAPPER = r"""#!/bin/bash
 set -a; source /tmp/.sandbox_env 2>/dev/null; set +a
 cd "$(cat /tmp/.sandbox_cwd 2>/dev/null || echo /testbed)" 2>/dev/null
 eval "$1"
 _exit_code=$?
-export -p > /tmp/.sandbox_env
+(unset FAKEROOTKEY; export -p) > /tmp/.sandbox_env
 pwd > /tmp/.sandbox_cwd
 exit $_exit_code
 """
@@ -153,16 +157,22 @@ class GenericSandboxEnv(RLEnvironment):
 
     def _do_reset(self, **kwargs: Any) -> tuple[StepResult, list[dict]]:
         task_prompt = kwargs.get("task_prompt")
-        if self._backend is not None:
-            self._backend.close()
-        bkwargs = dict(self._backend_kwargs)
-        bkwargs.setdefault("timeout", self._timeout)
-        self._backend = create_backend(self._backend_type, **bkwargs)
-        self._backend.start()
+        if self._backend is None:
+            bkwargs = dict(self._backend_kwargs)
+            bkwargs.setdefault("timeout", self._timeout)
+            self._backend = create_backend(self._backend_type, **bkwargs)
+            self._backend.start()
+        else:
+            self._backend.restart()
         self._step_count = 0
         self._task_prompt = task_prompt
 
-        self._backend.run_command("mkdir -p /testbed/input /testbed/output")
+        mkdir_result = self._backend.run_command("mkdir -p /testbed/input /testbed/output")
+        if mkdir_result.exit_code != 0:
+            raise RuntimeError(
+                "Failed to initialize generic sandbox directories "
+                f"(exit={mkdir_result.exit_code}): {mkdir_result.stderr or mkdir_result.stdout}"
+            )
         if self._backend.run_command("which git").exit_code == 0:
             git_result = self._backend.run_command(
                 "cd /testbed && git init && git config user.email 'tulu@example.com' && git config user.name 'Tulu'"
@@ -170,8 +180,18 @@ class GenericSandboxEnv(RLEnvironment):
             if git_result.exit_code != 0:
                 logger.warning(f"git init/config failed (exit {git_result.exit_code}): {git_result.stderr.strip()}")
         self._backend.write_file("/tmp/.sandbox_bash_wrapper.sh", _BASH_WRAPPER)
-        self._backend.run_command("chmod +x /tmp/.sandbox_bash_wrapper.sh")
-        self._backend.run_command("echo /testbed > /tmp/.sandbox_cwd")
+        chmod_result = self._backend.run_command("chmod +x /tmp/.sandbox_bash_wrapper.sh")
+        if chmod_result.exit_code != 0:
+            raise RuntimeError(
+                "Failed to chmod generic sandbox bash wrapper "
+                f"(exit={chmod_result.exit_code}): {chmod_result.stderr or chmod_result.stdout}"
+            )
+        cwd_result = self._backend.run_command("echo /testbed > /tmp/.sandbox_cwd")
+        if cwd_result.exit_code != 0:
+            raise RuntimeError(
+                "Failed to initialize generic sandbox cwd "
+                f"(exit={cwd_result.exit_code}): {cwd_result.stderr or cwd_result.stdout}"
+            )
 
         if self._write_prompt_file and task_prompt:
             self._backend.write_file("/root/prompt.txt", task_prompt)
@@ -191,16 +211,42 @@ class GenericSandboxEnv(RLEnvironment):
 
         self._step_count += 1
 
-        if call.name == "execute_bash":
-            args = coerce_args(_EXECUTE_BASH_TOOL["function"]["parameters"], call.args)
-            return self._execute_bash(args)
-        elif call.name == "str_replace_editor":
-            args = coerce_args(_STR_REPLACE_EDITOR_TOOL["function"]["parameters"], call.args)
-            return self._execute_editor(args)
-        else:
+        try:
+            if call.name == "execute_bash":
+                args = coerce_args(_EXECUTE_BASH_TOOL["function"]["parameters"], call.args)
+                return self._execute_bash(args)
+            elif call.name == "str_replace_editor":
+                args = coerce_args(_STR_REPLACE_EDITOR_TOOL["function"]["parameters"], call.args)
+                return self._execute_editor(args)
+            else:
+                return StepResult(
+                    result=f"Error: Unknown tool '{call.name}'. Available: execute_bash, str_replace_editor",
+                    reward=self._penalty,
+                )
+        # SandboxLostError subclasses RuntimeError, so it must be caught first.
+        except SandboxLostError as error:
+            logger.warning("Sandbox worker was lost: %s", error)
+            with contextlib.suppress(Exception):
+                self._backend.close()
+            self._backend = None
             return StepResult(
-                result=f"Error: Unknown tool '{call.name}'. Available: execute_bash, str_replace_editor",
-                reward=self._penalty,
+                result="Sandbox worker was lost. Ending this rollout so it can be resampled.",
+                reward=0.0,
+                done=True,
+                metadata={"sandbox_lost": True, "infrastructure_failure": True, "error": str(error)},
+            )
+        except RuntimeError as e:
+            if "not started. Call start() first" not in str(e):
+                raise
+            logger.warning("Generic sandbox backend unavailable after timeout: %s", e)
+            return StepResult(
+                result=(
+                    "Sandbox backend is no longer running, likely after a command timeout. "
+                    "Ending episode with reward 0."
+                ),
+                reward=0.0,
+                done=True,
+                metadata={"timeout": True, "backend_unavailable": True},
             )
 
     def _execute_bash(self, args: dict) -> StepResult:
@@ -222,6 +268,10 @@ class GenericSandboxEnv(RLEnvironment):
         )
 
         reward = 0.0 if result.exit_code == 0 else self._penalty
+        if result.exit_code == 124:
+            return StepResult(
+                result=observation, reward=0.0, done=True, metadata={"exit_code": result.exit_code, "timeout": True}
+            )
         return StepResult(result=observation, reward=reward, metadata={"exit_code": result.exit_code})
 
     def _execute_editor(self, args: dict) -> StepResult:
@@ -245,20 +295,33 @@ class GenericSandboxEnv(RLEnvironment):
                 output = self._editor_insert(path, args.get("insert_line"), args.get("new_str"))
             else:
                 return self._editor_error(f"Unknown command '{command}'. Use view/create/str_replace/insert.")
+        except _EditorTimeout as exc:
+            return StepResult(
+                result=f"Execution output of [str_replace_editor]:\nERROR: {exc}",
+                reward=0.0,
+                done=True,
+                metadata={"timeout": True},
+            )
         except (_EditorError, FileNotFoundError) as exc:
             return self._editor_error(str(exc))
 
         return StepResult(result=f"Execution output of [str_replace_editor]:\n{output}")
 
+    def _ensure_not_timeout(self, result) -> None:
+        if result.exit_code == 124:
+            raise _EditorTimeout(result.stderr or result.stdout or "Command timed out.")
+
     def _editor_view(self, path: str, view_range: list[int] | None = None) -> str:
         assert self._backend is not None
         check = self._backend.run_command(f"test -d {shlex.quote(path)}")
+        self._ensure_not_timeout(check)
         is_dir = check.exit_code == 0
 
         if is_dir:
             result = self._backend.run_command(
                 f'find {shlex.quote(path)} -maxdepth 2 -not -path "*/.*" | sort | head -100'
             )
+            self._ensure_not_timeout(result)
             return _truncate_output(result.stdout)
 
         if view_range and len(view_range) == 2:
@@ -268,6 +331,7 @@ class GenericSandboxEnv(RLEnvironment):
             cmd = f"cat -n {shlex.quote(path)}"
 
         result = self._backend.run_command(cmd)
+        self._ensure_not_timeout(result)
         if result.exit_code != 0:
             raise _EditorError(f"Failed to view '{path}': {result.stderr or result.stdout}")
         return _truncate_output(result.stdout)
@@ -277,13 +341,18 @@ class GenericSandboxEnv(RLEnvironment):
         if file_text is None:
             raise _EditorError("'file_text' parameter is required for create.")
 
-        if self._backend.run_command(f"test -d {shlex.quote(path)}").exit_code == 0:
+        is_dir_result = self._backend.run_command(f"test -d {shlex.quote(path)}")
+        self._ensure_not_timeout(is_dir_result)
+        if is_dir_result.exit_code == 0:
             raise _EditorError(f"'{path}' is a directory. Cannot create a file with the same name.")
-        if self._backend.run_command(f"test -e {shlex.quote(path)}").exit_code == 0:
+        exists_result = self._backend.run_command(f"test -e {shlex.quote(path)}")
+        self._ensure_not_timeout(exists_result)
+        if exists_result.exit_code == 0:
             raise _EditorError(f"File '{path}' already exists. Use str_replace to edit.")
 
         parent = "/".join(path.rsplit("/", 1)[:-1]) or "/"
-        self._backend.run_command(f"mkdir -p {shlex.quote(parent)}")
+        mkdir_result = self._backend.run_command(f"mkdir -p {shlex.quote(parent)}")
+        self._ensure_not_timeout(mkdir_result)
         self._backend.write_file(path, file_text)
         return f"File created successfully at: {path}"
 

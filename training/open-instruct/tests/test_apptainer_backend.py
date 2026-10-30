@@ -7,6 +7,7 @@ right command lines and honors the abstract SandboxBackend contract.
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import subprocess
 import tarfile
@@ -14,21 +15,16 @@ import unittest
 from unittest.mock import patch
 
 from open_instruct.environments.backends import (
-    ApptainerBackend,
     _APPTAINER_LIVE_INSTANCES,
+    ApptainerBackend,
     _normalize_apptainer_image,
     create_backend,
 )
+from open_instruct.environments.swerl_vanillux_sandbox import SWERLVanilluxSandboxEnv, SWERLVanilluxSandboxEnvConfig
 
 
-def _completed(
-    stdout: bytes = b"",
-    stderr: bytes = b"",
-    returncode: int = 0,
-) -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess(
-        args=[], returncode=returncode, stdout=stdout, stderr=stderr
-    )
+def _completed(stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
 class _FakeApptainer:
@@ -42,9 +38,7 @@ class _FakeApptainer:
         self.calls: list[dict] = []
         self._scripted: list[tuple[list[str], subprocess.CompletedProcess]] = []
 
-    def script_for_prefix(
-        self, prefix: list[str], result: subprocess.CompletedProcess
-    ) -> None:
+    def script_for_prefix(self, prefix: list[str], result: subprocess.CompletedProcess) -> None:
         self._scripted.append((prefix, result))
 
     def __call__(self, argv, **kwargs) -> subprocess.CompletedProcess:
@@ -74,10 +68,7 @@ def _started_backend(fake: _FakeApptainer, **kwargs) -> ApptainerBackend:
 class TestImageNormalization(unittest.TestCase):
     def test_plain_tag_gets_docker_prefix(self):
         self.assertEqual(_normalize_apptainer_image("ubuntu:22.04"), "docker://ubuntu:22.04")
-        self.assertEqual(
-            _normalize_apptainer_image("hamishi740/swerl-tmax-v3:abc123"),
-            "docker://hamishi740/swerl-tmax-v3:abc123",
-        )
+        self.assertEqual(_normalize_apptainer_image("example/task:abc123"), "docker://example/task:abc123")
 
     def test_uri_passes_through(self):
         self.assertEqual(_normalize_apptainer_image("docker://foo:bar"), "docker://foo:bar")
@@ -121,9 +112,7 @@ class TestStartAndClose(unittest.TestCase):
 
     def test_start_propagates_apptainer_pwd_and_cache(self):
         fake = _FakeApptainer()
-        backend = _started_backend(
-            fake, pwd="/workspace", cache_dir="/scratch/cache", tmp_dir="/scratch/tmp"
-        )
+        backend = _started_backend(fake, pwd="/workspace", cache_dir="/scratch/cache", tmp_dir="/scratch/tmp")
         try:
             env = fake.calls[0]["env"]
             self.assertEqual(env["APPTAINER_PWD"], "/workspace")
@@ -135,23 +124,24 @@ class TestStartAndClose(unittest.TestCase):
 
     def test_start_raises_when_binary_missing(self):
         backend = _make_backend()
-        with patch("open_instruct.environments.backends.shutil.which", return_value=None):
-            with self.assertRaisesRegex(RuntimeError, "not found on PATH"):
-                backend.start()
+        with (
+            patch("open_instruct.environments.backends.shutil.which", return_value=None),
+            self.assertRaisesRegex(RuntimeError, "not found on PATH"),
+        ):
+            backend.start()
 
     def test_start_raises_when_apptainer_fails(self):
         fake = _FakeApptainer()
         fake.script_for_prefix(
-            ["apptainer", "instance", "start"],
-            _completed(stderr=b"FATAL: image pull failed", returncode=255),
+            ["apptainer", "instance", "start"], _completed(stderr=b"FATAL: image pull failed", returncode=255)
         )
         backend = _make_backend()
         with (
             patch("open_instruct.environments.backends.subprocess.run", side_effect=fake),
             patch("open_instruct.environments.backends.shutil.which", return_value="/usr/bin/apptainer"),
+            self.assertRaisesRegex(RuntimeError, "apptainer instance start failed"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "apptainer instance start failed"):
-                backend.start()
+            backend.start()
 
     def test_close_is_idempotent(self):
         fake = _FakeApptainer()
@@ -184,14 +174,30 @@ class TestStartAndClose(unittest.TestCase):
         with patch("open_instruct.environments.backends.subprocess.run", side_effect=fake):
             backend.close()
 
+    def test_restart_normalizes_replacement_image(self):
+        fake = _FakeApptainer()
+        backend = _started_backend(fake)
+        with (
+            patch("open_instruct.environments.backends.subprocess.run", side_effect=fake),
+            patch("open_instruct.environments.backends.shutil.which", return_value="/usr/bin/apptainer"),
+        ):
+            try:
+                # Environment reset replaces the image before reusing the backend.
+                backend._image = "example/replacement:latest"
+                backend.restart()
+                starts = [
+                    call["argv"] for call in fake.calls if call["argv"][:3] == ["apptainer", "instance", "start"]
+                ]
+                self.assertEqual(len(starts), 2)
+                self.assertIn("docker://example/replacement:latest", starts[-1])
+            finally:
+                backend.close()
+
 
 class TestRunCommand(unittest.TestCase):
     def test_run_command_wraps_with_timeout_and_bash(self):
         fake = _FakeApptainer()
-        fake.script_for_prefix(
-            ["apptainer", "exec"],
-            _completed(stdout=b"hello\n", stderr=b""),
-        )
+        fake.script_for_prefix(["apptainer", "exec"], _completed(stdout=b"hello\n", stderr=b""))
         backend = _started_backend(fake, timeout=42)
         try:
             with patch("open_instruct.environments.backends.subprocess.run", side_effect=fake):
@@ -212,10 +218,7 @@ class TestRunCommand(unittest.TestCase):
 
     def test_run_command_annotates_timeout_exit_code(self):
         fake = _FakeApptainer()
-        fake.script_for_prefix(
-            ["apptainer", "exec"],
-            _completed(returncode=124, stderr=b""),
-        )
+        fake.script_for_prefix(["apptainer", "exec"], _completed(returncode=124, stderr=b""))
         backend = _started_backend(fake, timeout=5)
         try:
             with patch("open_instruct.environments.backends.subprocess.run", side_effect=fake):
@@ -240,8 +243,7 @@ class TestFileIO(unittest.TestCase):
             with patch("open_instruct.environments.backends.subprocess.run", side_effect=fake):
                 backend.write_file("/workspace/foo.txt", "hello world")
             write_calls = [
-                c for c in fake.calls
-                if c["argv"][:2] == ["apptainer", "exec"] and "cat >" in " ".join(c["argv"])
+                c for c in fake.calls if c["argv"][:2] == ["apptainer", "exec"] and "cat >" in " ".join(c["argv"])
             ]
             self.assertEqual(len(write_calls), 1)
             call = write_calls[0]
@@ -328,10 +330,7 @@ class TestFileIO(unittest.TestCase):
         try:
             with patch("open_instruct.environments.backends.subprocess.run", side_effect=fake):
                 backend.put_archive("/", tar_bytes)
-            tar_calls = [
-                c for c in fake.calls
-                if c["argv"][:2] == ["apptainer", "exec"] and "tar" in c["argv"]
-            ]
+            tar_calls = [c for c in fake.calls if c["argv"][:2] == ["apptainer", "exec"] and "tar" in c["argv"]]
             self.assertEqual(len(tar_calls), 1)
             argv = tar_calls[0]["argv"]
             self.assertEqual(argv[-5:], ["tar", "-xf", "-", "-C", "/"])
@@ -339,6 +338,35 @@ class TestFileIO(unittest.TestCase):
         finally:
             with patch("open_instruct.environments.backends.subprocess.run", side_effect=fake):
                 backend.close()
+
+
+class TestSandboxPwdConfig(unittest.TestCase):
+    """`pwd` must reach ApptainerBackend but never DockerBackend.
+
+    ApptainerBackend defaults pwd="/workspace", which the swerl-tmax images do not
+    have, so every exec fails with "chdir /workspace: no such file or directory".
+    The knob was dropped from the env config when the vmvm backend was removed, so
+    there was no way to set it from tool_configs.
+    """
+
+    def test_pwd_is_a_config_field(self):
+        names = {f.name for f in dataclasses.fields(SWERLVanilluxSandboxEnvConfig)}
+        self.assertIn("pwd", names)
+        self.assertEqual(SWERLVanilluxSandboxEnvConfig().pwd, "")
+
+    def test_pwd_forwarded_to_apptainer(self):
+        env = SWERLVanilluxSandboxEnv(backend="apptainer", image="task.sif", pwd="/")
+        self.assertEqual(env._backend_kwargs.get("pwd"), "/")
+
+    def test_pwd_unset_leaves_kwargs_untouched(self):
+        env = SWERLVanilluxSandboxEnv(backend="apptainer", image="task.sif")
+        self.assertNotIn("pwd", env._backend_kwargs)
+
+    def test_pwd_not_forwarded_to_docker(self):
+        # DockerBackend.__init__ has no pwd parameter; forwarding it would be a
+        # TypeError at sandbox start rather than a config error at launch.
+        env = SWERLVanilluxSandboxEnv(backend="docker", image="python:3.12-slim", pwd="/")
+        self.assertNotIn("pwd", env._backend_kwargs)
 
 
 if __name__ == "__main__":

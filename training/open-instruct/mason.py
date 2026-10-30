@@ -113,7 +113,9 @@ def get_args():
         "--hostname", type=str, nargs="+", help="Beaker hostname on which the job could be run.", default=None
     )
     parser.add_argument("--max_retries", type=int, help="Number of retries", default=0)
-    parser.add_argument("--budget", type=str, help="Budget to use. If unset, Beaker uses the default budget.", default=None)
+    parser.add_argument(
+        "--budget", type=str, help="Budget to use. If unset, Beaker uses the default budget.", default=None
+    )
     parser.add_argument("--gpus", type=int, help="Number of gpus", default=0)
     parser.add_argument(
         "--shared_memory", type=str, help="Shared memory size (e.g., '10gb', '10.24gb')", default="10.24gb"
@@ -497,9 +499,12 @@ def make_internal_command(command: list[str], args: argparse.Namespace, whoami: 
                     ["--no_try_launch_beaker_eval_jobs"],
                     ["--no_try_launch_beaker_eval_jobs_on_weka"],
                 ]
-                no_eval_concat_commands = [" ".join(cmd) for cmd in no_eval_commands]
-                no_eval_concat_command_exists = any(cmd in command for cmd in no_eval_concat_commands)
-                if not no_eval_concat_command_exists:
+                no_eval_command_exists = any(
+                    command[index : index + len(pattern)] == pattern
+                    for pattern in no_eval_commands
+                    for index in range(len(command))
+                )
+                if not no_eval_command_exists:
                     raise ValueError(
                         "To auto-evaluation is turned on by default, to make sure it works, you must:\n"
                         "1. run mason with`--auto_output_dir_path /weka/...`, or\n"

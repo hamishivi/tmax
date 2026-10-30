@@ -34,6 +34,8 @@ class ToolCallParseResult:
 
     tool_calls: list[EnvCall] = field(default_factory=list)
     had_tool_call: bool = False
+    # Preserve the first call's position when malformed calls are dropped.
+    first_tool_call_invalid: bool = False
 
 
 class ToolParser(ABC):
@@ -178,17 +180,22 @@ class VllmToolParser(ToolParser):
             return ToolCallParseResult()
 
         tool_calls = []
-        for call in result.tool_calls:
+        first_tool_call_invalid = False
+        for index, call in enumerate(result.tool_calls):
             try:
                 args = json.loads(call.function.arguments)
                 if not isinstance(args, dict):
                     raise ValueError(f"Expected dict, got {type(args).__name__}: {args!r}")
                 tool_calls.append(EnvCall(id=call.id or "", name=call.function.name, args=args))
-            except (json.JSONDecodeError, ValueError) as e:
+            except (TypeError, ValueError) as e:
+                if index == 0:
+                    first_tool_call_invalid = True
                 logger.warning(
                     f"VllmToolParser: Failed to parse tool arguments: {e}\nArguments: {call.function.arguments!r}"
                 )
-        return ToolCallParseResult(tool_calls=tool_calls, had_tool_call=True)
+        return ToolCallParseResult(
+            tool_calls=tool_calls, had_tool_call=True, first_tool_call_invalid=first_tool_call_invalid
+        )
 
     def _format_tool_output(self, tool_output: str, role: str = "tool") -> str:
         template = self._role_templates[role]

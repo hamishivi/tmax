@@ -22,6 +22,7 @@ with contextlib.suppress(Exception):
     import deepspeed
 
 # isort: on
+import hashlib
 import json
 import math
 import os
@@ -46,7 +47,7 @@ from tqdm.auto import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, BitsAndBytesConfig, DataCollatorForSeq2Seq, get_scheduler
 from transformers.training_args import _convert_str_dict
 
-from open_instruct import logger_utils, model_utils, utils
+from open_instruct import logger_utils, model_utils
 from open_instruct.dataset_transformation import (
     INPUT_IDS_KEY,
     TOKENIZED_SFT_DATASET_KEYS,
@@ -75,14 +76,13 @@ from open_instruct.utils import (
 logger = get_logger(__name__)
 
 
-_MAX_SEQ_LENGTH_TRANSFORM_FNS = {
-    "sft_tulu_tokenize_and_truncate_v1",
-    "last_turn_tulu_tokenize_and_truncate_v1",
-}
+_MAX_SEQ_LENGTH_TRANSFORM_FNS = {"sft_tulu_tokenize_and_truncate_v1", "last_turn_tulu_tokenize_and_truncate_v1"}
 _MAX_TOKEN_LENGTH_FILTER_FNS = {"sft_length_and_label_filter_v1"}
 
 
-def build_transform_fn_args(dataset_transform_fn: list[str], max_seq_length: int | None) -> list[dict[str, int | None]]:
+def build_transform_fn_args(
+    dataset_transform_fn: list[str], max_seq_length: int | None
+) -> list[dict[str, int | None]]:
     transform_fn_args = []
     for fn_name in dataset_transform_fn:
         if fn_name in _MAX_SEQ_LENGTH_TRANSFORM_FNS:
@@ -92,6 +92,39 @@ def build_transform_fn_args(dataset_transform_fn: list[str], max_seq_length: int
         else:
             transform_fn_args.append({})
     return transform_fn_args
+
+
+def load_pretokenized_jsonl(path: str, max_seq_length: int | None):
+    """Load a pre-tokenized SFT dataset directly from a JSONL file.
+
+    Each line must contain ``input_ids`` and ``labels`` (equal length). We add
+    an all-ones ``attention_mask`` and drop any example longer than
+    ``max_seq_length`` (if set). This keeps trajectories in the exact token space
+    produced by the RL rollouts (including interleaved tool outputs / special
+    tokens), avoiding any retokenization mismatch.
+    """
+
+    def gen(source_sha256: str):
+        # The digest participates in the dataset cache key through gen_kwargs.
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                input_ids = row["input_ids"]
+                labels = row["labels"]
+                if len(input_ids) != len(labels):
+                    continue
+                if max_seq_length is not None and len(input_ids) > max_seq_length:
+                    continue
+                yield {"input_ids": input_ids, "attention_mask": [1] * len(input_ids), "labels": labels}
+
+    with open(path, "rb") as source:
+        source_sha256 = hashlib.file_digest(source, "sha256").hexdigest()
+    dataset = datasets.Dataset.from_generator(gen, gen_kwargs={"source_sha256": source_sha256})
+    print(f"load_pretokenized_jsonl: kept {len(dataset)} examples (max_seq_length={max_seq_length}) from {path}")
+    return dataset
 
 
 @dataclass
@@ -346,10 +379,23 @@ class FlatArguments:
             "help": "Degree of Ulysses sequence parallelism. 1 means disabled. Requires DeepSpeed ZeRO-3 and flash attention."
         },
     )
+    pretokenized_jsonl: str | None = field(
+        default=None,
+        metadata={
+            "help": "If set, load a pre-tokenized SFT dataset directly from this JSONL file (each line has "
+            "'input_ids' and 'labels'; 'attention_mask' is added automatically), skipping message tokenization. "
+            "Preserves saved trajectories in their original token space."
+        },
+    )
 
     def __post_init__(self):
-        if self.dataset_name is None and self.dataset_mixer is None and self.dataset_mixer_list is None:
-            raise ValueError("Need either a dataset name, dataset mixer, or dataset mixer list.")
+        if (
+            self.dataset_name is None
+            and self.dataset_mixer is None
+            and self.dataset_mixer_list is None
+            and self.pretokenized_jsonl is None
+        ):
+            raise ValueError("Need a dataset name, dataset mixer, dataset mixer list, or pretokenized JSONL input.")
         if (
             self.dataset_name is not None and (self.dataset_mixer is not None or self.dataset_mixer_list is not None)
         ) or (self.dataset_mixer is not None and self.dataset_mixer_list is not None):
@@ -523,21 +569,24 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     if not dataset_mixer_list_config_names and args.dataset_config_name is not None:
         dataset_mixer_list_config_names = [args.dataset_config_name]
     with accelerator.main_process_first():
-        transform_fn_args = build_transform_fn_args(args.dataset_transform_fn, args.max_seq_length)
-        train_dataset = get_cached_dataset_tulu(
-            dataset_mixer_list=args.dataset_mixer_list,
-            dataset_mixer_list_splits=args.dataset_mixer_list_splits,
-            tc=tc,
-            dataset_transform_fn=args.dataset_transform_fn,
-            transform_fn_args=transform_fn_args,
-            target_columns=args.dataset_target_columns,
-            dataset_cache_mode=args.dataset_cache_mode,
-            dataset_config_hash=args.dataset_config_hash,
-            hf_entity=args.hf_entity,
-            dataset_local_cache_dir=args.dataset_local_cache_dir,
-            dataset_skip_cache=args.dataset_skip_cache,
-            dataset_mixer_list_config_names=dataset_mixer_list_config_names,
-        )
+        if args.pretokenized_jsonl:
+            train_dataset = load_pretokenized_jsonl(args.pretokenized_jsonl, args.max_seq_length)
+        else:
+            transform_fn_args = build_transform_fn_args(args.dataset_transform_fn, args.max_seq_length)
+            train_dataset = get_cached_dataset_tulu(
+                dataset_mixer_list=args.dataset_mixer_list,
+                dataset_mixer_list_splits=args.dataset_mixer_list_splits,
+                tc=tc,
+                dataset_transform_fn=args.dataset_transform_fn,
+                transform_fn_args=transform_fn_args,
+                target_columns=args.dataset_target_columns,
+                dataset_cache_mode=args.dataset_cache_mode,
+                dataset_config_hash=args.dataset_config_hash,
+                hf_entity=args.hf_entity,
+                dataset_local_cache_dir=args.dataset_local_cache_dir,
+                dataset_skip_cache=args.dataset_skip_cache,
+                dataset_mixer_list_config_names=dataset_mixer_list_config_names,
+            )
         train_dataset = train_dataset.shuffle(seed=args.seed)
         train_dataset.set_format(type="pt")
     if accelerator.is_main_process:
@@ -550,7 +599,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     # when multiple ranks on a shared filesystem all try to access the
     # HF hub cache concurrently.
     model_path = args.config_name or args.model_name_or_path
-    if model_path and accelerator.is_main_process:
+    if model_path and accelerator.is_main_process and not os.path.isdir(model_path):
         snapshot_download(model_path, revision=args.model_revision)
     accelerator.wait_for_everyone()
 

@@ -57,6 +57,7 @@ from open_instruct import logger_utils, utils
 from open_instruct.data_types import (
     EnvConfig,
     EnvConfigEntry,
+    FatalGenerationError,
     GenerationResult,
     PromptRequest,
     RequestInfo,
@@ -69,13 +70,7 @@ from open_instruct.environments.tools.parsers import ToolParser, create_tool_par
 from open_instruct.ground_truth_utils import RewardConfig
 
 logger = logger_utils.setup_logger(__name__)
-SANDBOX_TIMING_LOGS = os.getenv("SWERL_SANDBOX_TIMING_LOGS", "").strip().lower() not in {
-    "",
-    "0",
-    "false",
-    "no",
-    "off",
-}
+SANDBOX_TIMING_LOGS = os.getenv("SWERL_SANDBOX_TIMING_LOGS", "").strip().lower() not in {"", "0", "false", "no", "off"}
 SANDBOX_TIMING_LOG_THRESHOLD_S = float(os.getenv("SWERL_SANDBOX_TIMING_LOG_THRESHOLD_S", "1.0"))
 RESET_FAILURE_ZERO_REWARD = os.getenv("SWERL_RESET_FAILURE_ZERO_REWARD", "").strip().lower() not in {
     "",
@@ -92,6 +87,22 @@ RESET_FAILURE_ZERO_REWARD_MARKERS = (
     "image not known",
     "locating image with id",
 )
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+# independent wall-clock deadline for a whole
+# rollout. The 61b5a85d sync removed it tree-wide, leaving max_steps as the only
+# brake on a rollout grinding against a dead or pathologically slow sandbox.
+ROLLOUT_TIMEOUT_S = _env_float("SWERL_ROLLOUT_TIMEOUT_S", 600.0)
 
 # ---------------------------------------------------------------------------
 # Monkey-patch: vLLM 0.18.0 hybrid model dtype serialization bug
@@ -147,10 +158,7 @@ def patch_vllm_qwen3_5_lm_head_fp32() -> None:
     # default. This mirrors vLLM's MiniMax fix: do the final projection in fp32
     # to avoid bf16 rounding in logits/logprobs.
     patched_classes = []
-    for module_name in (
-        "vllm.model_executor.models.qwen3_5",
-        "vllm.model_executor.models.qwen3_5_mtp",
-    ):
+    for module_name in ("vllm.model_executor.models.qwen3_5", "vllm.model_executor.models.qwen3_5_mtp"):
         try:
             module = __import__(module_name, fromlist=[""])
         except ImportError:
@@ -534,9 +542,37 @@ def add_request(actor: "LLMRayActor", request: PromptRequest) -> None:
         seed = request.generation_config.seed + j if request.generation_config.seed is not None else None
         sub_sampling_params = dataclasses.replace(sampling_params, seed=seed)
         sub_request_id = f"{request_id}_{j}"
-        actor.active_tasks[sub_request_id] = asyncio.run_coroutine_threadsafe(
+        task = asyncio.run_coroutine_threadsafe(
             process_request(actor, sub_request_id, sub_sampling_params), actor.loop
         )
+        actor.active_tasks[sub_request_id] = task
+        task.add_done_callback(
+            lambda completed, request_id=request_id, is_eval=request.is_eval: _report_request_failure(
+                actor, request_id, is_eval, completed
+            )
+        )
+
+
+def _report_request_failure(actor: "LLMRayActor", request_id: str, is_eval: bool, task: futures.Future) -> None:
+    """Wake the result consumer immediately when a background request fails."""
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is None:
+        return
+    with actor._request_failure_lock:
+        if request_id in actor._reported_request_failures:
+            return
+        actor._reported_request_failures.add(request_id)
+    failure = FatalGenerationError(
+        request_id=request_id,
+        error_type=type(error).__name__,
+        message=str(error),
+        traceback="".join(traceback.format_exception(error)),
+    )
+    logger.error("Fatal background generation failure for %s: %s: %s", request_id, failure.error_type, failure.message)
+    queue = actor.eval_results_queue if is_eval else actor.results_queue
+    queue.put(failure)
 
 
 FALLBACK_CHAT_TEMPLATE = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
@@ -631,6 +667,8 @@ class LLMRayActor:
         tool_stop_sequences: list[str] | None = None,
         max_steps: int = 5,
         per_turn_max_tokens: int | None = None,
+        seed_per_turn: bool = False,
+        tool_call_format_error_feedback: bool = False,
         tool_call_timeout: float = DEFAULT_TOOL_CALL_TIMEOUT_S,
         mask_tool_use: bool = True,
         pools: dict[str, ray.actor.ActorHandle] | None = None,
@@ -654,6 +692,8 @@ class LLMRayActor:
         self._init_config(
             max_steps,
             per_turn_max_tokens,
+            seed_per_turn,
+            tool_call_format_error_feedback,
             tool_call_timeout,
             mask_tool_use,
             pools,
@@ -685,6 +725,8 @@ class LLMRayActor:
         self,
         max_steps: int,
         per_turn_max_tokens: int | None,
+        seed_per_turn: bool,
+        tool_call_format_error_feedback: bool,
         tool_call_timeout: float,
         mask_tool_use: bool,
         pools: dict[str, ray.actor.ActorHandle] | None,
@@ -696,6 +738,9 @@ class LLMRayActor:
     ) -> None:
         self.max_steps = max_steps
         self.per_turn_max_tokens = per_turn_max_tokens
+        self.seed_per_turn = seed_per_turn
+        # The tool-error recovery path reads this setting after sandbox failures.
+        self.tool_call_format_error_feedback = tool_call_format_error_feedback
         self.tool_call_timeout = tool_call_timeout
         self.mask_tool_use = mask_tool_use
         self.pools: dict[str, ray.actor.ActorHandle] = pools or {}
@@ -704,6 +749,8 @@ class LLMRayActor:
         self.request_metadata = {}
         self.active_tasks = {}
         self.request_outputs = {}
+        self._reported_request_failures: set[str] = set()
+        self._request_failure_lock = threading.Lock()
         self.reward_config = reward_config
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
@@ -834,12 +881,13 @@ class LLMRayActor:
             api_key="EMPTY",
             timeout=VLLM_OPENAI_TIMEOUT_S,
             max_retries=VLLM_OPENAI_MAX_RETRIES,
+            # This server is always local to the actor, regardless of proxy settings.
+            http_client=openai.DefaultAsyncHttpxClient(trust_env=False),
         )
         self.model_name = self.llm_engine.vllm_config.model_config.model
 
         logger.info(
-            "Waiting for vLLM OpenAI API server to be ready at %s "
-            "(timeout=%.1fs, max_retries=%d)",
+            "Waiting for vLLM OpenAI API server to be ready at %s (timeout=%.1fs, max_retries=%d)",
             base_url,
             VLLM_OPENAI_TIMEOUT_S,
             VLLM_OPENAI_MAX_RETRIES,
@@ -942,9 +990,7 @@ class LLMRayActor:
             try:
                 future.result()
             except Exception as e:
-                raise RuntimeError(
-                    f"{source} failed with {type(e).__name__}: {e}\n{traceback.format_exc()}"
-                ) from None
+                raise RuntimeError(f"{source} failed with {type(e).__name__}: {e}\n{traceback.format_exc()}") from None
 
         check_future("vLLM prefetch worker", self._prefetch_future)
         check_future("vLLM completion worker", self._process_future)
@@ -1037,6 +1083,30 @@ class PoolSetup:
     tool_call_format_error_messages: dict[str, str]
     active_env_names: list[str]
     text_env_names: list[str]
+    # Per-target grading deadline and submit markers, collected once at reset. Grading is
+    # not an ordinary tool call: its budget belongs to the task's verifier, so it must not
+    # inherit the agent's per-call timeout. Queried here rather than per step to keep the
+    # hot path free of remote round-trips.
+    grading_deadlines: dict[str, float] = dataclasses.field(default_factory=dict)
+    submit_markers: dict[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
+
+
+def _is_submission_call(tool_call: Any, pool_setup: PoolSetup) -> bool:
+    """Will this tool call trigger grading?
+
+    Matched on the call's own arguments, which is what the env itself keys on. The env
+    also grades when the marker appears in a command's OUTPUT, and that cannot be known
+    before dispatch -- such a call keeps the ordinary tool timeout, so its verifier can
+    still be abandoned by the caller. That residue is why the timeout handler below
+    reports outer cancellation of a grading step as its own case instead of counting it
+    as an ordinary slow command.
+    """
+    markers = pool_setup.submit_markers.get(tool_call.name)
+    if not markers or tool_call.name not in pool_setup.grading_deadlines:
+        return False
+    args = tool_call.args or {}
+    blob = "\n".join(str(v) for v in args.values())
+    return any(marker in blob for marker in markers)
 
 
 async def _acquire_and_reset_pools(
@@ -1053,6 +1123,8 @@ async def _acquire_and_reset_pools(
     tool_call_format_error_messages: dict[str, str] = {}
     active_env_names: list[str] = []
     text_env_names: list[str] = []
+    grading_deadlines: dict[str, float] = {}
+    submit_markers: dict[str, tuple[str, ...]] = {}
 
     try:
         for pool_name in sorted(configured_tools):
@@ -1073,6 +1145,15 @@ async def _acquire_and_reset_pools(
             if target_format_error_message:
                 tool_call_format_error_messages[pool_name] = target_format_error_message
 
+            # Grading contract. Optional: envs predating it, and every env that does not
+            # grade, simply keep the ordinary tool-call timeout. Asked after reset so the
+            # deadline reflects the task that was actually selected, not the corpus default.
+            target_grading_deadline = await target_actor.get_grading_deadline.remote()
+            target_submit_markers = tuple(await target_actor.get_submit_markers.remote() or ())
+            if target_grading_deadline and target_submit_markers:
+                grading_deadlines[pool_name] = float(target_grading_deadline)
+                submit_markers[pool_name] = target_submit_markers
+
             new_actors, new_tools, new_roles = _register_tool_dispatch(
                 pool_name, target_actor, target_tools, target_response_role, actor_map
             )
@@ -1082,6 +1163,13 @@ async def _acquire_and_reset_pools(
             if target_format_error_message:
                 for name in new_tools:
                     tool_call_format_error_messages[name] = target_format_error_message
+            # The submission arrives as a call to an individual tool ("bash"), not to the
+            # pool, so the deadline has to be registered under the dispatch names too --
+            # otherwise the lookup misses and grading silently keeps the 120s cap.
+            if pool_name in grading_deadlines:
+                for name in new_tools:
+                    grading_deadlines[name] = grading_deadlines[pool_name]
+                    submit_markers[name] = submit_markers[pool_name]
 
             if entry.is_text_env:
                 text_env_names.append(pool_name)
@@ -1109,6 +1197,8 @@ async def _acquire_and_reset_pools(
         tool_call_format_error_messages=tool_call_format_error_messages,
         active_env_names=active_env_names,
         text_env_names=text_env_names,
+        grading_deadlines=grading_deadlines,
+        submit_markers=submit_markers,
     )
 
 
@@ -1120,6 +1210,20 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
 
     def add_timing(name: str, start_time: float) -> None:
         timings[name] += time.perf_counter() - start_time
+
+    rollout_deadline = request_start_time + ROLLOUT_TIMEOUT_S if ROLLOUT_TIMEOUT_S > 0 else None
+
+    def remaining_rollout_time() -> float | None:
+        if rollout_deadline is None:
+            return None
+        return max(0.0, rollout_deadline - time.perf_counter())
+
+    def mark_rollout_timeout(rollout: RolloutState, message: str) -> None:
+        logger.warning(message)
+        rollout.timeout = True
+        rollout.done = True
+        rollout.tool_error += message
+        rollout.rewards.append(0.0)
 
     await _check_health(actor.server_port)
     add_timing("health_check", request_start_time)
@@ -1144,6 +1248,7 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
     max_steps = env_config.max_steps
 
     output = None
+    unsafe_env_names: set[str] = set()
     pool_setup = PoolSetup(
         acquired={},
         actor_map={},
@@ -1184,7 +1289,16 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
         tool_call_format_error_message = _select_tool_call_format_error_message(pool_setup, allowed_tools)
 
         while rollout.step_count < max_steps:
-            if rollout.done:
+            if rollout.done or rollout.timeout:
+                break
+            remaining_rollout_s = remaining_rollout_time()
+            if remaining_rollout_s is not None and remaining_rollout_s <= 0:
+                mark_rollout_timeout(
+                    rollout,
+                    f"Rollout timed out after {ROLLOUT_TIMEOUT_S:.1f}s "
+                    f"(request_id={sub_request_id}, base_request_id={base_request_id}, "
+                    f"step_count={rollout.step_count}).",
+                )
                 break
 
             remaining_budget = sampling_params.max_tokens - len(response_masks)
@@ -1194,12 +1308,21 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
             if remaining_budget <= 0 or remaining_room <= 0:
                 break
 
+            # A rollout may make several completion requests when it interacts
+            # with tools. By default, let the engine RNG advance naturally:
+            # reusing one request seed can repeat a completion after similar
+            # observations. Opt-in per-turn seeding uses a different seed for
+            # each completion and each sample in the prompt group.
             current_sampling_params = dataclasses.replace(sampling_params, max_tokens=current_max_tokens)
             params_dict = dataclasses.asdict(current_sampling_params)
             min_tokens = params_dict.pop("min_tokens", 0)
+            params_dict.pop("seed", None)
+            if getattr(actor, "seed_per_turn", False) and sampling_params.seed is not None:
+                num_samples = request_metadata["original_sampling_params"].n
+                params_dict["seed"] = sampling_params.seed + counts["generation_calls"] * num_samples
             counts["generation_calls"] += 1
             phase_start_time = time.perf_counter()
-            api_response = await actor.client.completions.create(
+            completion_coro = actor.client.completions.create(
                 model=actor.model_name,
                 prompt=current_prompt,
                 extra_body={
@@ -1213,6 +1336,21 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                 },
                 **params_dict,
             )
+            remaining_rollout_s = remaining_rollout_time()
+            try:
+                if remaining_rollout_s is None:
+                    api_response = await completion_coro
+                else:
+                    api_response = await asyncio.wait_for(completion_coro, timeout=max(0.001, remaining_rollout_s))
+            except asyncio.TimeoutError:
+                add_timing("generation", phase_start_time)
+                mark_rollout_timeout(
+                    rollout,
+                    f"Rollout timed out during generation after {ROLLOUT_TIMEOUT_S:.1f}s "
+                    f"(request_id={sub_request_id}, base_request_id={base_request_id}, "
+                    f"step_count={rollout.step_count}).",
+                )
+                break
             add_timing("generation", phase_start_time)
 
             output = api_response.choices[0]
@@ -1229,6 +1367,11 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
 
             parse_result = actor.tool_parser.parse_tool_calls(output.text)
             tool_calls = [tc for tc in parse_result.tool_calls if tc.name in allowed_tools]
+            if pool_setup.active_env_names == ["swerl_vanillux_sandbox"]:
+                first_call = [] if parse_result.first_tool_call_invalid else parse_result.tool_calls[:1]
+                tool_calls = [
+                    tc for tc in first_call if tc.name == "bash" and isinstance(tc.args.get("command", ""), str)
+                ]
 
             format_error_feedback: list[tuple[str, str]] = []
             if tool_call_format_error_message and not text_env_names:
@@ -1236,7 +1379,11 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
 
                 # No tool call at all should read like a fresh user instruction.
                 # Malformed or wrong-tool calls get regular tool feedback.
-                if not parse_result.had_tool_call:
+                if pool_setup.active_env_names == ["swerl_vanillux_sandbox"]:
+                    # Evaluation removes invalid calls and sends user-role feedback.
+                    if not tool_calls:
+                        format_error_feedback.append((tool_call_format_error_message, "user"))
+                elif not parse_result.had_tool_call:
                     format_error_feedback.append((tool_call_format_error_message, "user"))
                 elif has_wrong_tool_call or not tool_calls:
                     format_error_feedback.append((tool_call_format_error_message, "tool"))
@@ -1273,14 +1420,35 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                     )
 
                 rollout.step_count += 1
+                # Bound before the try: the handlers below read it, and a failure between
+                # dispatch and assignment must not turn into a NameError.
+                is_grading_call = False
+                step_timeout = actor.tool_call_timeout
 
                 try:
                     counts["tool_calls"] += 1
                     phase_start_time = time.perf_counter()
-                    step_result: StepResult = await asyncio.wait_for(
-                        target.step.remote(EnvCall(id=str(rollout.step_count), name=tc.name, args=tc.args)),
-                        timeout=actor.tool_call_timeout,
+                    step_ref = target.step.remote(EnvCall(id=str(rollout.step_count), name=tc.name, args=tc.args))
+                    remaining_rollout_s = remaining_rollout_time()
+                    is_grading_call = _is_submission_call(tc, pool_setup)
+                    if is_grading_call:
+                        # Submission gets the task's verifier budget and is deliberately
+                        # NOT clamped by the agent's remaining rollout time. The rollout
+                        # deadline bounds how long the AGENT may work; letting it also
+                        # bound grading means an agent that submits late has its reward
+                        # discarded for a reason that has nothing to do with the verifier.
+                        step_timeout = pool_setup.grading_deadlines[tc.name]
+                    else:
+                        step_timeout = actor.tool_call_timeout
+                        if remaining_rollout_s is not None:
+                            step_timeout = min(step_timeout, max(0.001, remaining_rollout_s))
+                    # Do not let wait_for cancel the local reference: we must
+                    # still observe remote completion before releasing this actor.
+                    step_future = asyncio.ensure_future(step_ref)
+                    step_future.add_done_callback(
+                        lambda completed: completed.exception() if not completed.cancelled() else None
                     )
+                    step_result: StepResult = await asyncio.wait_for(asyncio.shield(step_future), timeout=step_timeout)
                     add_timing("tool_step", phase_start_time)
                     observations.append((step_result.result, tool_response_roles.get(tc.name, "tool")))
                     rollout.tool_output += step_result.result
@@ -1288,7 +1456,23 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                     if step_result.done:
                         rollout.done = True
                     meta = step_result.metadata or {}
+                    if meta.get("invalid_reward"):
+                        rollout.info["invalid_reward"] = True
+                    if meta.get("sandbox_lost"):
+                        rollout.info["sandbox_lost"] = True
+                        rollout.info["infrastructure_failure"] = True
+                    if meta.get("infrastructure_failure"):
+                        rollout.info["infrastructure_failure"] = True
                     rollout.timeout = rollout.timeout or meta.get("timeout", False)
+                    if meta.get("timeout", False):
+                        rollout.done = True
+                        # An agent step that ran long and a verifier that exhausted its
+                        # budget both set `timeout`. Only the env knows which, so record
+                        # it here while that distinction is still available.
+                        if meta.get("grading"):
+                            rollout.info["verifier_timeout"] = True
+                    if meta.get("verifier_timeout_clamped"):
+                        rollout.info["verifier_timeout_clamped"] = True
                     rollout.tool_error += meta.get("error", "")
                     rollout.tool_runtime += meta.get("runtime", 0.0)
                     rollout.tool_call_stats.append(
@@ -1300,15 +1484,81 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                     )
                 except asyncio.TimeoutError:
                     add_timing("tool_step", phase_start_time)
-                    error_msg = f"Step '{tc.name}' timed out after {actor.tool_call_timeout}s. Args: {tc.args}"
+                    # Three distinct causes that used to read as two. Grading abandoned by
+                    # its caller is the one that must be separable: it is a verifier
+                    # terminated from outside, which no log inside the env can observe.
+                    if is_grading_call:
+                        error_msg = (
+                            f"GRADING abandoned by caller after {step_timeout:.1f}s "
+                            f"(verifier budget + overhead) during step '{tc.name}' "
+                            f"(request_id={sub_request_id}, base_request_id={base_request_id}, "
+                            f"step_count={rollout.step_count})."
+                        )
+                    elif remaining_rollout_time() is not None and remaining_rollout_time() <= 0:
+                        error_msg = (
+                            f"Rollout timed out after {ROLLOUT_TIMEOUT_S:.1f}s during step '{tc.name}' "
+                            f"(request_id={sub_request_id}, base_request_id={base_request_id}, "
+                            f"step_count={rollout.step_count}). Args: {tc.args}"
+                        )
+                    else:
+                        error_msg = (
+                            f"Step '{tc.name}' timed out after {actor.tool_call_timeout}s "
+                            f"(request_id={sub_request_id}, base_request_id={base_request_id}, "
+                            f"step_count={rollout.step_count}). Args: {tc.args}"
+                        )
                     logger.warning(error_msg)
+                    if is_grading_call:
+                        rollout.info["grading_abandoned_by_caller"] = True
+                    # Ray cancellation is not sandbox cleanup acknowledgement,
+                    # and force=True is unsupported for actor tasks. The synchronous
+                    # backend enforces its command timeout; drain it before reuse.
+                    drained_result = None
+                    draining_env_names = {
+                        name for name, (_, acquired_actor) in pool_setup.acquired.items() if acquired_actor == target
+                    }
+                    unsafe_env_names.update(draining_env_names)
+                    try:
+                        drained_result = await asyncio.wait_for(asyncio.shield(step_future), timeout=60)
+                        drain_metadata = drained_result.metadata or {}
+                        if drain_metadata.get("grading") and not is_grading_call:
+                            # Grading we could not see coming: the env grades when the
+                            # marker appears in a command's output, not only in its args.
+                            # Counting this as an ordinary slow command would understate
+                            # verifier terminations, so name it.
+                            rollout.info["grading_truncated_unanticipated"] = True
+                            logger.warning(
+                                "GRADING was triggered by command OUTPUT and ran under the "
+                                "ordinary %.1fs tool timeout (verifier budget was %.1fs); "
+                                "reward recovered during drain. step '%s', request_id=%s",
+                                step_timeout,
+                                drain_metadata.get("verifier_timeout_s", -1.0),
+                                tc.name,
+                                sub_request_id,
+                            )
+                        for flag in ("invalid_reward", "infrastructure_failure", "sandbox_lost"):
+                            if drain_metadata.get(flag):
+                                rollout.info[flag] = True
+                        if drain_metadata.get("sandbox_lost"):
+                            rollout.info["infrastructure_failure"] = True
+                        unsafe_env_names.difference_update(draining_env_names)
+                    except Exception as drain_error:
+                        rollout.info["infrastructure_failure"] = True
+                        logger.warning("Timed-out environment step failed while draining: %s", drain_error)
                     observations.append((error_msg, "tool"))
                     rollout.tool_error += error_msg
                     rollout.timeout = True
-                    rollout.rewards.append(0.0)
+                    rollout.done = True
+                    rollout.rewards.append(drained_result.reward if drained_result is not None else 0.0)
                     rollout.tool_call_stats.append(
                         ToolCallStats(tool_name=tc.name, success=False, runtime=actor.tool_call_timeout)
                     )
+                except asyncio.CancelledError:
+                    # Caller cancellation also must not return an in-flight actor
+                    # to the pool. Its lease is reclaimed after actor discard.
+                    unsafe_env_names.update(
+                        name for name, (_, acquired_actor) in pool_setup.acquired.items() if acquired_actor == target
+                    )
+                    raise
                 except Exception as e:
                     add_timing("tool_step", phase_start_time)
                     error_msg = f"Step '{tc.name}' failed: {e}. Args: {tc.args}"
@@ -1316,9 +1566,17 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                     observations.append((error_msg, "tool"))
                     rollout.tool_error += error_msg
                     rollout.rewards.append(0.0)
+                    # Unexpected implementation/transport exceptions are not
+                    # scored model failures. Structured format feedback belongs in
+                    # StepResult; do not retry an actor with unconfirmed cleanup.
+                    rollout.info["infrastructure_failure"] = True
+                    unsafe_env_names.update(
+                        name for name, (_, acquired_actor) in pool_setup.acquired.items() if acquired_actor == target
+                    )
+                    rollout.done = True
                     rollout.tool_call_stats.append(ToolCallStats(tool_name=tc.name, success=False, runtime=0.0))
 
-                if rollout.done:
+                if rollout.done or rollout.timeout:
                     break
 
             if observations:
@@ -1349,25 +1607,46 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
     finally:
         phase_start_time = time.perf_counter()
         env_metrics: dict[str, dict[str, float]] = {}
+        dead_env_names: set[str] = set(unsafe_env_names)
         for env_name in pool_setup.active_env_names:
+            if env_name in dead_env_names:
+                continue
             if env_name in pool_setup.acquired:
                 _, env_act = pool_setup.acquired[env_name]
-                env_metrics[env_name] = await env_act.get_metrics.remote()
+                try:
+                    env_metrics[env_name] = await env_act.get_metrics.remote()
+                except ray.exceptions.RayActorError as e:
+                    # Discard failed actors before reuse: a dead actor
+                    # must not abort finalization (the completion still gets enqueued)
+                    # and must not be released back to the pool — discard it.
+                    logger.warning("Environment actor for %s died before metrics collection: %s", env_name, e)
+                    dead_env_names.add(env_name)
+                    rollout.info["infrastructure_failure"] = True
         if len(env_metrics) == 1:
             env_name, metrics = next(iter(env_metrics.items()))
             rollout.info["env_name"] = env_name
             rollout.info.update(metrics)
         elif env_metrics:
             rollout.info["env_metrics"] = env_metrics
-        for pool, acq_actor in pool_setup.acquired.values():
-            pool.release.remote(acq_actor)
+        for pooled_env_name, (pool, acq_actor) in pool_setup.acquired.items():
+            if pooled_env_name in dead_env_names:
+                # Observe replacement failure instead of silently shrinking the
+                # pool. Keep a bound even if replacement actor setup hangs.
+                await asyncio.wait_for(
+                    pool.discard.remote(acq_actor, "actor died or command completion could not be confirmed"),
+                    timeout=60,
+                )
+            else:
+                pool.release.remote(acq_actor)
         add_timing("env_metrics_and_release", phase_start_time)
 
     if len(response_tokens) == 0:
         eos_token_id = actor.llm_engine.tokenizer.eos_token_id
         response_tokens.append(eos_token_id)
-        response_masks.append(1)
-        response_logprobs.append(float("nan"))
+        # errored or
+        # timed-out empty rollouts must not train on the synthetic EOS token.
+        response_masks.append(0 if rollout.timeout or rollout.tool_error else 1)
+        response_logprobs.append(0.0 if rollout.timeout or rollout.tool_error else float("nan"))
 
     finish_reason = output.finish_reason if output else "stop"
 
@@ -1450,6 +1729,7 @@ def create_vllm_engines(
     tool_stop_sequences: list[str] | None = None,
     max_steps: int = 5,
     per_turn_max_tokens: int | None = None,
+    seed_per_turn: bool = False,
     mask_tool_use: bool = True,
     pools: dict[str, ray.actor.ActorHandle] | None = None,
     prompt_queue=None,
@@ -1544,6 +1824,7 @@ def create_vllm_engines(
                 tool_stop_sequences=tool_stop_sequences,
                 max_steps=max_steps,
                 per_turn_max_tokens=per_turn_max_tokens,
+                seed_per_turn=seed_per_turn,
                 mask_tool_use=mask_tool_use,
                 pools=pools,
                 inflight_updates=inflight_updates,

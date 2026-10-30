@@ -1,0 +1,373 @@
+"""Tests for the remote Sandfleet sandbox backend."""
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.error import HTTPError
+
+import pytest
+
+from open_instruct.environments import sandfleet_backend as module
+from open_instruct.environments.backends import ExecutionResult, SandboxLostError, SandboxOOMError, create_backend
+from open_instruct.environments.sandfleet_backend import SandfleetBackend
+
+
+class _ServiceHandler(BaseHTTPRequestHandler):
+    requests: list[tuple[str, str, dict]] = []
+    base_url = ""
+    oom = False
+    lost = False
+    release_error = False
+
+    def log_message(self, *_args):
+        pass
+
+    def _body(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        return json.loads(self.rfile.read(length)) if length else {}
+
+    def _send(self, status, value):
+        body = json.dumps(value).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):  # noqa: N802
+        payload = self._body()
+        self.__class__.requests.append(("POST", self.path, payload))
+        if self.path == "/v1/lease-requests":
+            self._send(
+                202,
+                {
+                    "request_id": "request-1",
+                    "status": "assigned",
+                    "poll_after_seconds": 2,
+                    "lease": {
+                        "lease_id": "lease-1",
+                        "lease_token": "lease-token",
+                        "agent_url": self.base_url,
+                        "ttl_seconds": 3600,
+                    },
+                },
+            )
+        elif self.path == "/v1/leases/lease-1/renew":
+            self._send(200, {"lease_id": "lease-1", "ttl_seconds": 3600})
+        elif self.path.endswith("/start"):
+            self._send(200, {"instance_name": "first", "cgroup": {"path": "/cg/step-1"}})
+        elif self.path.endswith("/restart"):
+            self._send(200, {"instance_name": "second", "cgroup": {"path": "/cg/step-1"}})
+        elif self.path.endswith("/exec"):
+            if self.lost:
+                self._send(500, {"error": {"type": "SandboxLostError", "message": "worker preempted"}})
+            elif self.oom:
+                self._send(500, {"error": {"type": "SandboxOOMError", "message": "memory exhausted"}})
+            else:
+                self._send(200, {"stdout": "hello\n", "stderr": "", "exit_code": 0})
+        elif self.path.endswith("/write-file") or self.path.endswith("/put-archive"):
+            self._send(200, {"ok": True})
+        elif self.path.endswith("/read-file"):
+            self._send(200, {"content_b64": base64.b64encode(b"contents").decode()})
+        else:
+            self._send(404, {"error": {"type": "KeyError", "message": self.path}})
+
+    def do_DELETE(self):  # noqa: N802
+        payload = self._body()
+        self.__class__.requests.append(("DELETE", self.path, payload))
+        if self.release_error:
+            self._send(500, {"error": {"type": "RuntimeError", "message": "release failed"}})
+        else:
+            self._send(200, {"released": True})
+
+
+@pytest.fixture
+def service(monkeypatch):
+    _ServiceHandler.requests = []
+    _ServiceHandler.oom = False
+    _ServiceHandler.lost = False
+    _ServiceHandler.release_error = False
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ServiceHandler)
+    _ServiceHandler.base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    monkeypatch.setenv("SANDFLEET_URL", _ServiceHandler.base_url)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield _ServiceHandler.base_url
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.fixture(autouse=True)
+def sandfleet_environment(monkeypatch):
+    monkeypatch.setenv("SANDFLEET_CLIENT_TOKEN", "client-token")
+    monkeypatch.delenv("SANDFLEET_POOL", raising=False)
+
+
+def test_full_backend_contract_and_persistent_remote_lease(service):
+    backend = SandfleetBackend(image="/shared/first.sif")
+    backend.start()
+    assert backend._name == "first"
+    assert backend._worker_metadata["path"] == "/cg/step-1"
+    assert backend.run_command("echo hello") == ExecutionResult(stdout="hello\n", stderr="", exit_code=0)
+    backend.write_file("/workspace/data", b"contents")
+    assert backend.read_file("/workspace/data", binary=True) == b"contents"
+    backend.put_archive("/workspace", b"archive")
+
+    backend._image = "/shared/second.sif"
+    backend.restart()
+    assert backend._name == "second"
+    assert backend._lease_id == "lease-1"
+    backend._renew_once()
+    backend.close()
+
+    paths = [path for _, path, _ in _ServiceHandler.requests]
+    assert paths.count("/v1/lease-requests") == 1
+    assert "/v1/leases/lease-1/restart" in paths
+    assert "/v1/leases/lease-1/renew" in paths
+    assert paths[-1] == "/v1/leases/lease-1"
+
+
+def test_remote_oom_preserves_backend_exception(service):
+    backend = SandfleetBackend(image="/shared/image.sif")
+    backend.start()
+    _ServiceHandler.oom = True
+    try:
+        with pytest.raises(SandboxOOMError, match="memory exhausted"):
+            backend.run_command("allocate everything")
+    finally:
+        backend.close()
+
+
+def test_lost_worker_is_a_distinct_retryable_infrastructure_error(service):
+    backend = SandfleetBackend(image="/shared/image.sif")
+    backend.start()
+    _ServiceHandler.lost = True
+    try:
+        with pytest.raises(SandboxLostError, match="worker preempted"):
+            backend.run_command("echo never-runs")
+    finally:
+        backend.close()
+
+
+def test_named_pool_ignores_local_memory_setting(service, monkeypatch):
+    monkeypatch.setenv("SANDFLEET_POOL", "small")
+    backend = create_backend("sandfleet", image="/shared/image.sif", mem_limit="12g")
+    assert isinstance(backend, SandfleetBackend)
+    assert backend._pool == "small"
+    assert backend._resources is None
+    assert backend._acquire_timeout == 900
+    assert backend._request_timeout == 300
+
+
+def _transient_error() -> HTTPError:
+    body = io.BytesIO(b'{"error":{"type":"RuntimeError","message":"try later"}}')
+    return HTTPError("http://controller", 503, "Service Unavailable", {}, body)
+
+
+def test_configuration_rejection_preserves_controller_guidance(monkeypatch):
+    body = io.BytesIO(
+        b'{"error":{"type":"ValueError","message":"Declarative resource requests are disabled; '
+        b'start the controller with --enable-dynamic-resources"}}'
+    )
+
+    def reject(*_args, **_kwargs):
+        raise HTTPError("http://controller", 400, "Bad Request", {}, body)
+
+    monkeypatch.setattr("open_instruct.environments.sandfleet_backend.urlopen", reject)
+
+    with pytest.raises(ValueError, match="--enable-dynamic-resources"):
+        SandfleetBackend()._request(
+            "http://controller",
+            "/v1/lease-requests",
+            token="client-token",
+            method="POST",
+            payload={"resources": {"cpus": 2, "memory_mb": 4096}},
+        )
+
+
+def test_replay_safe_requests_retry_with_backoff(monkeypatch):
+    outcomes = iter([_transient_error(), _transient_error(), io.BytesIO(b'{"ok":true}')])
+    calls = []
+    delays = []
+
+    def request(*args, **kwargs):
+        calls.append((args, kwargs))
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr("open_instruct.environments.sandfleet_backend.urlopen", request)
+    monkeypatch.setattr("open_instruct.environments.sandfleet_backend.time.sleep", delays.append)
+    backend = SandfleetBackend()
+
+    assert backend._request("http://controller", "/v1/health", token="client-token") == {"ok": True}
+    assert len(calls) == 3
+    assert len(delays) == 2
+    assert delays[0] < delays[1]
+
+
+def test_renewal_retries_but_lease_creation_does_not(monkeypatch):
+    monkeypatch.setenv("SANDFLEET_URL", "http://controller")
+    outcomes = iter([_transient_error(), io.BytesIO(b'{"lease_id":"lease-1"}')])
+    calls = []
+
+    def request(*args, **kwargs):
+        calls.append((args, kwargs))
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr("open_instruct.environments.sandfleet_backend.urlopen", request)
+    monkeypatch.setattr("open_instruct.environments.sandfleet_backend.time.sleep", lambda _delay: None)
+    backend = SandfleetBackend()
+    backend._lease_id = "lease-1"
+    backend._renew_once()
+    assert len(calls) == 2
+
+    calls.clear()
+    outcomes = iter([_transient_error(), io.BytesIO(b"{}")])
+    with pytest.raises(RuntimeError, match="try later"):
+        SandfleetBackend().start()
+    assert len(calls) == 1
+
+
+def test_renewal_failure_is_exposed_to_the_next_operation(monkeypatch):
+    backend = SandfleetBackend()
+    backend._lease_ttl_seconds = 3
+    monkeypatch.setattr(backend._renew_stop, "wait", lambda _timeout: False)
+
+    def fail_renewal():
+        raise ConnectionError("controller unavailable after retry window")
+
+    monkeypatch.setattr(backend, "_renew_once", fail_renewal)
+    backend._renew_loop()
+
+    backend._lease_id = "lease-1"
+    backend._lease_token = "lease-token"
+    backend._agent_url = "http://agent"
+    with pytest.raises(SandboxLostError, match="controller unavailable"):
+        backend._agent_request("exec")
+
+
+@pytest.mark.parametrize(("mem_limit", "memory_mb"), [("4g", 4096), ("1.5g", 1536), (67108865, 65)])
+def test_backend_requests_two_cpus_and_existing_memory_limit(service, mem_limit, memory_mb):
+    backend = create_backend("sandfleet", image="/shared/image.sif", mem_limit=mem_limit)
+    backend.start()
+    try:
+        request = next(
+            payload
+            for method, path, payload in _ServiceHandler.requests
+            if method == "POST" and path == "/v1/lease-requests"
+        )
+        assert request == {"resources": {"cpus": 2, "memory_mb": memory_mb}, "timeout_seconds": 900}
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("mem_limit", ["garbage", "63m", 0])
+def test_backend_rejects_invalid_or_too_small_memory(mem_limit):
+    with pytest.raises(ValueError, match="mem_limit"):
+        SandfleetBackend(mem_limit=mem_limit)
+
+
+def test_client_token_comes_from_environment(monkeypatch):
+    monkeypatch.setenv("SANDFLEET_CLIENT_TOKEN", "different-client-token")
+    monkeypatch.setenv("SANDFLEET_TOKEN", "admin-token")
+    backend = SandfleetBackend()
+    assert backend._token == "different-client-token"
+
+
+def test_client_role_does_not_fall_back_to_admin(monkeypatch):
+    monkeypatch.delenv("SANDFLEET_CLIENT_TOKEN", raising=False)
+    monkeypatch.setenv("SANDFLEET_TOKEN", "admin-token")
+    backend = SandfleetBackend()
+    assert backend._token == ""
+
+
+def test_failed_release_keeps_lease_releasable(service):
+    backend = SandfleetBackend()
+    backend.start()
+    _ServiceHandler.release_error = True
+    with pytest.raises(RuntimeError, match="release failed"):
+        backend.close()
+    assert backend._lease_id == "lease-1"
+
+
+def test_controller_renewal_follows_changed_registry(monkeypatch, tmp_path):
+    registry = tmp_path / "endpoint.json"
+    registry.write_text(json.dumps({"url": "http://old"}))
+    monkeypatch.setenv("SANDFLEET_REGISTRY", str(registry))
+    backend = SandfleetBackend()
+    backend._url = "http://old"
+    backend._lease_id = "test"
+    backend._lease_ttl_seconds = 3600
+    seen = []
+
+    class Response(io.BytesIO):
+        pass
+
+    def request(req, **kwargs):
+        seen.append(req.full_url)
+        if len(seen) == 1:
+            registry.write_text(json.dumps({"url": "http://new"}))
+            raise ConnectionRefusedError("controller restarting")
+        return Response(b"{}")
+
+    monkeypatch.setattr(module, "urlopen", request)
+    monkeypatch.setattr(module, "_sleep_before_retry", lambda *_args: 0)
+    backend._renew_once()
+    assert seen == ["http://old/v1/leases/test/renew", "http://new/v1/leases/test/renew"]
+    # Direct worker traffic must never be redirected to the controller.
+    backend._request("http://worker", "/v1/leases/test/exec", token="lease", method="POST")
+    assert seen[-1] == "http://worker/v1/leases/test/exec"
+
+
+def test_registry_invalid_does_not_fall_back(monkeypatch, tmp_path):
+    path = tmp_path / "endpoint.json"
+    monkeypatch.setenv("SANDFLEET_REGISTRY", str(path))
+    backend = SandfleetBackend()
+    backend._url = "http://old"
+    assert backend._controller_url() == "http://old"
+    path.write_text("{")
+    with pytest.raises(ValueError):
+        backend._controller_url()
+    path.write_text(json.dumps({"url": "http://user:password@host"}))
+    with pytest.raises(ValueError):
+        backend._controller_url()
+
+
+def test_renewal_retry_is_bounded_by_ttl(monkeypatch):
+    backend = SandfleetBackend()
+    backend._lease_id = "test"
+    backend._lease_ttl_seconds = 60
+    calls = []
+    monkeypatch.setattr(backend, "_request", lambda *args, **kwargs: calls.append(kwargs))
+    backend._renew_once()
+    assert calls[0]["retry_window"] == 30
+    assert calls[0]["timeout"] == 10
+    assert calls[0]["stop"] is backend._renew_stop
+
+
+def test_worker_file_read_keeps_its_operation_timeout(monkeypatch):
+    backend = SandfleetBackend()
+    backend._lease_id = "test"
+    backend._lease_token = "lease-token"
+    backend._agent_url = "http://worker"
+    calls = []
+
+    def request(req, *, timeout):
+        calls.append((req.full_url, timeout))
+        return io.BytesIO(b'{"content_b64":"b2s="}')
+
+    monkeypatch.setattr(module, "urlopen", request)
+    assert backend.read_file("/tmp/output") == "ok"
+    assert calls == [("http://worker/v1/leases/test/read-file", 120)]

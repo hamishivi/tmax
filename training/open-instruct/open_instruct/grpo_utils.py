@@ -3,7 +3,7 @@ import importlib
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 import torch
@@ -21,6 +21,87 @@ from open_instruct.utils import (
 
 logger = logger_utils.setup_logger(__name__)
 TORCH_DTYPES: dict[str, torch.dtype] = {"bfloat16": torch.bfloat16, "float32": torch.float32}
+
+
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the model owned by a distributed wrapper, if present."""
+    return getattr(model, "module", model)
+
+
+def _validate_matching_parameters(
+    policy: torch.nn.Module, ref_policy: torch.nn.Module
+) -> list[tuple[str, torch.nn.Parameter, torch.nn.Parameter]]:
+    policy_params = list(_unwrap_model(policy).named_parameters())
+    ref_params = list(_unwrap_model(ref_policy).named_parameters())
+    policy_names = [name for name, _ in policy_params]
+    ref_names = [name for name, _ in ref_params]
+    if policy_names != ref_names:
+        raise ValueError("Policy and reference policy parameter names do not match")
+
+    pairs = []
+    for (name, param), (_, ref_param) in zip(policy_params, ref_params, strict=True):
+        param_shape = getattr(param, "ds_shape", param.shape)
+        ref_param_shape = getattr(ref_param, "ds_shape", ref_param.shape)
+        if param_shape != ref_param_shape:
+            raise ValueError(
+                f"Policy and reference policy parameter shapes do not match for {name}: "
+                f"{tuple(param_shape)} != {tuple(ref_param_shape)}"
+            )
+        pairs.append((name, param, ref_param))
+    return pairs
+
+
+@torch.no_grad()
+def update_reference_policy(
+    policy: torch.nn.Module, ref_policy: torch.nn.Module, alpha: float, *, deepspeed_stage_3: bool = False
+) -> None:
+    """Polyak-update a reference policy without mixing distributed-engine collectives.
+
+    ZeRO-3 parameters belonging to separate engines must not be placed in one
+    ``GatheredParameters`` context. After releasing each engine's cached full
+    parameters, corresponding local ZeRO shards have identical layouts and can
+    be updated directly without an all-gather.
+    """
+    pairs = _validate_matching_parameters(policy, ref_policy)
+    if deepspeed_stage_3:
+        for model in (policy, ref_policy):
+            empty_partition_cache = getattr(model, "empty_partition_cache", None)
+            if empty_partition_cache is None:
+                raise ValueError("ZeRO-3 reference policy updates require DeepSpeed engine wrappers")
+            empty_partition_cache()
+
+        zero3_shards = []
+        for name, param, ref_param in pairs:
+            if not hasattr(param, "ds_tensor") or not hasattr(ref_param, "ds_tensor"):
+                raise ValueError(f"ZeRO-3 parameter {name} is missing its local partition")
+            param_ds_tensor = cast(Any, param).ds_tensor
+            ref_param_ds_tensor = cast(Any, ref_param).ds_tensor
+            if param_ds_tensor.shape != ref_param_ds_tensor.shape:
+                raise ValueError(
+                    f"Policy and reference policy ZeRO-3 shard shapes do not match for {name}: "
+                    f"{tuple(param_ds_tensor.shape)} != {tuple(ref_param_ds_tensor.shape)}"
+                )
+            if param_ds_tensor.dtype != ref_param_ds_tensor.dtype:
+                raise ValueError(
+                    f"Policy and reference policy ZeRO-3 shard dtypes do not match for {name}: "
+                    f"{param_ds_tensor.dtype} != {ref_param_ds_tensor.dtype}"
+                )
+            if dist.is_initialized():
+                param_group_ranks = tuple(dist.get_process_group_ranks(cast(Any, param).ds_process_group))
+                ref_param_group_ranks = tuple(dist.get_process_group_ranks(cast(Any, ref_param).ds_process_group))
+                if param_group_ranks != ref_param_group_ranks:
+                    raise ValueError(
+                        f"Policy and reference policy ZeRO-3 process groups do not match for {name}: "
+                        f"{param_group_ranks} != {ref_param_group_ranks}"
+                    )
+            zero3_shards.append((param_ds_tensor, ref_param_ds_tensor))
+
+        for param_ds_tensor, ref_param_ds_tensor in zero3_shards:
+            ref_param_ds_tensor.lerp_(param_ds_tensor.to(ref_param_ds_tensor.device), alpha)
+        return
+
+    for _, param, ref_param in pairs:
+        ref_param.lerp_(param, alpha)
 
 
 def compute_pass_at_k_metrics(correct_per_prompt: np.ndarray) -> dict[str, float]:
@@ -128,14 +209,18 @@ class GRPOExperimentConfig(
     When >0, tokens with ratio ≥ tis_mask_upper are multiplied by 0 in the pg loss.
     Set to 0 to disable the upper side of the mask.
     """
-    sequence_tis_mask_log_ratio_threshold: float = 0.0
-    """Sequence-level threshold δ for avg log(π_rollout / π_θ).
+    sequence_tis_mask_lower: float = 0.0
+    """Lower bound for the geometric-mean sequence ratio ρ_geo = geomean_t(π_θ / π_rollout).
 
-    When >0, whole response samples whose average log-ratio exceeds this threshold
-    are multiplied by 0 in the pg loss.
+    When >0, whole responses whose ρ_geo is below this bound are multiplied by 0
+    in both the pg loss and the KL term. Set to 0 to disable the lower bound.
     """
-    sequence_tis_mask_negative_advantages_only: bool = True
-    """Only apply the sequence-level ratio mask to samples with negative mean advantage."""
+    sequence_tis_mask_upper: float = 0.0
+    """Upper bound for the geometric-mean sequence ratio ρ_geo = geomean_t(π_θ / π_rollout).
+
+    When >0, whole responses whose ρ_geo is above this bound are multiplied by 0
+    in both the pg loss and the KL term. Set to 0 to disable the upper bound.
+    """
     kl_estimator: Literal[0, 1, 2, 3] = 2
     """the KL estimator to use"""
     loss_denominator: str = "token"
@@ -174,6 +259,15 @@ class GRPOExperimentConfig(
     binary KL. We default to 0.1 as a moderately tighter middle-ground; bump
     closer to 0.15–0.2 for paper-faithful runs.
     """
+    dppo_ratio_cap: float = 10.0
+    """For DPPO: upper cap on the rollout importance ratio in the policy gradient.
+
+    Uses the Stable-RL reference implementation's REINFORCE-with-importance-
+    sampling form ``-A · min(π_θ/μ_θ', c).detach() · log π_θ``. This
+    preserves the uncapped DPPO gradient below ``c`` while bounding the influence
+    of extreme off-policy tokens. Set to 0 to recover the uncapped Eq. 11 loss.
+    Only used when ``loss_fn=dppo``.
+    """
     tvpo_divergence_threshold: float = 0.02
     """For TVPO: prompt-level total-variation trust-region radius δ.
 
@@ -194,7 +288,7 @@ class GRPOExperimentConfig(
     blow-ups in extreme ratios. Only used when ``loss_fn=tvpo``.
     """
     record_entropy: bool = False
-    """whether to record the entropy of the policy during training. Uses extra memory."""
+    """Whether to record policy entropy. The tiled loss computes it one LM-head tile at a time."""
     use_vllm_logprobs: bool = False
     """whether to use vLLM's logprobs for training instead of calculating them via forward pass"""
 
@@ -302,6 +396,10 @@ class GRPOExperimentConfig(
     """Number of completions per eval prompt for local pass@k metrics."""
 
     def __post_init__(self):
+        if self.ref_policy_update_freq is not None and self.ref_policy_update_freq <= 0:
+            raise ValueError(
+                f"`ref_policy_update_freq` must be greater than 0 when set, got {self.ref_policy_update_freq}."
+            )
         if self.send_slack_alerts and not os.environ.get("SLACK_WEBHOOK_URL"):
             logger.warning(
                 "--send_slack_alerts is set but SLACK_WEBHOOK_URL is not in the environment. Slack alerts will not be sent."
@@ -317,8 +415,6 @@ class GRPOExperimentConfig(
                     "`use_liger_grpo_loss` currently only supports `loss_fn=dapo`, `loss_fn=cispo`, "
                     "`loss_fn=dppo`, or `loss_fn=tvpo`."
                 )
-            if self.record_entropy:
-                raise ValueError("`use_liger_grpo_loss` does not support `record_entropy=True`.")
             if self.loss_denominator not in ("token", "sequence"):
                 raise ValueError("`use_liger_grpo_loss` currently requires `loss_denominator=token` or `sequence`.")
             if self.kl_estimator != 2:
@@ -330,6 +426,8 @@ class GRPOExperimentConfig(
                 raise ValueError(
                     f"DPPO requires `dppo_divergence_threshold` > 0 (got {self.dppo_divergence_threshold})."
                 )
+            if self.dppo_ratio_cap < 0.0:
+                raise ValueError(f"DPPO requires `dppo_ratio_cap` >= 0 (got {self.dppo_ratio_cap}).")
             # DPPO's trust region must be anchored on the rollout policy μ_θ'
             # (Takeaway 2 in arXiv:2602.04879). Forcing `use_vllm_logprobs=True`
             # ensures the cached `old_logprob` (and therefore the importance
@@ -377,10 +475,19 @@ class GRPOExperimentConfig(
                 "tis_mask_lower must be less than tis_mask_upper when both mask bounds are enabled, "
                 f"got {self.tis_mask_lower=} and {self.tis_mask_upper=}."
             )
-        if self.sequence_tis_mask_log_ratio_threshold < 0.0:
+        if self.sequence_tis_mask_lower < 0.0 or self.sequence_tis_mask_upper < 0.0:
             raise ValueError(
-                "sequence_tis_mask_log_ratio_threshold must be ≥ 0 "
-                f"(got {self.sequence_tis_mask_log_ratio_threshold=}). Use 0 to disable."
+                "sequence_tis_mask_lower and sequence_tis_mask_upper must be ≥ 0 "
+                f"(got {self.sequence_tis_mask_lower=}, {self.sequence_tis_mask_upper=}). Use 0 to disable."
+            )
+        if (
+            self.sequence_tis_mask_lower > 0.0
+            and self.sequence_tis_mask_upper > 0.0
+            and self.sequence_tis_mask_lower >= self.sequence_tis_mask_upper
+        ):
+            raise ValueError(
+                "sequence_tis_mask_lower must be less than sequence_tis_mask_upper when both are enabled, "
+                f"got {self.sequence_tis_mask_lower=} and {self.sequence_tis_mask_upper=}."
             )
         if self.loss_denominator not in ("token", "sequence") and float(self.loss_denominator) <= 0:
             raise ValueError(
@@ -521,16 +628,24 @@ def compute_tis_mask(
 def compute_sequence_tis_mask(
     new_logprobs: torch.Tensor,
     vllm_logprobs: torch.Tensor,
-    advantages: torch.Tensor,
     response_mask: torch.Tensor,
-    log_ratio_threshold: float,
-    negative_advantages_only: bool = True,
     rollout_sample_ids: torch.Tensor | None = None,
     sequence_process_group: dist.ProcessGroup | None = None,
-) -> torch.Tensor | None:
-    """Whole-sequence gate: mask when mean log(π_rollout / π_θ) exceeds δ."""
-    if log_ratio_threshold <= 0.0:
-        return None
+    ratio_lower_bound: float = 0.0,
+    ratio_upper_bound: float = 0.0,
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gate a whole sequence using the geometric mean of ρ_t = π_θ / π_rollout.
+
+    The aggregation is evaluated in log space for numerical stability:
+    ``log(ρ_geo) = mean_t(log(ρ_t))``. A sequence is masked when ρ_geo falls
+    below ``ratio_lower_bound`` or rises above ``ratio_upper_bound``. The
+    per-sequence decision is broadcast to every valid response token. Also
+    returns scalar counts of sequences masked by the lower bound, masked by the
+    upper bound, and evaluated (for logging mask rates).
+    """
+    zero_count = torch.zeros((), dtype=torch.float32, device=response_mask.device)
+    if ratio_lower_bound <= 0.0 and ratio_upper_bound <= 0.0:
+        return None, zero_count, zero_count.clone(), zero_count.clone()
     with torch.no_grad():
         if rollout_sample_ids is not None:
             sequence_ids = rollout_sample_ids
@@ -548,36 +663,40 @@ def compute_sequence_tis_mask(
         if sequence_process_group is not None:
             dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=sequence_process_group)
         if local_max.item() < 0:
-            return torch.zeros(response_mask.shape, dtype=new_logprobs.dtype, device=response_mask.device)
+            empty_mask = torch.zeros(response_mask.shape, dtype=new_logprobs.dtype, device=response_mask.device)
+            return empty_mask, zero_count, zero_count.clone(), zero_count.clone()
 
         counts = torch.zeros(int(local_max.item()) + 1, dtype=torch.float32, device=response_mask.device)
 
-        log_ratio = (vllm_logprobs - new_logprobs).clamp(-10.0, 10.0)
+        log_ratio = new_logprobs - vllm_logprobs
         log_ratio = torch.where(valid, log_ratio, torch.zeros_like(log_ratio))
-        advantage_values = torch.where(valid, advantages, torch.zeros_like(advantages))
-
         flat_ids = sequence_ids[valid].long()
         log_ratio_sums = torch.zeros_like(counts)
-        advantage_sums = torch.zeros_like(counts)
         if flat_ids.numel() > 0:
             counts.scatter_add_(0, flat_ids, torch.ones_like(flat_ids, dtype=torch.float32))
             log_ratio_sums.scatter_add_(0, flat_ids, log_ratio[valid].float())
-            advantage_sums.scatter_add_(0, flat_ids, advantage_values[valid].float())
         if sequence_process_group is not None:
             dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=sequence_process_group)
             dist.all_reduce(log_ratio_sums, op=dist.ReduceOp.SUM, group=sequence_process_group)
-            dist.all_reduce(advantage_sums, op=dist.ReduceOp.SUM, group=sequence_process_group)
 
         avg_log_ratio = log_ratio_sums / counts.clamp_min(1.0)
-        mean_advantage = advantage_sums / counts.clamp_min(1.0)
-        sequence_should_mask = avg_log_ratio > log_ratio_threshold
-        if negative_advantages_only:
-            sequence_should_mask = sequence_should_mask & (mean_advantage < 0.0)
-
+        evaluated_sequences = counts > 0
+        lower_should_mask = torch.zeros_like(avg_log_ratio, dtype=torch.bool)
+        upper_should_mask = torch.zeros_like(avg_log_ratio, dtype=torch.bool)
+        if ratio_lower_bound > 0.0:
+            lower_should_mask = evaluated_sequences & (avg_log_ratio < math.log(ratio_lower_bound))
+        if ratio_upper_bound > 0.0:
+            upper_should_mask = evaluated_sequences & (avg_log_ratio > math.log(ratio_upper_bound))
+        sequence_should_mask = lower_should_mask | upper_should_mask
         keep_by_sequence = (~sequence_should_mask).to(dtype=new_logprobs.dtype)
         mask = torch.zeros(response_mask.shape, dtype=new_logprobs.dtype, device=response_mask.device)
         mask[valid] = keep_by_sequence[flat_ids]
-        return mask
+        return (
+            mask,
+            lower_should_mask.sum(dtype=torch.float32),
+            upper_should_mask.sum(dtype=torch.float32),
+            evaluated_sequences.sum(dtype=torch.float32),
+        )
 
 
 def resolve_old_logprob(
@@ -694,6 +813,300 @@ def compute_dppo_mask(
         bad = bad_high | bad_low
         mask = (~bad & response_mask).to(new_logprobs.dtype)
     return mask, divergence
+
+
+POLICY_DRIFT_LOG_RATIO_LIMIT = 20.0
+POLICY_DRIFT_HISTOGRAM_BINS = 400
+POLICY_GRADIENT_LOG_WEIGHT_MIN = -30.0
+POLICY_GRADIENT_LOG_WEIGHT_MAX = 30.0
+
+
+def compute_policy_gradient_weights(
+    log_ratio: torch.Tensor,
+    advantages: torch.Tensor,
+    config: GRPOExperimentConfig,
+    policy_weight: torch.Tensor | None = None,
+    policy_freeze_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return the absolute per-token coefficient on ``grad(log pi)``.
+
+    This is a diagnostic proxy for which tokens dominate the policy-loss
+    gradient. It accounts for each supported loss's clipping behavior and any
+    externally supplied importance weights or masks, but intentionally excludes
+    the optional reference-policy KL term.
+    """
+    with torch.no_grad():
+        ratio = torch.exp(log_ratio.float().clamp(-POLICY_DRIFT_LOG_RATIO_LIMIT, POLICY_DRIFT_LOG_RATIO_LIMIT))
+        abs_advantages = advantages.float().abs()
+
+        if config.loss_fn == GRPOLossType.dapo:
+            clipped = ((advantages > 0) & (ratio > 1.0 + config.clip_higher)) | (
+                (advantages < 0) & (ratio < 1.0 - config.clip_lower)
+            )
+            effective_ratio = ratio * (~clipped)
+        elif config.loss_fn == GRPOLossType.cispo:
+            effective_ratio = ratio.clamp(max=1.0 + config.clip_higher)
+        elif config.loss_fn == GRPOLossType.dppo:
+            effective_ratio = ratio.clamp(max=config.dppo_ratio_cap) if config.dppo_ratio_cap > 0.0 else ratio
+        elif config.loss_fn == GRPOLossType.tvpo:
+            effective_ratio = ratio.clamp(max=config.tvpo_truncation_cap)
+        else:
+            raise ValueError(f"Invalid loss function: {config.loss_fn}")
+
+        weights = abs_advantages * effective_ratio
+        if policy_weight is not None:
+            weights = weights * policy_weight.float()
+        if policy_freeze_mask is not None:
+            weights = weights * policy_freeze_mask.float()
+        return torch.nan_to_num(weights, nan=0.0, posinf=math.exp(POLICY_GRADIENT_LOG_WEIGHT_MAX), neginf=0.0)
+
+
+def compute_dppo_ratio(log_ratio: torch.Tensor) -> torch.Tensor:
+    """Exponentiate DPPO's log-ratio with standard symmetric numerical bounds."""
+    return torch.exp(log_ratio.clamp(-POLICY_DRIFT_LOG_RATIO_LIMIT, POLICY_DRIFT_LOG_RATIO_LIMIT))
+
+
+def compute_dppo_policy_loss(
+    new_logprobs: torch.Tensor, ratio: torch.Tensor, advantages: torch.Tensor, ratio_cap: float
+) -> torch.Tensor:
+    """Compute DPPO's per-token policy loss, optionally capping its gradient.
+
+    The detached REINFORCE form has the same gradient as ``-A * ratio`` below
+    the cap and bounds the coefficient on ``grad(log pi)`` above it. The
+    ratio is expected to have the standard numerical ``[-20, 20]`` log-ratio
+    bounds applied before exponentiation. A non-positive cap recovers the
+    uncapped Eq. 11 surrogate for that numerically bounded ratio.
+    """
+    if ratio_cap <= 0.0:
+        return -advantages * ratio
+    capped_ratio = ratio.clamp(max=ratio_cap).detach()
+    return -advantages * capped_ratio * new_logprobs
+
+
+def _fixed_histogram(
+    values: torch.Tensor, bins: int, min_value: float, max_value: float, weights: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Build a fixed-width float64 histogram without moving values off device."""
+    histogram = torch.zeros(bins, dtype=torch.float64, device=values.device)
+    if values.numel() == 0:
+        return histogram
+    values = values.float().clamp(min_value, max_value)
+    indices = ((values - min_value) * bins / (max_value - min_value)).floor().long().clamp(0, bins - 1)
+    bin_values = torch.ones_like(values, dtype=torch.float64) if weights is None else weights.to(dtype=torch.float64)
+    histogram.scatter_add_(0, indices, bin_values)
+    return histogram
+
+
+def _histogram_quantile(histogram: torch.Tensor, quantile: float, max_value: float) -> float:
+    """Approximate a non-negative quantile using the lower edge of its bin."""
+    total = float(histogram.sum())
+    if total <= 0.0:
+        return float("nan")
+    cumulative = histogram.cumsum(0)
+    target = quantile * total
+    index = int(
+        torch.searchsorted(cumulative, torch.tensor(target, device=histogram.device)).clamp_max(len(histogram) - 1)
+    )
+    return index * max_value / len(histogram)
+
+
+def _top_fraction_mass_share(
+    count_histogram: torch.Tensor, mass_histogram: torch.Tensor, total_token_count: float, fraction: float
+) -> float:
+    """Approximate the mass owned by the largest ``fraction`` of tokens."""
+    total_mass = float(mass_histogram.sum())
+    if total_token_count <= 0.0 or total_mass <= 0.0:
+        return 0.0
+
+    remaining = total_token_count * fraction
+    selected_mass = 0.0
+    counts = count_histogram.tolist()
+    masses = mass_histogram.tolist()
+    for count, mass in zip(reversed(counts), reversed(masses), strict=True):
+        if remaining <= 0.0:
+            break
+        if count <= remaining:
+            selected_mass += mass
+            remaining -= count
+        elif count > 0.0:
+            selected_mass += mass * remaining / count
+            remaining = 0.0
+    return 100.0 * selected_mass / total_mass
+
+
+class PolicyDriftAccumulator:
+    """Accumulate human-readable policy-drift metrics for one optimizer update.
+
+    Values are collected across every packed microbatch. ``compute_metrics``
+    performs fixed-size distributed reductions so the reported moments and
+    histogram quantiles cover all trainer ranks rather than averaging rank-local
+    percentiles.
+    """
+
+    _TOKEN_COUNT = 0
+    _ABS_LOG_RATIO_SUM = 1
+    _ABS_LOG_RATIO_SQUARED_SUM = 2
+    _RATIO_SUM = 3
+    _RATIO_SQUARED_SUM = 4
+    _INCREASED_OVER_FIVE_COUNT = 5
+    _DECREASED_OVER_FIVE_COUNT = 6
+    _REVERSE_KL_SUM = 7
+    _NUM_SCALARS = 8
+
+    def __init__(
+        self, device: torch.device | str, max_staleness: int, histogram_bins: int = POLICY_DRIFT_HISTOGRAM_BINS
+    ):
+        self.histogram_bins = histogram_bins
+        self.max_staleness = max(max_staleness, 0)
+        self.scalars = torch.zeros(self._NUM_SCALARS, dtype=torch.float64, device=device)
+        self.abs_log_ratio_max = torch.zeros((), dtype=torch.float64, device=device)
+        self.abs_log_ratio_histogram = torch.zeros(histogram_bins, dtype=torch.float64, device=device)
+        self.age_abs_log_ratio_histograms = torch.zeros(
+            self.max_staleness + 1, histogram_bins, dtype=torch.float64, device=device
+        )
+        self.policy_gradient_weight_count_histogram = torch.zeros(histogram_bins, dtype=torch.float64, device=device)
+        self.policy_gradient_weight_mass_histogram = torch.zeros(histogram_bins, dtype=torch.float64, device=device)
+
+    @torch.no_grad()
+    def update(
+        self,
+        new_logprobs: torch.Tensor,
+        rollout_logprobs: torch.Tensor,
+        response_mask: torch.Tensor,
+        policy_gradient_weights: torch.Tensor,
+        model_steps: torch.Tensor | None = None,
+        training_step: int | None = None,
+    ) -> None:
+        valid = response_mask.bool() & torch.isfinite(new_logprobs) & torch.isfinite(rollout_logprobs)
+        if not bool(valid.any()):
+            return
+
+        raw_log_ratio = new_logprobs.float() - rollout_logprobs.float()
+        log_ratio = raw_log_ratio[valid].clamp(-POLICY_DRIFT_LOG_RATIO_LIMIT, POLICY_DRIFT_LOG_RATIO_LIMIT)
+        abs_log_ratio = log_ratio.abs()
+        ratio = torch.exp(log_ratio)
+        token_count = float(log_ratio.numel())
+
+        self.scalars[self._TOKEN_COUNT] += token_count
+        self.scalars[self._ABS_LOG_RATIO_SUM] += abs_log_ratio.double().sum()
+        self.scalars[self._ABS_LOG_RATIO_SQUARED_SUM] += abs_log_ratio.double().square().sum()
+        self.scalars[self._RATIO_SUM] += ratio.double().sum()
+        self.scalars[self._RATIO_SQUARED_SUM] += ratio.double().square().sum()
+        log_five = math.log(5.0)
+        self.scalars[self._INCREASED_OVER_FIVE_COUNT] += (log_ratio > log_five).double().sum()
+        self.scalars[self._DECREASED_OVER_FIVE_COUNT] += (log_ratio < -log_five).double().sum()
+        rollout_prob = torch.exp(rollout_logprobs.float()[valid].clamp(-30.0, 0.0))
+        self.scalars[self._REVERSE_KL_SUM] += (rollout_prob * -raw_log_ratio[valid]).double().sum()
+        self.abs_log_ratio_max.copy_(torch.maximum(self.abs_log_ratio_max, abs_log_ratio.double().max()))
+        self.abs_log_ratio_histogram += _fixed_histogram(
+            abs_log_ratio, self.histogram_bins, 0.0, POLICY_DRIFT_LOG_RATIO_LIMIT
+        )
+
+        if model_steps is not None and training_step is not None:
+            ages = training_step - model_steps.long()[valid]
+            valid_age = (ages >= 0) & (ages <= self.max_staleness)
+            if bool(valid_age.any()):
+                age_values = ages[valid_age]
+                abs_values = abs_log_ratio[valid_age]
+                value_bins = (
+                    (abs_values * self.histogram_bins / POLICY_DRIFT_LOG_RATIO_LIMIT)
+                    .floor()
+                    .long()
+                    .clamp(0, self.histogram_bins - 1)
+                )
+                flat_bins = age_values * self.histogram_bins + value_bins
+                age_histogram = torch.bincount(flat_bins, minlength=(self.max_staleness + 1) * self.histogram_bins)
+                self.age_abs_log_ratio_histograms += age_histogram.reshape_as(
+                    self.age_abs_log_ratio_histograms
+                ).double()
+
+        gradient_weights = policy_gradient_weights.float()[valid]
+        gradient_weights = torch.nan_to_num(
+            gradient_weights, nan=0.0, posinf=math.exp(POLICY_GRADIENT_LOG_WEIGHT_MAX), neginf=0.0
+        ).clamp_min(0.0)
+        positive_weight = gradient_weights > 0.0
+        if bool(positive_weight.any()):
+            positive_weights = gradient_weights[positive_weight]
+            log_weights = positive_weights.log().clamp(POLICY_GRADIENT_LOG_WEIGHT_MIN, POLICY_GRADIENT_LOG_WEIGHT_MAX)
+            self.policy_gradient_weight_count_histogram += _fixed_histogram(
+                log_weights, self.histogram_bins, POLICY_GRADIENT_LOG_WEIGHT_MIN, POLICY_GRADIENT_LOG_WEIGHT_MAX
+            )
+            self.policy_gradient_weight_mass_histogram += _fixed_histogram(
+                log_weights,
+                self.histogram_bins,
+                POLICY_GRADIENT_LOG_WEIGHT_MIN,
+                POLICY_GRADIENT_LOG_WEIGHT_MAX,
+                weights=positive_weights,
+            )
+
+    @torch.no_grad()
+    def compute_metrics(self, process_group: dist.ProcessGroup | None = None) -> dict[str, float]:
+        sum_parts = [
+            self.scalars,
+            self.abs_log_ratio_histogram,
+            self.age_abs_log_ratio_histograms.flatten(),
+            self.policy_gradient_weight_count_histogram,
+            self.policy_gradient_weight_mass_histogram,
+        ]
+        part_sizes = [part.numel() for part in sum_parts]
+        reduced = torch.cat(sum_parts)
+        max_abs_log_ratio = self.abs_log_ratio_max.clone()
+        if dist.is_initialized():
+            dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=process_group)
+            dist.all_reduce(max_abs_log_ratio, op=dist.ReduceOp.MAX, group=process_group)
+
+        offset = 0
+        reduced_parts = []
+        for size, original in zip(part_sizes, sum_parts, strict=True):
+            reduced_parts.append(reduced[offset : offset + size].reshape_as(original))
+            offset += size
+        scalars, abs_histogram, age_histograms, gradient_count_histogram, gradient_mass_histogram = reduced_parts
+        age_histograms = age_histograms.reshape_as(self.age_abs_log_ratio_histograms)
+
+        token_count = float(scalars[self._TOKEN_COUNT])
+        if token_count <= 0.0:
+            return {}
+        mean_abs_log_ratio = float(scalars[self._ABS_LOG_RATIO_SUM]) / token_count
+        abs_log_ratio_variance = max(
+            float(scalars[self._ABS_LOG_RATIO_SQUARED_SUM]) / token_count - mean_abs_log_ratio**2, 0.0
+        )
+        ratio_sum = float(scalars[self._RATIO_SUM])
+        ratio_squared_sum = float(scalars[self._RATIO_SQUARED_SUM])
+        effective_data_pct = (
+            100.0 * ratio_sum**2 / (token_count * ratio_squared_sum) if ratio_squared_sum > 0.0 else 0.0
+        )
+
+        metrics = {
+            "debug/vllm_vs_local_logprob_diff_mean": mean_abs_log_ratio,
+            "debug/vllm_vs_local_logprob_diff_max": float(max_abs_log_ratio),
+            "debug/vllm_vs_local_logprob_diff_std": math.sqrt(abs_log_ratio_variance),
+            "debug/vllm_local_reverse_kl": float(scalars[self._REVERSE_KL_SUM]) / token_count,
+            "policy_drift/probability_change_p50_x": math.exp(
+                _histogram_quantile(abs_histogram, 0.50, POLICY_DRIFT_LOG_RATIO_LIMIT)
+            ),
+            "policy_drift/probability_change_p95_x": math.exp(
+                _histogram_quantile(abs_histogram, 0.95, POLICY_DRIFT_LOG_RATIO_LIMIT)
+            ),
+            "policy_drift/probability_change_p99_x": math.exp(
+                _histogram_quantile(abs_histogram, 0.99, POLICY_DRIFT_LOG_RATIO_LIMIT)
+            ),
+            "policy_drift/probability_increased_over_5x_pct": 100.0
+            * float(scalars[self._INCREASED_OVER_FIVE_COUNT])
+            / token_count,
+            "policy_drift/probability_decreased_over_5x_pct": 100.0
+            * float(scalars[self._DECREASED_OVER_FIVE_COUNT])
+            / token_count,
+            "policy_drift/effective_data_pct": min(max(effective_data_pct, 0.0), 100.0),
+            "policy_gradient/top_1pct_token_weight_share_pct": _top_fraction_mass_share(
+                gradient_count_histogram, gradient_mass_histogram, token_count, 0.01
+            ),
+        }
+        for age in range(self.max_staleness + 1):
+            age_quantile = _histogram_quantile(age_histograms[age], 0.95, POLICY_DRIFT_LOG_RATIO_LIMIT)
+            metrics[f"policy_drift/age_{age}_probability_change_p95_x"] = (
+                math.exp(age_quantile) if math.isfinite(age_quantile) else float("nan")
+            )
+        return metrics
 
 
 def compute_tvpo_mask(
@@ -834,6 +1247,7 @@ def compute_grpo_loss(
     config: GRPOExperimentConfig,
     tis_weights: torch.Tensor | None = None,
     policy_freeze_mask: torch.Tensor | None = None,
+    kl_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if config.loss_fn == GRPOLossType.dapo:
         pg_losses = -advantages * ratio
@@ -848,8 +1262,9 @@ def compute_grpo_loss(
         # by a DPPO mask passed in via ``tis_weights`` (see
         # :func:`compute_dppo_mask`); the caller is responsible for computing
         # ``ratio`` as π_θ / μ_θ' (rollout/behavior policy) — see Takeaway 2.
-        # Eq. 11: L_DPPO = E[Σ_t M_t · r_t · A_t]. No symmetric clipping.
-        pg_losses = -advantages * ratio
+        # The Stable-RL reference implementation caps the detached importance
+        # weight in REINFORCE form. Set dppo_ratio_cap=0 for uncapped Eq. 11.
+        pg_losses = compute_dppo_policy_loss(new_logprobs, ratio, advantages, config.dppo_ratio_cap)
         pg_losses2 = pg_losses
     elif config.loss_fn == GRPOLossType.tvpo:
         # TVPO: REINFORCE-with-IS surrogate -A · clamp(r, max=c).detach() · log π.
@@ -885,6 +1300,9 @@ def compute_grpo_loss(
     else:
         kl = torch.zeros_like(pg_loss_max)
 
+    if kl_mask is not None:
+        kl = kl * kl_mask
+
     return pg_losses, pg_losses2, pg_loss_max, kl
 
 
@@ -907,6 +1325,8 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         response_mask: torch.Tensor,
         policy_mask: torch.Tensor,
         has_policy_mask: bool,
+        kl_mask: torch.Tensor,
+        has_kl_mask: bool,
         policy_freeze_mask: torch.Tensor,
         has_policy_freeze_mask: bool,
         advantages: torch.Tensor,
@@ -920,6 +1340,7 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         loss_fn: str,
         dppo_divergence_type: str,
         dppo_divergence_threshold: float,
+        dppo_ratio_cap: float,
         tvpo_truncation_cap: float,
         sequence_loss: bool,
         rollout_sample_ids: torch.Tensor,
@@ -927,8 +1348,9 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         sequence_process_group: dist.ProcessGroup | None,
         shards: int,
         loss_scale: torch.Tensor,
+        record_entropy: bool,
         compute_params: list[torch.nn.Parameter],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.dim() != 3:
             raise ValueError(f"hidden_states must be [B, T, H], got {tuple(hidden_states.shape)}")
         if selected_token_ids.shape != hidden_states.shape[:2]:
@@ -937,6 +1359,8 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
             raise ValueError("response_mask must match hidden_states batch/sequence dimensions")
         if has_policy_mask and policy_mask.shape != hidden_states.shape[:2]:
             raise ValueError("policy_mask must match hidden_states batch/sequence dimensions")
+        if has_kl_mask and kl_mask.shape != hidden_states.shape[:2]:
+            raise ValueError("kl_mask must match hidden_states batch/sequence dimensions")
         if has_policy_freeze_mask and policy_freeze_mask.shape != hidden_states.shape[:2]:
             raise ValueError("policy_freeze_mask must match hidden_states batch/sequence dimensions")
         if shards < 1:
@@ -955,6 +1379,8 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         old_logprobs = old_logprobs.reshape(-1)
         if has_policy_mask:
             policy_mask = policy_mask.reshape(-1)
+        if has_kl_mask:
+            kl_mask = kl_mask.reshape(-1)
         if has_policy_freeze_mask:
             policy_freeze_mask = policy_freeze_mask.reshape(-1)
         if has_ref_logprobs:
@@ -967,7 +1393,8 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
             loss_weights_2d, loss_denom = _sequence_loss_weights(mask_2d, rollout_ids, sequence_process_group)
         else:
             loss_weights_2d = mask_2d.to(dtype=torch.float32)
-            loss_denom = loss_weights_2d.sum().clamp_min(1.0)
+            loss_denom = loss_weights_2d.sum()
+        # A padding-only DP worker has no sequences, but must still run backward.
         loss_denom = loss_denom.clamp_min(1.0)
         loss_weights = loss_weights_2d.reshape(-1)
         metric_denom = mask_2d.to(dtype=torch.float32).sum()
@@ -981,6 +1408,7 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         advantage_shards = list(torch.chunk(advantages, chunks=shards, dim=0))
         old_logprob_shards = list(torch.chunk(old_logprobs, chunks=shards, dim=0))
         policy_mask_shards = list(torch.chunk(policy_mask, chunks=shards, dim=0)) if has_policy_mask else []
+        kl_mask_shards = list(torch.chunk(kl_mask, chunks=shards, dim=0)) if has_kl_mask else []
         policy_freeze_mask_shards = (
             list(torch.chunk(policy_freeze_mask, chunks=shards, dim=0)) if has_policy_freeze_mask else []
         )
@@ -990,6 +1418,7 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         total_kl_sum = torch.zeros(4, dtype=torch.float32, device=hidden_states.device)
         total_clip_sum = torch.zeros_like(total_loss_sum)
         total_ratio_sum = torch.zeros_like(total_loss_sum)
+        total_entropy_sum = torch.zeros_like(total_loss_sum)
         compute_params = [p for p in compute_params if p.requires_grad]
 
         for shard_idx, x_shard in enumerate(x_shards):
@@ -1012,7 +1441,12 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
                 new_logprobs = torch.gather(logits, dim=-1, index=shard_labels.unsqueeze(-1)).squeeze(-1)
                 new_logprobs = new_logprobs - torch.logsumexp(logits, dim=-1)
 
-                ratio = torch.exp(new_logprobs - old_logprob_shards[shard_idx])
+                if record_entropy:
+                    with torch.no_grad():
+                        entropy = model_utils.entropy_from_logits(logits)
+
+                log_ratio = new_logprobs - old_logprob_shards[shard_idx]
+                ratio = compute_dppo_ratio(log_ratio) if loss_type == GRPOLossType.dppo else torch.exp(log_ratio)
                 if loss_type == GRPOLossType.dapo:
                     pg_losses = -advantage_shards[shard_idx] * ratio
                     pg_losses2 = -advantage_shards[shard_idx] * torch.clamp(ratio, 1.0 - clip_lower, 1.0 + clip_higher)
@@ -1021,7 +1455,9 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
                     pg_losses = -advantage_shards[shard_idx] * clipped_ratio * new_logprobs
                     pg_losses2 = pg_losses
                 elif loss_type == GRPOLossType.dppo:
-                    pg_losses = -advantage_shards[shard_idx] * ratio
+                    pg_losses = compute_dppo_policy_loss(
+                        new_logprobs, ratio, advantage_shards[shard_idx], dppo_ratio_cap
+                    )
                     pg_losses2 = pg_losses
                     dppo_mask, _ = compute_dppo_mask(
                         new_logprobs=new_logprobs,
@@ -1057,6 +1493,8 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
                 else:
                     kl = torch.zeros_like(pg_loss)
                     kl_all = torch.zeros(4, *pg_loss.shape, dtype=pg_loss.dtype, device=pg_loss.device)
+                if has_kl_mask:
+                    kl = kl * kl_mask_shards[shard_idx].to(dtype=kl.dtype)
 
                 shard_mask = mask_shards[shard_idx].to(dtype=pg_loss.dtype)
                 per_token_loss = pg_loss + beta * kl
@@ -1066,6 +1504,8 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
             total_kl_sum = total_kl_sum + (kl_all.detach().float() * shard_mask.float()).sum(dim=-1)
             total_clip_sum = total_clip_sum + ((pg_losses2 > pg_losses).detach().float() * shard_mask.float()).sum()
             total_ratio_sum = total_ratio_sum + (ratio.detach().float() * shard_mask.float()).sum()
+            if record_entropy:
+                total_entropy_sum = total_entropy_sum + (entropy.float() * shard_mask.float()).sum()
             torch.autograd.backward(loss_sum, incoming_grad.to(dtype=loss_sum.dtype))
 
         if compute_params:
@@ -1076,6 +1516,8 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
             dist.all_reduce(total_kl_sum, op=dist.ReduceOp.SUM, group=sequence_process_group)
             dist.all_reduce(total_clip_sum, op=dist.ReduceOp.SUM, group=sequence_process_group)
             dist.all_reduce(total_ratio_sum, op=dist.ReduceOp.SUM, group=sequence_process_group)
+            if record_entropy:
+                dist.all_reduce(total_entropy_sum, op=dist.ReduceOp.SUM, group=sequence_process_group)
             dist.all_reduce(metric_denom, op=dist.ReduceOp.SUM, group=sequence_process_group)
         metric_denom = metric_denom.clamp_min(1.0)
 
@@ -1087,7 +1529,8 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         kl_avg = total_kl_sum / metric_denom
         clipfrac = total_clip_sum / metric_denom
         ratio_avg = total_ratio_sum / metric_denom
-        return loss, kl_avg, clipfrac, ratio_avg
+        entropy_avg = total_entropy_sum / metric_denom
+        return loss, kl_avg, clipfrac, ratio_avg, entropy_avg
 
     @staticmethod
     def backward(ctx, *grads) -> tuple:
@@ -1095,7 +1538,7 @@ class TiledGRPOLMHeadLoss(torch.autograd.Function):
         grad = grads[0]
         if isinstance(grad, torch.Tensor):
             x_grad = x_grad * grad.to(dtype=x_grad.dtype)
-        return (None, x_grad, *([None] * 25))
+        return (None, x_grad, *([None] * 29))
 
 
 def deepspeed_gradient_reduction_divisor(world_size: int, sequence_parallel_size: int, zero_stage: int) -> int:
@@ -1145,19 +1588,26 @@ def tiled_grpo_lm_head_loss(
     loss_fn: str | GRPOLossType = GRPOLossType.dapo,
     dppo_divergence_type: str | DPPODivergenceType = DPPODivergenceType.tv,
     dppo_divergence_threshold: float = 0.1,
+    dppo_ratio_cap: float = 10.0,
     tvpo_truncation_cap: float = 20.0,
     loss_denominator: str = "token",
     rollout_sample_ids: torch.Tensor | None = None,
     sequence_process_group: dist.ProcessGroup | None = None,
     policy_mask: torch.Tensor | None = None,
+    kl_mask: torch.Tensor | None = None,
     policy_freeze_mask: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    record_entropy: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    """Compute tiled GRPO loss metrics, optionally appending average response-token entropy."""
     has_ref_logprobs = ref_logprobs is not None
     if ref_logprobs is None:
         ref_logprobs = torch.empty(0, dtype=old_logprobs.dtype, device=old_logprobs.device)
     has_policy_mask = policy_mask is not None
     if policy_mask is None:
         policy_mask = torch.empty(0, dtype=response_mask.dtype, device=response_mask.device)
+    has_kl_mask = kl_mask is not None
+    if kl_mask is None:
+        kl_mask = torch.empty(0, dtype=response_mask.dtype, device=response_mask.device)
     has_policy_freeze_mask = policy_freeze_mask is not None
     if policy_freeze_mask is None:
         policy_freeze_mask = torch.empty(0, dtype=response_mask.dtype, device=response_mask.device)
@@ -1165,13 +1615,15 @@ def tiled_grpo_lm_head_loss(
     if rollout_sample_ids is None:
         rollout_sample_ids = torch.empty(0, dtype=torch.long, device=old_logprobs.device)
     compute_params = list(lm_head.parameters(recurse=False))
-    return TiledGRPOLMHeadLoss.apply(
+    outputs = TiledGRPOLMHeadLoss.apply(
         lm_head,
         hidden_states,
         selected_token_ids,
         response_mask,
         policy_mask,
         has_policy_mask,
+        kl_mask,
+        has_kl_mask,
         policy_freeze_mask,
         has_policy_freeze_mask,
         advantages,
@@ -1185,6 +1637,7 @@ def tiled_grpo_lm_head_loss(
         loss_fn,
         dppo_divergence_type,
         dppo_divergence_threshold,
+        dppo_ratio_cap,
         tvpo_truncation_cap,
         loss_denominator == "sequence",
         rollout_sample_ids,
@@ -1192,8 +1645,10 @@ def tiled_grpo_lm_head_loss(
         sequence_process_group,
         shards,
         loss_scale,
+        record_entropy,
         compute_params,
     )
+    return outputs if record_entropy else outputs[:4]
 
 
 def _compute_packing_kwargs(position_ids: torch.Tensor, cp_context: object | None = None) -> dict:
