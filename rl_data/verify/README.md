@@ -2,9 +2,7 @@
 
 This is a public restoration of the historical TMax audit tools, with a later
 direct-provider client and explicitly reconstructed image-build orchestration.
-It is **not an identical replay of the paper run**. See the
-[provenance report](../../docs/task-audit-provenance.md) for the file-by-file
-classification, released artifact checks, and missing historical evidence.
+It is **not an identical replay of the paper run**.
 
 The paper's **13,565-task TMax-13K v1.1** is the hardened **prefilter**: applied
 repairs plus original `CLEAN`/`TASK-TRIVIAL` tasks. The **7,015-task** subset with

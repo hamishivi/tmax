@@ -171,21 +171,23 @@ successful (pass) trajectories form the SFT corpus used to warm-start RL.
 
 ## Evaluating on the published Harbor dataset
 
-The full 15k corpus is published on the [Harbor](https://www.harborframework.com/docs/datasets)
-registry as **[`tmax/TMax-15K-Harbor`](https://hub.harborframework.com/datasets/tmax/TMax-15K-Harbor/latest)**
-(public). Each task ships as a self-contained Harbor environment with a
-programmatic verifier, so you can evaluate any agent/model on it without
-regenerating anything.
+The hardened **13,565-task TMax v1.1 corpus** is public on Harbor Hub as
+**[`tmax/tmax-13k-v1.1`](https://hub.harborframework.com/datasets/tmax/tmax-13k-v1.1)**.
+It contains the same task IDs, instructions, verifiers, supporting assets, and
+Docker images as the [v1.1 Hugging Face release](https://huggingface.co/datasets/TMaxxx/tmax-13k-v1.1-harbor).
+The `v1.1` and `latest` tags point to the same complete release. Historical
+`setup.sh` recipes are retained in the Hugging Face archive; Harbor uses the
+already initialized public images and their workspace wrappers.
 
-Evaluate an agent on the dataset with `harbor run -d` ([run docs](https://www.harborframework.com/docs/datasets)):
+Evaluate an agent with Harbor 0.25.0, the version verified with this release:
 
 ```bash
 # full dataset
-uv run harbor run -d "tmax/TMax-15K-Harbor@latest" \
+uvx --from harbor==0.25.0 harbor run -d "tmax/tmax-13k-v1.1@v1.1" \
     --agent terminus-2 --model "<model>" --env docker
 
 # a quick subset: cap the number of tasks (-l) and/or filter by name (-i / -x)
-uv run harbor run -d "tmax/TMax-15K-Harbor@latest" \
+uvx --from harbor==0.25.0 harbor run -d "tmax/tmax-13k-v1.1@v1.1" \
     --agent terminus-2 --model "<model>" --env docker \
     -i "task_00000*" -l 10
 ```
@@ -196,10 +198,13 @@ Results (per-task reward, agent/verifier logs) are written under `jobs/<job-name
 locally — set `DAYTONA_API_KEY` and pass `--env daytona`:
 
 ```bash
-uv run harbor run -d "tmax/TMax-15K-Harbor@latest" \
+uvx --from harbor==0.25.0 harbor run -d "tmax/tmax-13k-v1.1@v1.1" \
     --agent terminus-2 --model "<model>" \
     --env daytona --n-concurrent 10
 ```
+
+The earlier 14,601-task corpus, before the v1.1 audit and repairs, remains at
+[`tmax/TMax-15K-Harbor`](https://hub.harborframework.com/datasets/tmax/TMax-15K-Harbor).
 
 ## Requirements
 
@@ -209,7 +214,7 @@ uv run harbor run -d "tmax/TMax-15K-Harbor@latest" \
   endpoints are supported via env vars — see `scripts/README.md`.
 - `apptainer` on PATH for building/running task containers.
 - `HF_TOKEN` for the upload stage.
-- To evaluate on the published `tmax/TMax-15K-Harbor` dataset: the `harbor` CLI
-  (a project dep, run via `uv run harbor …`), a model API key for your chosen
+- To evaluate on the published v1.1 Hub dataset: Harbor 0.25.0 (the commands
+  above use an isolated `uvx` environment), a model API key for your chosen
   agent, and a container runtime — Docker locally, or `DAYTONA_API_KEY` for the
   Daytona sandbox on Docker-less hosts.
