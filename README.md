@@ -139,27 +139,32 @@ Feel free to swap out daytona for your sandboxing backend of choice.
 
 ## Task data on Harbor
 
-We also ship the full **15k** task corpus in [Harbor](https://www.harborframework.com/docs/datasets)
-format so you can run it out of the box. It's published on the Harbor registry as
-**[`tmax/TMax-15K-Harbor`](https://hub.harborframework.com/datasets/tmax/TMax-15K-Harbor/latest)**
-(public): the legacy 10k self-contained tasks plus 5k newer *intricate*
-multi-modal tasks. Every task ships as a self-contained Harbor environment with
-a programmatic verifier, so you can evaluate any agent/model on it directly — no
-need to regenerate or build anything from `rl_data/`.
+The **13,565 hardened tasks used by TMax v1.1** are public on Harbor Hub as
+**[`tmax/tmax-13k-v1.1`](https://hub.harborframework.com/datasets/tmax/tmax-13k-v1.1)**.
+The `v1.1` and `latest` tags resolve to the same complete release. Its pinned
+task references preserve the instructions, verifiers, supporting test assets,
+and Docker wrappers from the
+[Hugging Face Harbor export](https://huggingface.co/datasets/TMaxxx/tmax-13k-v1.1-harbor).
+The [training data](https://huggingface.co/datasets/TMaxxx/tmax-13k-v1.1) and
+[metadata companion](https://huggingface.co/datasets/TMaxxx/tmax-13k-v1.1-metadata)
+cover the same task IDs.
 
 ```bash
-# evaluate an agent on a 10-task subset using the Daytona cloud sandbox
-# (no local Docker required — swap `--env daytona` for `--env docker` to build locally)
-export DAYTONA_API_KEY='xxx'
-uv run harbor run -d "tmax/TMax-15K-Harbor@latest" \
-    --agent terminus-2 --model "<model>" \
-    --env daytona -l 10
+# Evaluate an agent on a 10-task subset using Docker.
+# Set MODEL to your provider/model and configure its API credentials.
+uvx --from harbor==0.25.0 harbor run -d "tmax/tmax-13k-v1.1@v1.1" \
+    --agent terminus-2 --model "$MODEL" --env docker -l 10
 ```
 
+This command uses Harbor 0.25.0, the version verified with the Hub release.
 Drop `-l` to run the full set, or use `-i`/`-x` to include/exclude tasks by name.
 Per-task rewards and agent/verifier logs land under `jobs/<job-name>/`. See
 [`rl_data/README.md`](rl_data/README.md#evaluating-on-the-published-harbor-dataset)
 for the full set of run options.
+
+The earlier 14,601-task release remains available as
+[`tmax/TMax-15K-Harbor`](https://hub.harborframework.com/datasets/tmax/TMax-15K-Harbor).
+It contains the original tasks before the v1.1 audit, repairs, and exclusions.
 
 ## Requirements
 
@@ -169,7 +174,7 @@ for the full set of run options.
 - (for data generation) **`apptainer`** on PATH for building and running task containers.
 - (for training) A configured **Docker/Podman**, **Apptainer**, or **Sandfleet** backend. Docker Hub credentials may be needed for authenticated or high-volume image pulls; Apptainer and Sandfleet can use prepared SIF images. See the [training recipes](training/open-instruct/scripts/tmax/README.md) for setup.
 - **`HF_TOKEN`** for the Hugging Face upload stage and for pulling gated models.
-- (to evaluate on the published `tmax/TMax-15K-Harbor` dataset) a model API key
+- (to evaluate on the published Harbor datasets) a model API key
   for your chosen agent plus a container runtime — Docker locally, or
   `DAYTONA_API_KEY` for the Daytona sandbox on Docker-less hosts.
 
@@ -177,6 +182,7 @@ for the full set of run options.
 
 - **V1.1:**
   - Models and data: [TMax v1.1 collection](https://huggingface.co/collections/TMaxxx/tmax-v11).
+  - Harbor dataset: [`tmax/tmax-13k-v1.1@v1.1`](https://hub.harborframework.com/datasets/tmax/tmax-13k-v1.1) (13,565 tasks).
   - Evaluation rollouts: [`evaluation_assets/v1.1/`](evaluation_assets/v1.1/) (2B, 4B, 8B, 9B, and 27B on Terminal-Bench 2.0 using Daytona).
 - **V1.0:**
   - Models and data: [Ai2 TMax collection](https://huggingface.co/collections/allenai/tmax).
@@ -186,6 +192,14 @@ for the full set of run options.
 ## Licensing
 
 This codebase is licensed under Apache 2.0 as given in [LICENSE](LICENSE).
+
+The TMax v1.1 training data, metadata, and Harbor export use
+[ODC-BY](https://opendatacommons.org/licenses/by/1-0/), following the
+[original TMax dataset](https://huggingface.co/datasets/allenai/TMax-15K).
+Research and educational use should follow
+[Ai2's Responsible Use Guidelines](https://allenai.org/responsible-use).
+Gemini 3.1 Pro outputs included in the data remain subject to
+[Google's Terms of Service](https://policies.google.com/terms).
 
 # Citation
 

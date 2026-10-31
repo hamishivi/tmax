@@ -1,5 +1,24 @@
 # TMax v1.1 publication conversion
 
+The published 13,565-task release is available as
+[Open Instruct training data](https://huggingface.co/datasets/TMaxxx/tmax-13k-v1.1),
+[task and audit metadata](https://huggingface.co/datasets/TMaxxx/tmax-13k-v1.1-metadata),
+and a [Harbor export](https://huggingface.co/datasets/TMaxxx/tmax-13k-v1.1-harbor).
+The complete export is also public on
+[Harbor Hub](https://hub.harborframework.com/datasets/tmax/tmax-13k-v1.1):
+
+```bash
+uvx --from harbor==0.25.0 harbor run -d "tmax/tmax-13k-v1.1@v1.1" \
+  --env docker --agent terminus-2 --model "$MODEL"
+```
+
+All three dataset variants use ODC-BY, following the
+[original TMax release](https://huggingface.co/datasets/allenai/TMax-15K), with
+its Ai2 responsible-use and Gemini terms notices. The Hub dataset pins all
+13,565 task versions by content hash; both `v1.1` and `latest` identify this
+release. The Hugging Face archive additionally preserves historical setup
+recipes; Harbor uses the initialized images and their workspace wrappers.
+
 `prepare_hardened_open_instruct.py` and `publish_hardened_images.py` were already
 shipped in the public dataset's `conversion/` directory. Their imported local
 copies matched those files byte for byte. They are later publication tooling,

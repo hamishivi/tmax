@@ -86,6 +86,15 @@ budget. Neither infrastructure failure nor failure to solve proves unsolvability
 See the public [training dataset](https://huggingface.co/datasets/TMaxxx/tmax-13k-v1.1/tree/84c6b85842e6ea108db97647ebbe48f9f1c8e7be)
 and [metadata companion](https://huggingface.co/datasets/TMaxxx/tmax-13k-v1.1-metadata/tree/62fdc43e34e8c8e9895aa3126ec02e1c1233591c).
 
+The same 13,565 tasks are now public on
+[Harbor Hub](https://hub.harborframework.com/datasets/tmax/tmax-13k-v1.1) as
+`tmax/tmax-13k-v1.1@v1.1`, with every task reference pinned by content hash.
+The [Hugging Face Harbor export](https://huggingface.co/datasets/TMaxxx/tmax-13k-v1.1-harbor)
+also preserves the historical setup recipes. All three v1.1 dataset variants
+use ODC-BY, matching the original TMax data release and its responsible-use
+and Gemini terms notices. This publication does not add solver evidence for
+tasks without a demonstrated passing solution.
+
 The public conversion retains **11,852 original Docker references** and publishes
 **1,713 hardened images**: 1,014 deletion-only whiteout images and 699 SIF imports
 for dependency/combined repairs. The source recipe describes 1,763 derivatives
