@@ -22,8 +22,7 @@ recipes; Harbor uses the initialized images and their workspace wrappers.
 `prepare_hardened_open_instruct.py` and `publish_hardened_images.py` were already
 shipped in the public dataset's `conversion/` directory. Their imported local
 copies matched those files byte for byte. They are later publication tooling,
-separate from the historical rubric/repair run. See
-[provenance and limitations](../../docs/task-audit-provenance.md).
+separate from the historical rubric/repair run.
 
 `audit_release.py` downloads pinned public task records, metadata, recipes,
 publication receipts, and the task archive. It verifies the schema against the

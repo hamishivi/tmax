@@ -156,7 +156,6 @@ uvx --from harbor==0.25.0 harbor run -d "tmax/tmax-13k-v1.1@v1.1" \
     --agent terminus-2 --model "$MODEL" --env docker -l 10
 ```
 
-This command uses Harbor 0.25.0, the version verified with the Hub release.
 Drop `-l` to run the full set, or use `-i`/`-x` to include/exclude tasks by name.
 Per-task rewards and agent/verifier logs land under `jobs/<job-name>/`. See
 [`rl_data/README.md`](rl_data/README.md#evaluating-on-the-published-harbor-dataset)

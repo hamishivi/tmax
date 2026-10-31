@@ -205,9 +205,6 @@ uvx --from harbor==0.25.0 harbor run -d "tmax/tmax-13k-v1.1@v1.1" \
 
 The earlier 14,601-task corpus, before the v1.1 audit and repairs, remains at
 [`tmax/TMax-15K-Harbor`](https://hub.harborframework.com/datasets/tmax/TMax-15K-Harbor).
-The v1.1 data uses [ODC-BY](https://opendatacommons.org/licenses/by/1-0/), with
-the same Ai2 responsible-use and Gemini terms notices as the
-[original TMax release](https://huggingface.co/datasets/allenai/TMax-15K).
 
 ## Requirements
 
