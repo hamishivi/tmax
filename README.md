@@ -28,7 +28,7 @@ Below, we give a quick overview of the codebase and how to use it.
 
 ### News
 
-- [3/11/26] **TMax v1.1 released!** We have updated the codebase to improve stability and our overall recipe. Please consult [PR #11](https://github.com/hamishivi/tmax/pull/11) for the full set of changes. To reproduce TMax v1.0 training, please use commit [`6d3d606`](https://github.com/hamishivi/tmax/tree/6d3d606c0f9de6ceec9481f9ccc793936818fef0).
+- [3/11/26] **TMax v1.1 released!** We have updated the codebase to improve stability and our overall recipe. Find the models and data in our [Hugging Face collection](https://huggingface.co/collections/TMaxxx/tmax-v11) and the tasks on [Harbor Hub](https://hub.harborframework.com/datasets/tmax/tmax-13k-v1.1). Please consult [PR #11](https://github.com/hamishivi/tmax/pull/11) for the full set of changes. To reproduce TMax v1.0 training, please use commit [`6d3d606`](https://github.com/hamishivi/tmax/tree/6d3d606c0f9de6ceec9481f9ccc793936818fef0).
 - Initial release of the codebase and models! Please read [our paper](https://arxiv.org/abs/2606.23321) for more details.
 
 
